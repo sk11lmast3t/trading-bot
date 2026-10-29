@@ -29,9 +29,9 @@ class ScalpingConfig:
     risk_per_trade: float = 0.01          # 1% risk per trade
     max_positions: int = 3
     leverage: int = 1                     # 1x for cash/BNF discipline, up to 5x-20x for scalping
-    take_profit_pct: float = 0.003
-    stop_loss_pct: float = 0.002
-    max_hold_cycles: int = 60
+    take_profit_pct: float = 0.001
+    stop_loss_pct: float = 0.001
+    max_hold_cycles: int = 12
     trailing_stop: bool = True
     trailing_stop_pct: float = 0.001
     use_grid: bool = True
