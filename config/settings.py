@@ -80,7 +80,7 @@ class StrategyConfig:
     laggard_peer_max_move: float = 0.003         # Peer unmoved < 0.3%
 
     # GRU Deep Learning Predictor
-    use_gru_filter: bool = True
+    use_gru_filter: bool = False
     gru_model_path: str = "models/crypto_gru_model.h5"
     gru_scaler_path: str = "models/crypto_gru_model_scaler.pkl"
     gru_lookback: int = 20
