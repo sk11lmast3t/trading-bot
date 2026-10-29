@@ -137,15 +137,12 @@ class GridScalperStrategy(BaseStrategy):
         last = df.iloc[-1]
         price = last["close"]
         atr = last.get("atr", price * 0.01)
-        sc = self.config.scalping
         ema = last["ema_medium"]
         rsi = last["rsi"]
         ema_fast = last["ema_fast"]
         ema_medium = last["ema_medium"]
 
         # Trend regime: up / down / flat around EMA
-        ema_fast = last["ema_fast"]
-        ema_medium = last["ema_medium"]
         if ema_fast > ema_medium * 1.0005:
             trend = "up"
         elif ema_fast < ema_medium * 0.9995:
@@ -154,16 +151,14 @@ class GridScalperStrategy(BaseStrategy):
             trend = "flat"
 
         # Grid LONG: buy dips below EMA, allowed only in uptrend or flat
-        if (price < ema * (1 - sc.grid_spacing_pct) and
-                trend in ("up", "flat") and rsi < 55):
+        if price < ema and trend in ("up", "flat") and rsi < 55:
             sl = price - (atr * 2)
             tp = ema
             confidence = 0.7
             return TradeSetup(Signal.LONG, price, sl, tp, confidence, self.name)
 
         # Grid SHORT: sell rallies above EMA, allowed only in downtrend or flat
-        if (price > ema * (1 + sc.grid_spacing_pct) and
-                trend in ("down", "flat") and rsi > 45):
+        if price > ema and trend in ("down", "flat") and rsi > 45:
             sl = price + (atr * 2)
             tp = ema
             confidence = 0.7

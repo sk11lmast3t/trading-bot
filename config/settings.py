@@ -35,8 +35,6 @@ class ScalpingConfig:
     trailing_stop: bool = True
     trailing_stop_pct: float = 0.001
     use_grid: bool = True
-    grid_levels: int = 3
-    grid_spacing_pct: float = 0.0001
     cooldown_seconds: int = 10
 
 
