@@ -138,16 +138,22 @@ class GridScalperStrategy(BaseStrategy):
         price = last["close"]
         atr = last.get("atr", price * 0.01)
         ema = last["ema_medium"]
+        ema_fast = last.get("ema_fast", ema)
+        ema_medium = last.get("ema_medium", ema)
 
-        # Grid LONG: buy dips below EMA
-        if price < ema:
+        # Pure EMA trend detection: only exact equality is flat.
+        downtrend = ema_fast < ema_medium
+        uptrend = ema_fast > ema_medium
+
+        # Grid LONG: buy dips below EMA (blocked in downtrend)
+        if price < ema and not downtrend:
             sl = price - (atr * 2)
             tp = ema
             confidence = 0.7
             return TradeSetup(Signal.LONG, price, sl, tp, confidence, self.name)
 
-        # Grid SHORT: sell rallies above EMA
-        if price > ema:
+        # Grid SHORT: sell rallies above EMA (blocked in uptrend)
+        if price > ema and not uptrend:
             sl = price + (atr * 2)
             tp = ema
             confidence = 0.7
