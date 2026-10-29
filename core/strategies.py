@@ -144,18 +144,18 @@ class GridScalperStrategy(BaseStrategy):
         ema_medium = last['ema_medium']
 
         # Grid LONG: Price below EMA, allow in flat/choppy (soft trend filter)
-        if price < ema * (1 - sc.grid_spacing_pct * 1.5) and ema_fast >= ema_medium * 0.999:
-            levels = min(sc.grid_levels, int((ema - price) / (price * sc.grid_spacing_pct)))
-            if levels >= 1 and rsi < 45:
+        if price < ema * (1 + 0.0005) and ema_fast >= ema_medium * 0.999:
+            levels = min(sc.grid_levels, int(abs(ema - price) / (price * sc.grid_spacing_pct))) if sc.grid_spacing_pct > 0 else 0
+            if levels >= 1 and rsi < 50 and price >= ema * (1 - 0.0005):
                 sl = price - (atr * 2)
                 tp = ema
                 confidence = min(0.85, 0.5 + (levels * 0.15))
                 return TradeSetup(Signal.LONG, price, sl, tp, confidence, self.name)
 
         # Grid SHORT: Price above EMA, allow in flat/choppy (soft trend filter)
-        if price > ema * (1 + sc.grid_spacing_pct * 1.5) and ema_fast <= ema_medium * 1.001:
-            levels = min(sc.grid_levels, int((price - ema) / (price * sc.grid_spacing_pct)))
-            if levels >= 1 and rsi > 55:
+        if price > ema * (1 - 0.0005) and ema_fast <= ema_medium * 1.001:
+            levels = min(sc.grid_levels, int(abs(price - ema) / (price * sc.grid_spacing_pct))) if sc.grid_spacing_pct > 0 else 0
+            if levels >= 1 and rsi > 50 and price <= ema * (1 + 0.0005):
                 sl = price + (atr * 2)
                 tp = ema
                 confidence = min(0.85, 0.5 + (levels * 0.15))

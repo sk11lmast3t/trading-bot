@@ -35,7 +35,7 @@ class ScalpingConfig:
     trailing_stop_pct: float = 0.001
     use_grid: bool = True
     grid_levels: int = 3
-    grid_spacing_pct: float = 0.001
+    grid_spacing_pct: float = 0.0005
     cooldown_seconds: int = 30
 
 
@@ -50,8 +50,8 @@ class StrategyConfig:
     rsi_period: int = 14
     rsi_overbought: float = 70.0
     rsi_oversold: float = 30.0
-    rsi_scalp_upper: float = 60.0
-    rsi_scalp_lower: float = 40.0
+    rsi_scalp_upper: float = 65.0
+    rsi_scalp_lower: float = 35.0
     atr_period: int = 14
     atr_multiplier: float = 1.5
     min_atr_threshold: float = 0.0005
