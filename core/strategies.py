@@ -135,31 +135,29 @@ class GridScalperStrategy(BaseStrategy):
         if len(df) < 30:
             return TradeSetup(Signal.HOLD)
         last = df.iloc[-1]
-        price = last['close']
-        atr = last.get('atr', price * 0.01)
+        price = last["close"]
+        atr = last.get("atr", price * 0.01)
         sc = self.config.scalping
-        ema = last['ema_medium']
-        rsi = last['rsi']
-        ema_fast = last['ema_fast']
-        ema_medium = last['ema_medium']
+        ema = last["ema_medium"]
+        rsi = last["rsi"]
+        ema_fast = last["ema_fast"]
+        ema_medium = last["ema_medium"]
 
-        # Grid LONG: Price below EMA, allow in flat/choppy (soft trend filter)
-        if price < ema * (1 + 0.0005) and ema_fast >= ema_medium * 0.999:
-            levels = min(sc.grid_levels, int(abs(ema - price) / (price * sc.grid_spacing_pct))) if sc.grid_spacing_pct > 0 else 0
-            if levels >= 1 and rsi < 50 and price >= ema * (1 - 0.0005):
-                sl = price - (atr * 2)
-                tp = ema
-                confidence = min(0.85, 0.5 + (levels * 0.15))
-                return TradeSetup(Signal.LONG, price, sl, tp, confidence, self.name)
+        # Grid LONG: price below EMA by at least grid_spacing_pct, flat trend filter, oversold RSI
+        if (price < ema * (1 - sc.grid_spacing_pct) and
+                ema_fast >= ema_medium * 0.999 and rsi < 50):
+            sl = price - (atr * 2)
+            tp = ema
+            confidence = 0.7
+            return TradeSetup(Signal.LONG, price, sl, tp, confidence, self.name)
 
-        # Grid SHORT: Price above EMA, allow in flat/choppy (soft trend filter)
-        if price > ema * (1 - 0.0005) and ema_fast <= ema_medium * 1.001:
-            levels = min(sc.grid_levels, int(abs(price - ema) / (price * sc.grid_spacing_pct))) if sc.grid_spacing_pct > 0 else 0
-            if levels >= 1 and rsi > 50 and price <= ema * (1 + 0.0005):
-                sl = price + (atr * 2)
-                tp = ema
-                confidence = min(0.85, 0.5 + (levels * 0.15))
-                return TradeSetup(Signal.SHORT, price, sl, tp, confidence, self.name)
+        # Grid SHORT: price above EMA by at least grid_spacing_pct, flat trend filter, overbought RSI
+        if (price > ema * (1 + sc.grid_spacing_pct) and
+                ema_fast <= ema_medium * 1.001 and rsi > 50):
+            sl = price + (atr * 2)
+            tp = ema
+            confidence = 0.7
+            return TradeSetup(Signal.SHORT, price, sl, tp, confidence, self.name)
 
         return TradeSetup(Signal.HOLD)
 
@@ -346,4 +344,5 @@ def get_strategy(config) -> BaseStrategy:
     if name not in strategies:
         raise ValueError(f"Unknown strategy: {name}")
     return strategies[name](config)
+
 
