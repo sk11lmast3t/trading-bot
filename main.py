@@ -48,6 +48,7 @@ class UnifiedCryptoBot:
         )
         self.running = False
         self.cycle_count = 0
+        self.position_entry_cycle = {}
 
         if self.config.mode == "live":
             self.exchange = ExchangeConnector(self.config).connect()
@@ -144,6 +145,7 @@ class UnifiedCryptoBot:
             # 10. Register position for heat & trailing stop tracking
             self.risk_manager.register_position(symbol, notional_value, side)
             self.risk_manager.update_position_price(symbol, setup.entry_price)
+            self.position_entry_cycle[symbol] = self.cycle_count
 
         except Exception as e:
             logger.error(f"Error processing {symbol}: {e}")
@@ -163,6 +165,23 @@ class UnifiedCryptoBot:
             side = pos.get('side', 'long')
             sc = self.config.scalping
 
+            # Max hold time exit
+            entry_cycle = self.position_entry_cycle.get(symbol, self.cycle_count)
+            max_hold = getattr(sc, 'max_hold_cycles', 60)
+            if self.cycle_count - entry_cycle > max_hold:
+                pnl = (price - entry) * float(pos.get('contracts', 0.0)) if side == 'long' else (entry - price) * float(pos.get('contracts', 0.0))
+                logger.info(f"[{symbol}] Closed {side.upper()} position: TIME EXIT | PnL: ${pnl:.4f}")
+                if self.config.mode == "live":
+                    opp_side = 'sell' if side == 'long' else 'buy'
+                    self.exchange.create_market_order(symbol, opp_side, float(pos.get('contracts', 0.0)))
+                else:
+                    self.exchange.close_position(symbol, price)
+                self.risk_manager.record_trade(pnl, symbol)
+                self.risk_manager.release_position(symbol)
+                self.position_entry_cycle.pop(symbol, None)
+                self.position_entry_cycle.pop(symbol, None)
+                return
+
             # Update trailing stop watermark
             self.risk_manager.update_position_price(symbol, price)
 
@@ -178,6 +197,8 @@ class UnifiedCryptoBot:
                     self.exchange.close_position(symbol, price)
                 self.risk_manager.record_trade(pnl, symbol)
                 self.risk_manager.release_position(symbol)
+                self.position_entry_cycle.pop(symbol, None)
+                self.position_entry_cycle.pop(symbol, None)
                 return
 
             hit_tp = False
@@ -202,6 +223,7 @@ class UnifiedCryptoBot:
                     self.exchange.close_position(symbol, price)
                 self.risk_manager.record_trade(pnl, symbol)
                 self.risk_manager.release_position(symbol)
+                self.position_entry_cycle.pop(symbol, None)
 
         except Exception as e:
             logger.error(f"Error checking exits for {symbol}: {e}")
