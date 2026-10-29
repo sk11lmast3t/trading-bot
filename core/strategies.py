@@ -1,4 +1,4 @@
-﻿"""
+"""
 Unified Strategies Engine
 Includes:
 1. EmaRsiAtrStrategy (Trend following)
@@ -72,7 +72,7 @@ class EmaRsiAtrStrategy(BaseStrategy):
                 prev['ema_fast'] <= prev['ema_medium']):
             sl = price - (atr * c.atr_multiplier * 0.8)
             tp = price + (atr * c.atr_multiplier * 2.5)
-            confidence = min(0.95, 0.6 + (0.15 if rsi < 50 else 0))
+            confidence = min(0.95, 0.6 + (0.15 if rsi < 55 else 0))
             return TradeSetup(Signal.LONG, price, sl, tp, confidence, self.name)
 
         # SHORT: Fast < Med < Slow + RSI in bearish scalp band
@@ -81,7 +81,7 @@ class EmaRsiAtrStrategy(BaseStrategy):
                 prev['ema_fast'] >= prev['ema_medium']):
             sl = price + (atr * c.atr_multiplier * 0.8)
             tp = price - (atr * c.atr_multiplier * 2.5)
-            confidence = min(0.95, 0.6 + (0.15 if rsi > 50 else 0))
+            confidence = min(0.95, 0.6 + (0.15 if rsi > 45 else 0))
             return TradeSetup(Signal.SHORT, price, sl, tp, confidence, self.name)
 
         return TradeSetup(Signal.HOLD)
@@ -155,7 +155,7 @@ class GridScalperStrategy(BaseStrategy):
 
         # Grid LONG: buy dips below EMA, allowed only in uptrend or flat
         if (price < ema * (1 - sc.grid_spacing_pct) and
-                trend in ("up", "flat") and rsi < 50):
+                trend in ("up", "flat") and rsi < 55):
             sl = price - (atr * 2)
             tp = ema
             confidence = 0.7
@@ -163,7 +163,7 @@ class GridScalperStrategy(BaseStrategy):
 
         # Grid SHORT: sell rallies above EMA, allowed only in downtrend or flat
         if (price > ema * (1 + sc.grid_spacing_pct) and
-                trend in ("down", "flat") and rsi > 50):
+                trend in ("down", "flat") and rsi > 45):
             sl = price + (atr * 2)
             tp = ema
             confidence = 0.7
