@@ -36,7 +36,7 @@ class ScalpingConfig:
     use_grid: bool = True
     grid_levels: int = 3
     grid_spacing_pct: float = 0.0005
-    cooldown_seconds: int = 30
+    cooldown_seconds: int = 10
 
 
 @dataclass
@@ -148,3 +148,4 @@ class BotConfig:
     log_level: str = "INFO"
     log_file: str = "logs/bot.log"
     mode: str = "paper"
+

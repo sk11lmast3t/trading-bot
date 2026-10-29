@@ -326,7 +326,7 @@ class CombinedStrategy(BaseStrategy):
 
         # High confidence single signal
         best_single = max(signals, key=lambda x: x.confidence)
-        if best_single.confidence >= 0.85:
+        if best_single.confidence >= 0.7:
             return best_single
 
         return TradeSetup(Signal.HOLD)
@@ -346,3 +346,4 @@ def get_strategy(config) -> BaseStrategy:
     if name not in strategies:
         raise ValueError(f"Unknown strategy: {name}")
     return strategies[name](config)
+
