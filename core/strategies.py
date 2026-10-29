@@ -146,9 +146,9 @@ class GridScalperStrategy(BaseStrategy):
         # Trend regime: up / down / flat around EMA
         ema_fast = last["ema_fast"]
         ema_medium = last["ema_medium"]
-        if ema_fast > ema_medium:
+        if ema_fast > ema_medium * 1.0005:
             trend = "up"
-        elif ema_fast < ema_medium:
+        elif ema_fast < ema_medium * 0.9995:
             trend = "down"
         else:
             trend = "flat"
