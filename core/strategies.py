@@ -1,4 +1,4 @@
-"""
+﻿"""
 Unified Strategies Engine
 Includes:
 1. EmaRsiAtrStrategy (Trend following)
@@ -143,17 +143,27 @@ class GridScalperStrategy(BaseStrategy):
         ema_fast = last["ema_fast"]
         ema_medium = last["ema_medium"]
 
-        # Grid LONG: price below EMA by at least grid_spacing_pct, flat trend filter, oversold RSI
+        # Trend regime: up / down / flat around EMA
+        ema_fast = last["ema_fast"]
+        ema_medium = last["ema_medium"]
+        if ema_fast > ema_medium * 1.001:
+            trend = "up"
+        elif ema_fast < ema_medium * 0.999:
+            trend = "down"
+        else:
+            trend = "flat"
+
+        # Grid LONG: buy dips below EMA, allowed only in uptrend or flat
         if (price < ema * (1 - sc.grid_spacing_pct) and
-                ema_fast >= ema_medium * 0.999 and rsi < 50):
+                trend in ("up", "flat") and rsi < 50):
             sl = price - (atr * 2)
             tp = ema
             confidence = 0.7
             return TradeSetup(Signal.LONG, price, sl, tp, confidence, self.name)
 
-        # Grid SHORT: price above EMA by at least grid_spacing_pct, flat trend filter, overbought RSI
+        # Grid SHORT: sell rallies above EMA, allowed only in downtrend or flat
         if (price > ema * (1 + sc.grid_spacing_pct) and
-                ema_fast <= ema_medium * 1.001 and rsi > 50):
+                trend in ("down", "flat") and rsi > 50):
             sl = price + (atr * 2)
             tp = ema
             confidence = 0.7
@@ -344,5 +354,6 @@ def get_strategy(config) -> BaseStrategy:
     if name not in strategies:
         raise ValueError(f"Unknown strategy: {name}")
     return strategies[name](config)
+
 
 
