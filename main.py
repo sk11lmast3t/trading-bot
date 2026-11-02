@@ -192,6 +192,29 @@ class UnifiedCryptoBot:
         except Exception as e:
             logger.error(f"Error processing {symbol}: {e}")
 
+    def _close_position(self, symbol, pos, price, reason):
+        entry = float(pos.get('entryPrice', 0.0))
+        contracts = float(pos.get('contracts', 0.0))
+        side = pos.get('side', 'long')
+        if side == 'long':
+            pnl = (price - entry) * contracts
+        else:
+            pnl = (entry - price) * contracts
+        logger.info(f"[{symbol}] Closed {side.upper()} position: {reason} | PnL: ${pnl:.4f}")
+        if self.config.mode == "live":
+            opp_side = 'sell' if side == 'long' else 'buy'
+            self.exchange.create_market_order(symbol, opp_side, contracts)
+            try:
+                self.exchange.cancel_all_orders(symbol)
+            except Exception:
+                pass
+        else:
+            self.exchange.close_position(symbol, price)
+        self.risk_manager.record_trade(pnl, symbol)
+        self.risk_manager.release_position(symbol)
+        self.position_entry_cycle.pop(symbol, None)
+        self.position_targets.pop(symbol, None)
+
     def check_exits(self, symbol: str):
         try:
             pos = self.exchange.get_position(symbol)
@@ -206,72 +229,45 @@ class UnifiedCryptoBot:
             entry = float(pos.get('entryPrice', 0.0))
             side = pos.get('side', 'long')
             sc = self.config.scalping
-
-            # Max hold time exit
-            entry_cycle = self.position_entry_cycle.get(symbol, self.cycle_count)
-            max_hold = getattr(sc, 'max_hold_cycles', 60)
-            if self.cycle_count - entry_cycle > max_hold:
-                pnl = (price - entry) * float(pos.get('contracts', 0.0)) if side == 'long' else (entry - price) * float(pos.get('contracts', 0.0))
-                logger.info(f"[{symbol}] Closed {side.upper()} position: TIME EXIT | PnL: ${pnl:.4f}")
-                if self.config.mode == "live":
-                    opp_side = 'sell' if side == 'long' else 'buy'
-                    self.exchange.create_market_order(symbol, opp_side, float(pos.get('contracts', 0.0)))
-                else:
-                    self.exchange.close_position(symbol, price)
-                self.risk_manager.record_trade(pnl, symbol)
-                self.risk_manager.release_position(symbol)
-                self.position_entry_cycle.pop(symbol, None)
-                self.position_targets.pop(symbol, None)
-                return
-
-            # Update trailing stop watermark
-            self.risk_manager.update_position_price(symbol, price)
-
-            # Check trailing stop / breakeven
-            trail_hit, trail_reason = self.risk_manager.check_trailing_stop(symbol, price)
-            if trail_hit:
-                reason = f"TRAILING STOP: {trail_reason}"
-                logger.info(f"[{symbol}] Closed {side.upper()} position: {reason} | PnL: ${pnl:.4f}")
-                if self.config.mode == "live":
-                    opp_side = 'sell' if side == 'long' else 'buy'
-                    self.exchange.create_market_order(symbol, opp_side, float(pos.get('contracts', 0.0)))
-                else:
-                    self.exchange.close_position(symbol, price)
-                self.risk_manager.record_trade(pnl, symbol)
-                self.risk_manager.release_position(symbol)
-                self.position_entry_cycle.pop(symbol, None)
-                self.position_targets.pop(symbol, None)
-                return
-
-            hit_tp = False
-            hit_sl = False
-
-            # Dynamic strategy targets (ATR-based) with config percentage fallbacks
             targets = self.position_targets.get(symbol, {})
             tp_price = targets.get('tp')
             sl_price = targets.get('sl')
 
+            self.risk_manager.update_position_price(symbol, price)
+
+            # 1. Hard SL (never skipped)
+            if side == 'long':
+                hit_sl = (price <= sl_price) if (sl_price and sl_price < entry) else (price <= entry * (1 - sc.stop_loss_pct))
+            else:
+                hit_sl = (price >= sl_price) if (sl_price and sl_price > entry) else (price >= entry * (1 + sc.stop_loss_pct))
+            if hit_sl:
+                self._close_position(symbol, pos, price, "STOP LOSS")
+                return
+
+            # 2. TP
             if side == 'long':
                 hit_tp = (price >= tp_price) if (tp_price and tp_price > entry) else (price >= entry * (1 + sc.take_profit_pct))
-                hit_sl = (price <= sl_price) if (sl_price and sl_price < entry) else (price <= entry * (1 - sc.stop_loss_pct))
-                pnl = (price - entry) * float(pos.get('contracts', 0.0))
             else:
                 hit_tp = (price <= tp_price) if (tp_price and tp_price < entry) else (price <= entry * (1 - sc.take_profit_pct))
-                hit_sl = (price >= sl_price) if (sl_price and sl_price > entry) else (price >= entry * (1 + sc.stop_loss_pct))
-                pnl = (entry - price) * float(pos.get('contracts', 0.0))
+            if hit_tp:
+                self._close_position(symbol, pos, price, "TAKE PROFIT")
+                return
 
-            if hit_tp or hit_sl:
-                reason = "TAKE PROFIT" if hit_tp else "STOP LOSS"
-                logger.info(f"[{symbol}] Closed {side.upper()} position: {reason} | PnL: ${pnl:.4f}")
-                if self.config.mode == "live":
-                    opp_side = 'sell' if side == 'long' else 'buy'
-                    self.exchange.create_market_order(symbol, opp_side, float(pos.get('contracts', 0.0)))
-                else:
-                    self.exchange.close_position(symbol, price)
-                self.risk_manager.record_trade(pnl, symbol)
-                self.risk_manager.release_position(symbol)
-                self.position_entry_cycle.pop(symbol, None)
-                self.position_targets.pop(symbol, None)
+            # 3. Trailing / breakeven (isolated so failure can't skip SL above)
+            try:
+                trail_hit, trail_reason = self.risk_manager.check_trailing_stop(symbol, price)
+                if trail_hit:
+                    self._close_position(symbol, pos, price, f"TRAILING STOP: {trail_reason}")
+                    return
+            except Exception as e:
+                logger.error(f"Trailing check error for {symbol}: {e}")
+
+            # 4. Time exit (using cycle count for now; 1.6 migrates to wall clock)
+            entry_cycle = self.position_entry_cycle.get(symbol, self.cycle_count)
+            max_hold = getattr(sc, 'max_hold_cycles', 60)
+            if self.cycle_count - entry_cycle > max_hold:
+                self._close_position(symbol, pos, price, "TIME EXIT")
+                return
 
         except Exception as e:
             logger.error(f"Error checking exits for {symbol}: {e}")
