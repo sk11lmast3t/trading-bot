@@ -87,15 +87,18 @@ class RiskManager:
         self.circuit_breaker = CircuitBreaker(config.risk, config.scalping.initial_capital)
 
     def _check_daily_reset(self, now = None):
-        now = now or datetime.utcnow()
-        current_day = now.date()
-        if current_day != self._current_day:
+        if now is None:
+            now = datetime.utcnow()
+        current_day = now.date() if hasattr(now, 'date') else now
+        if self._current_day is None:
+            self._current_day = current_day
+        elif current_day != self._current_day:
             self.reset_daily()
             self._current_day = current_day
 
     def can_trade(self, now: Optional[datetime] = None) -> Tuple[bool, str]:
         now = now or datetime.now()
-        self._check_daily_reset(datetime.utcnow())
+        self._check_daily_reset(now)
 
         # Circuit breaker check
         halted, reason = self.circuit_breaker.is_halted()
@@ -105,8 +108,8 @@ class RiskManager:
         if self.pause_until and now < self.pause_until:
             wait_s = int((self.pause_until - now).total_seconds())
             return False, f"Paused after loss streak ({wait_s}s remaining)"
-        if self.daily_trades >= self.rc.daily_trade_limit:
-            return False, "Daily trade limit reached"
+        if self.rc.daily_trade_limit > 0 and self.daily_trades >= self.rc.daily_trade_limit:
+            return False, f"Daily trade limit reached ({self.daily_trades}/{self.rc.daily_trade_limit})"
         if self.daily_pnl <= -(self.current_balance * self.rc.max_daily_loss_pct):
             return False, f"Max daily loss reached ({self.daily_pnl:.2f})"
         drawdown = (self.peak_balance - self.current_balance) / self.peak_balance
@@ -220,11 +223,12 @@ class RiskManager:
         size_value = min((capital * risk_pct) / price_risk * entry, max_size_value)
         return size_value / entry
 
-    def record_trade(self, pnl: float, symbol: str = ""):
+    def record_trade(self, pnl: float, symbol: str = "", trade_time: Optional[datetime] = None):
+        t_time = trade_time or datetime.now()
         self.daily_pnl += pnl
         self.current_balance += pnl
         self.daily_trades += 1
-        self.last_trade_time = datetime.now()
+        self.last_trade_time = t_time
         if pnl >= 0:
             self.consecutive_losses = 0
             self.circuit_breaker.reset_errors()
@@ -233,7 +237,7 @@ class RiskManager:
         if self.current_balance > self.peak_balance:
             self.peak_balance = self.current_balance
         self.trade_log.append({
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': t_time.isoformat() if hasattr(t_time, 'isoformat') else str(t_time),
             'symbol': symbol,
             'pnl': pnl,
             'balance': self.current_balance

@@ -97,7 +97,8 @@ class Backtester:
                         self._close(sym, t.tp, ts, "TP")
             # New signals
             if symbol not in self.open_trades:
-                can, _ = self.risk_manager.can_trade()
+                sim_time = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+                can, _ = self.risk_manager.can_trade(sim_time)
                 if not can:
                     continue
                 setup = self.strategy.analyze(window)
@@ -135,7 +136,8 @@ class Backtester:
         slip = exit_price * t.size * self.config.backtest.slippage_pct
         t.pnl -= (comm + slip)
         self.balance += t.pnl
-        self.risk_manager.record_trade(t.pnl, symbol)
+        sim_exit = exit_time.to_pydatetime() if hasattr(exit_time, "to_pydatetime") else exit_time
+        self.risk_manager.record_trade(t.pnl, symbol, sim_exit)
         if self.balance > self.peak:
             self.peak = self.balance
         self.trades.append(t)

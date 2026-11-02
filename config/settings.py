@@ -23,24 +23,33 @@ class ExchangeConfig:
 @dataclass
 class ScalpingConfig:
     symbols: List[str] = field(default_factory=lambda: ["BTC/USDT", "ETH/USDT", "SOL/USDT"])
+    scan_all_coins: bool = True           # Dynamically scan & trade all liquid coins on exchange
+    max_symbols_to_scan: int = 10         # Number of liquid USDT pairs to analyze
+    min_24h_volume_usd: float = 3_000_000.0 # Only trade pairs with >= $3M 24h volume
+    exclude_coins: List[str] = field(default_factory=lambda: [
+        'USDC/USDT', 'TUSD/USDT', 'BUSD/USDT', 'FDUSD/USDT', 'USDP/USDT',
+        'EUR/USDT', 'USD1/USDT', 'DAI/USDT', 'USTC/USDT', 'RLUSD/USDT',
+        'AEUR/USDT', 'EURI/USDT', 'PEPE/USDT'
+    ])
+    parallel_workers: int = 10            # Multi-threaded scanning for low latency on server
     timeframe: str = "5m"
     higher_timeframe: str = "15m"
     initial_capital: float = 1000.0
     risk_per_trade: float = 0.01          # 1% risk per trade
-    max_positions: int = 3
+    max_positions: int = 5                # Up to 5 concurrent positions across the entire universe
     leverage: int = 1                     # 1x for cash/BNF discipline, up to 5x-20x for scalping
-    take_profit_pct: float = 0.001
-    stop_loss_pct: float = 0.001
-    max_hold_cycles: int = 12
+    take_profit_pct: float = 0.005        # 0.5% default fallback
+    stop_loss_pct: float = 0.004          # 0.4% default fallback
+    max_hold_cycles: int = 720            # 720 cycles * 5s = 60 minutes (12x 5m candles, prevents premature exit)
     trailing_stop: bool = True
-    trailing_stop_pct: float = 0.001
+    trailing_stop_pct: float = 0.003      # 0.3% trailing distance
     use_grid: bool = True
     cooldown_seconds: int = 10
 
 
 @dataclass
 class StrategyConfig:
-    active_strategy: str = "combined"     # combined, kairi_disparity, crypto_laggard, ema_rsi_atr, momentum_scalper, grid_scalper, orderbook_imbalance
+    active_strategy: str = "ema_rsi_atr"     # combined, kairi_disparity, crypto_laggard, ema_rsi_atr, momentum_scalper, grid_scalper, orderbook_imbalance
     
     # EMA / Momentum parameters
     ema_fast: int = 8
@@ -79,7 +88,7 @@ class StrategyConfig:
     laggard_peer_max_move: float = 0.003         # Peer unmoved < 0.3%
 
     # GRU Deep Learning Predictor
-    use_gru_filter: bool = False
+    use_gru_filter: bool = False           # Filters trades using pre-trained deep learning forecast
     gru_model_path: str = "models/crypto_gru_model.h5"
     gru_scaler_path: str = "models/crypto_gru_model_scaler.pkl"
     gru_lookback: int = 20
@@ -91,11 +100,11 @@ class RiskConfig:
     max_daily_loss_pct: float = 0.03
     max_drawdown_pct: float = 0.05
     max_consecutive_losses: int = 5
-    daily_trade_limit: int = 100
+    daily_trade_limit: int = 500         # 500 trades/day (set to 0 for unlimited)
     pause_after_loss_streak: int = 300
     max_position_size_pct: float = 0.1
     max_position_per_symbol_pct: float = 0.15
-    max_portfolio_heat_pct: float = 0.60
+    max_portfolio_heat_pct: float = 0.95
     reduce_size_on_loss: bool = True
     size_reduction_factor: float = 0.5
     # Volatility-adjusted position sizing
@@ -106,11 +115,11 @@ class RiskConfig:
     circuit_breaker_drawdown_pct: float = 0.02
     circuit_breaker_time_window_min: int = 15
     circuit_breaker_error_streak: int = 5
-    # Trailing stop & breakeven
+    # Trailing stop & breakeven (calibrated for 5m scalping)
     trailing_stop_enabled: bool = True
-    trailing_stop_activation_pct: float = 0.015
-    trailing_stop_pct: float = 0.01
-    breakeven_activation_pct: float = 0.01
+    trailing_stop_activation_pct: float = 0.0035   # Activate trailing at +0.35% profit
+    trailing_stop_pct: float = 0.002               # Trail at 0.20% distance from peak
+    breakeven_activation_pct: float = 0.002        # Move stop to breakeven at +0.20% profit
 
 
 @dataclass
@@ -124,7 +133,7 @@ class ExecutionConfig:
     max_slippage_pct: float = 0.003          # reject if estimated slippage > 0.3%
     slippage_depth_levels: int = 10
     # Order flags
-    post_only: bool = False                  # maker-only limit orders
+    post_only: bool = True                  # maker-only limit orders
     reduce_only_stops: bool = True           # stop-losses must be reduce-only
     # TWAP execution
     twap_enabled: bool = False
@@ -132,7 +141,7 @@ class ExecutionConfig:
     twap_interval_sec: int = 30
     # Paper realism
     paper_latency_ms: int = 50
-    paper_slippage_pct: float = 0.001        # 0.1% simulated slippage
+    paper_slippage_pct: float = 0.0005        # 0.1% simulated slippage
     paper_partial_fill_chance: float = 0.1   # 10% chance of partial fill
     paper_reject_chance: float = 0.02        # 2% chance of order rejection
 

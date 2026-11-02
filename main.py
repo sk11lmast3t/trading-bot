@@ -11,6 +11,8 @@ import time
 import logging
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import pandas as pd
 from rich.console import Console
@@ -49,19 +51,43 @@ class UnifiedCryptoBot:
         self.running = False
         self.cycle_count = 0
         self.position_entry_cycle = {}
+        self.position_targets = {}
+        self.last_rejection_log = {}
+        self.trade_lock = threading.Lock()
+        self.last_symbol_refresh = 0
 
         if self.config.mode == "live":
             self.exchange = ExchangeConnector(self.config).connect()
         else:
             self.exchange = PaperExchange(self.config)
 
+        if self.config.scalping.scan_all_coins:
+            self.refresh_symbols()
+
+    def refresh_symbols(self):
+        try:
+            logger.info("Scanning market for active liquid trading pairs...")
+            discovered = self.exchange.fetch_active_symbols(
+                limit=self.config.scalping.max_symbols_to_scan,
+                min_volume=self.config.scalping.min_24h_volume_usd,
+                exclude=self.config.scalping.exclude_coins
+            )
+            if discovered:
+                self.config.scalping.symbols = discovered
+                self.last_symbol_refresh = time.time()
+                logger.info(f"Market scan complete. Dynamically tracking {len(discovered)} coins: {', '.join(discovered[:8])}...")
+        except Exception as e:
+            logger.warning(f"Error during market symbol refresh: {e}")
+
     def show_banner(self):
         console.print("[bold cyan]====================================================[/bold cyan]")
         console.print("[bold green]  UNIFIED CRYPTO SCALPER & DISPARITY BOT (100% PYTHON) [/bold green]")
         console.print("[bold cyan]====================================================[/bold cyan]")
         console.print(f"Mode: [yellow]{self.config.mode.upper()}[/yellow] | Strategy: [magenta]{self.config.strategy.active_strategy}[/magenta]")
-        console.print(f"Symbols: {', '.join(self.config.scalping.symbols)}")
-        console.print(f"Timeframe: {self.config.scalping.timeframe} | Leverage: {self.config.scalping.leverage}x")
+        sym_list = self.config.scalping.symbols
+        display_syms = ', '.join(sym_list[:8]) + (f" ... (+{len(sym_list)-8} more)" if len(sym_list) > 8 else "")
+        console.print(f"Symbols ({len(sym_list)} total): {display_syms}")
+        console.print(f"Timeframe: {self.config.scalping.timeframe} | Leverage: {self.config.scalping.leverage}x | Workers: {self.config.scalping.parallel_workers}")
         console.print(f"Disparity Period: {self.config.strategy.disparity_period} (Panic Thresh: {self.config.strategy.disparity_panic_threshold}%)")
         console.print("[bold cyan]----------------------------------------------------[/bold cyan]")
 
@@ -86,18 +112,29 @@ class UnifiedCryptoBot:
                 if predicted_price is not None:
                     curr_price = df['close'].iloc[-1]
                     if setup.signal == Signal.LONG and predicted_price < curr_price:
-                        logger.info(f"[{symbol}] LONG signal filtered out by GRU forecast (${predicted_price:.2f} < ${curr_price:.2f})")
+                        last_time = self.last_rejection_log.get((symbol, "gru_long"), 0)
+                        if time.time() - last_time > 300:
+                            logger.info(f"[{symbol}] LONG signal filtered out by GRU forecast (${predicted_price:.2f} < ${curr_price:.2f})")
+                            self.last_rejection_log[(symbol, "gru_long")] = time.time()
                         return
                     elif setup.signal == Signal.SHORT and predicted_price > curr_price:
-                        logger.info(f"[{symbol}] SHORT signal filtered out by GRU forecast (${predicted_price:.2f} > ${curr_price:.2f})")
+                        last_time = self.last_rejection_log.get((symbol, "gru_short"), 0)
+                        if time.time() - last_time > 300:
+                            logger.info(f"[{symbol}] SHORT signal filtered out by GRU forecast (${predicted_price:.2f} > ${curr_price:.2f})")
+                            self.last_rejection_log[(symbol, "gru_short")] = time.time()
                         return
 
             # 5. Risk Governor Verification
             now = datetime.now()
             can_trade, reason = self.risk_manager.can_trade(now)
             if not can_trade:
-                logger.info(f"[{symbol}] {setup.signal.value} rejected by RiskManager: {reason}")
+                last_time = self.last_rejection_log.get((symbol, reason), 0)
+                if time.time() - last_time > 300:  # Log at most once per 5 minutes per reason
+                    logger.info(f"[{symbol}] {setup.signal.value} rejected by RiskManager: {reason}")
+                    self.last_rejection_log[(symbol, reason)] = time.time()
                 return
+            else:
+                self.last_rejection_log.pop((symbol, reason), None)
 
             # 6. Check existing positions (No Averaging Down)
             if self.exchange.get_position(symbol):
@@ -146,6 +183,11 @@ class UnifiedCryptoBot:
             self.risk_manager.register_position(symbol, notional_value, side)
             self.risk_manager.update_position_price(symbol, setup.entry_price)
             self.position_entry_cycle[symbol] = self.cycle_count
+            self.position_targets[symbol] = {
+                'tp': setup.take_profit,
+                'sl': setup.stop_loss,
+                'strategy': setup.strategy_name
+            }
 
         except Exception as e:
             logger.error(f"Error processing {symbol}: {e}")
@@ -179,7 +221,7 @@ class UnifiedCryptoBot:
                 self.risk_manager.record_trade(pnl, symbol)
                 self.risk_manager.release_position(symbol)
                 self.position_entry_cycle.pop(symbol, None)
-                self.position_entry_cycle.pop(symbol, None)
+                self.position_targets.pop(symbol, None)
                 return
 
             # Update trailing stop watermark
@@ -198,19 +240,24 @@ class UnifiedCryptoBot:
                 self.risk_manager.record_trade(pnl, symbol)
                 self.risk_manager.release_position(symbol)
                 self.position_entry_cycle.pop(symbol, None)
-                self.position_entry_cycle.pop(symbol, None)
+                self.position_targets.pop(symbol, None)
                 return
 
             hit_tp = False
             hit_sl = False
 
+            # Dynamic strategy targets (ATR-based) with config percentage fallbacks
+            targets = self.position_targets.get(symbol, {})
+            tp_price = targets.get('tp')
+            sl_price = targets.get('sl')
+
             if side == 'long':
-                hit_tp = price >= entry * (1 + sc.take_profit_pct)
-                hit_sl = price <= entry * (1 - sc.stop_loss_pct)
+                hit_tp = (price >= tp_price) if (tp_price and tp_price > entry) else (price >= entry * (1 + sc.take_profit_pct))
+                hit_sl = (price <= sl_price) if (sl_price and sl_price < entry) else (price <= entry * (1 - sc.stop_loss_pct))
                 pnl = (price - entry) * float(pos.get('contracts', 0.0))
             else:
-                hit_tp = price <= entry * (1 - sc.take_profit_pct)
-                hit_sl = price >= entry * (1 + sc.stop_loss_pct)
+                hit_tp = (price <= tp_price) if (tp_price and tp_price < entry) else (price <= entry * (1 - sc.take_profit_pct))
+                hit_sl = (price >= sl_price) if (sl_price and sl_price > entry) else (price >= entry * (1 + sc.stop_loss_pct))
                 pnl = (entry - price) * float(pos.get('contracts', 0.0))
 
             if hit_tp or hit_sl:
@@ -224,6 +271,7 @@ class UnifiedCryptoBot:
                 self.risk_manager.record_trade(pnl, symbol)
                 self.risk_manager.release_position(symbol)
                 self.position_entry_cycle.pop(symbol, None)
+                self.position_targets.pop(symbol, None)
 
         except Exception as e:
             logger.error(f"Error checking exits for {symbol}: {e}")

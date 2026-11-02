@@ -168,6 +168,29 @@ class ExchangeConnector:
         except Exception as e:
             logger.warning(f"Leverage error on {symbol}: {e}")
 
+    def fetch_active_symbols(self, limit: int = 50, min_volume: float = 5_000_000.0,
+                             exclude: Optional[List[str]] = None) -> List[str]:
+        """Fetch all active USDT pairs ranked by 24h trading volume."""
+        exclude_set = set(exclude or [
+            'USDC/USDT', 'TUSD/USDT', 'BUSD/USDT', 'FDUSD/USDT', 'USDP/USDT',
+            'EUR/USDT', 'USD1/USDT', 'DAI/USDT', 'USTC/USDT', 'RLUSD/USDT'
+        ])
+        try:
+            tickers = self.exchange.fetch_tickers()
+            valid = []
+            for sym, t in tickers.items():
+                if not sym.endswith('/USDT') or sym in exclude_set:
+                    continue
+                vol = t.get('quoteVolume', 0) or 0
+                if vol >= min_volume:
+                    valid.append((sym, vol))
+            valid.sort(key=lambda x: x[1], reverse=True)
+            symbols = [s[0] for s in valid[:limit]]
+            return symbols if symbols else ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+        except Exception as e:
+            logger.warning(f"Error fetching active symbols: {e}. Falling back to default list.")
+            return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+
     def _build_params(self, params: dict, post_only: bool = False,
                       reduce_only: bool = False) -> dict:
         p = dict(params or {})
@@ -297,7 +320,7 @@ class PaperExchange:
 
     def _init_public_exchanges(self):
         candidates = []
-        for name in ['kraken', 'coinbase', 'kucoin']:
+        for name in ['binance', 'bybit', 'okx', 'kucoin', 'kraken', 'coinbase']:
             try:
                 ex_class = getattr(ccxt, name)
                 ex = ex_class({'enableRateLimit': True})
@@ -315,7 +338,7 @@ class PaperExchange:
         if self._current_public is None and candidates:
             self._current_public = candidates[0]
         if self._current_public is None:
-            for name in ['kraken', 'coinbase', 'kucoin']:
+            for name in ['binance', 'bybit', 'okx', 'kucoin', 'kraken', 'coinbase']:
                 try:
                     ex_class = getattr(ccxt,name)
                     self._current_public = ex_class({'enableRateLimit':True})
@@ -532,3 +555,40 @@ class PaperExchange:
         if symbol:
             return [o for o in self.orders.values() if o.get('symbol') == symbol]
         return list(self.orders.values())
+
+    def fetch_active_symbols(self, limit: int = 50, min_volume: float = 5_000_000.0,
+                             exclude: Optional[List[str]] = None) -> List[str]:
+        """Fetch all active USDT pairs ranked by 24h trading volume for Paper trading."""
+        exclude_set = set(exclude or [
+            'USDC/USDT', 'TUSD/USDT', 'BUSD/USDT', 'FDUSD/USDT', 'USDP/USDT',
+            'EUR/USDT', 'USD1/USDT', 'DAI/USDT', 'USTC/USDT', 'RLUSD/USDT',
+            'AEUR/USDT', 'EURI/USDT'
+        ])
+        tries = []
+        if self._current_public is not None:
+            tries.append(self._current_public)
+        for ex in self._public_exchanges:
+            if ex not in tries:
+                tries.append(ex)
+
+        for ex in tries:
+            try:
+                tickers = ex.fetch_tickers()
+                valid = []
+                for sym, t in tickers.items():
+                    if not sym.endswith('/USDT') or sym in exclude_set:
+                        continue
+                    vol = t.get('quoteVolume', 0) or 0
+                    if vol >= min_volume:
+                        valid.append((sym, vol))
+                valid.sort(key=lambda x: x[1], reverse=True)
+                symbols = [s[0] for s in valid[:limit]]
+                if symbols:
+                    logger.info(f"Dynamically discovered {len(symbols)} active coins from {getattr(ex, 'id', 'exchange')}")
+                    return symbols
+            except Exception as e:
+                logger.warning(f"Error fetching active symbols from {getattr(ex, 'id', 'exchange')}: {e}")
+                continue
+
+        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+

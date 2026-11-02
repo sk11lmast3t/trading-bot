@@ -59,14 +59,16 @@ class GRUPredictor:
                 return None
 
             sub_df = df[avail_cols].tail(self.lookback).astype(float)
-            scaled = self.scaler.transform(sub_df)
+            local_scaler = MinMaxScaler()
+            scaled = local_scaler.fit_transform(sub_df)
             X = scaled.reshape(1, self.lookback, sub_df.shape[1])
             pred_scaled = self.model.predict(X, verbose=0)
 
-            # Invert scaling on close price (index 3 or 0 depending on scaler)
+            # Invert scaling on close price (column index 3: 'close')
+            close_idx = avail_cols.index('close') if 'close' in avail_cols else 3
             dummy = np.zeros((1, sub_df.shape[1]))
-            dummy[0, 0] = pred_scaled[0, 0]
-            pred_price = self.scaler.inverse_transform(dummy)[0, 0]
+            dummy[0, close_idx] = pred_scaled[0, 0]
+            pred_price = local_scaler.inverse_transform(dummy)[0, close_idx]
             return float(pred_price)
         except Exception as e:
             logger.debug(f"GRU prediction error: {e}")

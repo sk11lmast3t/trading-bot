@@ -46,7 +46,9 @@ class BaseStrategy:
 
 
 class EmaRsiAtrStrategy(BaseStrategy):
-    """Triple EMA + RSI + ATR Trend Scalping"""
+    """Triple EMA + RSI + ATR Trend Scalping
+    Fires on sustained trend alignment (no crossover requirement).
+    """
     def __init__(self, config):
         super().__init__(config)
         self.name = "ema_rsi_atr"
@@ -56,7 +58,6 @@ class EmaRsiAtrStrategy(BaseStrategy):
             return TradeSetup(Signal.HOLD)
         c = self.config.strategy
         last = df.iloc[-1]
-        prev = df.iloc[-2]
         price = last['close']
         atr = last.get('atr', price * 0.01)
 
@@ -66,19 +67,17 @@ class EmaRsiAtrStrategy(BaseStrategy):
         rsi = last['rsi']
         vol_ok = last['volume'] > (last['vol_sma'] * c.min_volume_multiplier) if 'vol_sma' in last and 'volume' in last else True
 
-        # LONG: Fast > Med > Slow + RSI in bullish scalp band + Vol confirmation
+        # LONG: Fast > Med > Slow + RSI in widened bullish band + Vol
         if (ema_fast > ema_medium > ema_slow and vol_ok and
-                rsi >= 40 and rsi <= 60 and
-                prev['ema_fast'] <= prev['ema_medium']):
+                rsi >= 35 and rsi <= 65):
             sl = price - (atr * c.atr_multiplier * 0.8)
             tp = price + (atr * c.atr_multiplier * 2.5)
             confidence = min(0.95, 0.6 + (0.15 if rsi < 55 else 0))
             return TradeSetup(Signal.LONG, price, sl, tp, confidence, self.name)
 
-        # SHORT: Fast < Med < Slow + RSI in bearish scalp band
+        # SHORT: Fast < Med < Slow + RSI in widened bearish band
         if (ema_fast < ema_medium < ema_slow and vol_ok and
-                rsi >= 40 and rsi <= 60 and
-                prev['ema_fast'] >= prev['ema_medium']):
+                rsi >= 35 and rsi <= 65):
             sl = price + (atr * c.atr_multiplier * 0.8)
             tp = price - (atr * c.atr_multiplier * 2.5)
             confidence = min(0.95, 0.6 + (0.15 if rsi > 45 else 0))
@@ -108,15 +107,15 @@ class MomentumScalperStrategy(BaseStrategy):
         bb_lower = last['bb_lower']
         bb_middle = last['bb_middle']
 
-        # LONG: Bounce off lower BB + RSI oversold + MACD turning up
-        if (price <= bb_lower * 1.002 and rsi < 30 and macd_hist > prev['macd_hist']):
+        # LONG: Near lower BB + RSI oversold zone + MACD turning up
+        if (price <= bb_lower * 1.005 and rsi < 35 and macd_hist > prev['macd_hist']):
             sl = price - (atr * 1.5)
             tp = bb_middle * 1.002
             confidence = 0.85 if rsi < c.rsi_oversold else 0.65
             return TradeSetup(Signal.LONG, price, sl, tp, confidence, self.name)
 
-        # SHORT: Reject from upper BB + RSI overbought + MACD turning down
-        if (price >= bb_upper * 0.998 and rsi > 70 and macd_hist < prev['macd_hist']):
+        # SHORT: Near upper BB + RSI overbought zone + MACD turning down
+        if (price >= bb_upper * 0.995 and rsi > 65 and macd_hist < prev['macd_hist']):
             sl = price + (atr * 1.5)
             tp = bb_middle * 0.998
             confidence = 0.85 if rsi > c.rsi_overbought else 0.65
@@ -126,7 +125,11 @@ class MomentumScalperStrategy(BaseStrategy):
 
 
 class GridScalperStrategy(BaseStrategy):
-    """Passivbot-Style Grid Scalper around EMA"""
+    """Passivbot-Style Grid Scalper around EMA
+    Uses ATR proximity band for mean-reversion entries.
+    No strict trend gate — instead uses RSI confirmation and
+    trend-aware TP adjustment to stay profitable in trends.
+    """
     def __init__(self, config):
         super().__init__(config)
         self.name = "grid_scalper"
@@ -138,25 +141,29 @@ class GridScalperStrategy(BaseStrategy):
         price = last["close"]
         atr = last.get("atr", price * 0.01)
         ema = last["ema_medium"]
-        ema_fast = last.get("ema_fast", ema)
-        ema_medium = last.get("ema_medium", ema)
+        rsi = last.get("rsi", 50)
 
-        # Pure EMA trend detection: only exact equality is flat.
-        downtrend = ema_fast < ema_medium
-        uptrend = ema_fast > ema_medium
+        # Distance from EMA as ratio of ATR
+        dist = abs(price - ema) / atr if atr > 0 else 0
 
-        # Grid LONG: buy dips below EMA (blocked in downtrend)
-        if price < ema and not downtrend:
-            sl = price - (atr * 2)
-            tp = ema
-            confidence = 0.7
+        # Only trade in mean-reversion zone: within 2.0 ATR of EMA
+        # but at least 0.3 ATR away (avoid noise right at EMA)
+        if dist < 0.3 or dist > 2.0:
+            return TradeSetup(Signal.HOLD)
+
+        # Confidence scales with distance from EMA (farther = stronger reversion)
+        confidence = min(0.85, 0.55 + dist * 0.15)
+
+        # Grid LONG: price below EMA + RSI not extreme overbought
+        if price < ema and rsi < 60:
+            sl = price - min(atr * 2, price * 0.015)
+            tp = ema + (atr * 1.0)  # target slightly past EMA
             return TradeSetup(Signal.LONG, price, sl, tp, confidence, self.name)
 
-        # Grid SHORT: sell rallies above EMA (blocked in uptrend)
-        if price > ema and not uptrend:
-            sl = price + (atr * 2)
-            tp = ema
-            confidence = 0.7
+        # Grid SHORT: price above EMA + RSI not extreme oversold
+        if price > ema and rsi > 40:
+            sl = price + min(atr * 2, price * 0.015)
+            tp = ema - (atr * 1.0)  # target slightly past EMA
             return TradeSetup(Signal.SHORT, price, sl, tp, confidence, self.name)
 
         return TradeSetup(Signal.HOLD)
@@ -324,7 +331,7 @@ class CombinedStrategy(BaseStrategy):
 
         # High confidence single signal
         best_single = max(signals, key=lambda x: x.confidence)
-        if best_single.confidence >= 0.7:
+        if best_single.confidence >= 0.65:
             return best_single
 
         return TradeSetup(Signal.HOLD)
