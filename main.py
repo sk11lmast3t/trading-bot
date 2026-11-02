@@ -190,7 +190,53 @@ class UnifiedCryptoBot:
             )
 
             # 9. Order Placement with retry & slippage checks
-            if self.config.mode == "live":
+            entry_mode = self.config.execution.entry_mode
+            if entry_mode == "maker":
+                # Post-only limit at best bid/ask; track fill rate; cancel after timeout.
+                if self.config.mode == "live":
+                    self.exchange.set_leverage(symbol, self.config.scalping.leverage)
+                    entry_order = self.exchange.create_best_bid_ask_limit_order(
+                        symbol, side, size, post_only=True
+                    )
+                else:
+                    entry_order = self.exchange.create_best_bid_ask_limit_order(
+                        symbol, side, size, post_only=True
+                    )
+                entry_id = (getattr(entry_order, 'id', None) or
+                            getattr(entry_order, 'order_id', None) or
+                            (entry_order.get('id') if isinstance(entry_order, dict) else None))
+                audit(symbol, side, size, setup.entry_price, entry_id)
+                if entry_order is None:
+                    logger.error(f"[{symbol}] Maker entry order rejected: None")
+                    return
+                if isinstance(entry_order, dict) and entry_order.get('status') == 'rejected':
+                    logger.error(f"[{symbol}] Maker entry order rejected: {entry_order.get('reject_reason')}")
+                    return
+                # Track fill rate and cancel after timeout if unfilled.
+                filled = False
+                cancel_deadline = time.time() + self.config.execution.maker_cancel_seconds
+                while time.time() < cancel_deadline:
+                    if self.config.mode == "live":
+                        checked = self.exchange.check_maker_fill(symbol, entry_id, setup.entry_price, side)
+                    else:
+                        checked = self.exchange.check_limit_fill(symbol, entry_id, setup.entry_price, side)
+                    status = getattr(checked, 'state', None) or (checked.get('status') if isinstance(checked, dict) else None)
+                    if status in ('filled', 'closed') or (isinstance(checked, dict) and checked.get('filled', 0) >= size):
+                        filled = True
+                        entry_order = checked
+                        break
+                    if status in ('cancelled', 'canceled', 'rejected'):
+                        break
+                    time.sleep(1)
+                if not filled:
+                    logger.info(f"[{symbol}] Maker entry not filled within {self.config.execution.maker_cancel_seconds}s; cancelling")
+                    try:
+                        self.exchange.cancel_all_orders(symbol)
+                        audit(symbol, 'cancel', size, setup.entry_price, entry_id, 'cancel')
+                    except Exception:
+                        pass
+                    return
+            elif self.config.mode == "live":
                 self.exchange.set_leverage(symbol, self.config.scalping.leverage)
                 entry_order = self.exchange.create_market_order(symbol, side, size)
                 audit(symbol, side, size, setup.entry_price, getattr(entry_order,'id',None) or getattr(entry_order,'order_id',None))

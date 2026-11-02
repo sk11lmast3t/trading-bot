@@ -104,8 +104,24 @@ class Backtester:
                 setup = self.strategy.analyze(window)
                 if setup.signal in (Signal.LONG, Signal.SHORT):
                     side = "long" if setup.signal == Signal.LONG else "short"
-                    slip = self.config.backtest.slippage_pct
-                    entry_price = price * (1 + slip) if side == "long" else price * (1 - slip)
+                    entry_mode = getattr(self.config.execution, "entry_mode", "market")
+                    if entry_mode == "maker":
+                        # Post-only limit at best bid/ask; fill only if price trades
+                        # through the limit on the next bar (adverse selection).
+                        limit_price = price  # best bid for long, best ask for short
+                        next_cur = df.iloc[i + 1] if i + 1 < len(df) else None
+                        if next_cur is None:
+                            continue
+                        next_high = float(next_cur["high"])
+                        next_low = float(next_cur["low"])
+                        filled = (next_low <= limit_price <= next_high)
+                        if not filled:
+                            continue
+                        entry_price = limit_price
+                        fee = self.config.backtest.maker_fee
+                    else:
+                        entry_price = price
+                        fee = self.config.backtest.taker_fee
                     atr = cur.get("atr") if "atr" in cur else None
                     try:
                         atr = float(atr) if atr is not None else None
@@ -122,7 +138,7 @@ class Backtester:
                                           setup.stop_loss, setup.take_profit,
                                           setup.strategy_name)
                     self.open_trades[symbol] = trade
-                    self.balance -= price * size * self.config.backtest.commission_pct
+                    self.balance -= entry_price * size * fee
             self.equity_curve.append({"ts": ts, "bal": self._equity(price)})
         # Close remaining
         fp = df.iloc[-1]["close"]
@@ -139,8 +155,8 @@ class Backtester:
             t.pnl = (exit_price - t.entry_price) * t.size
         else:
             t.pnl = (t.entry_price - exit_price) * t.size
-        comm = exit_price * t.size * self.config.backtest.commission_pct
-        slip = exit_price * t.size * self.config.backtest.slippage_pct
+        comm = exit_price * t.size * self.config.backtest.taker_fee
+        slip = exit_price * t.size * self.config.backtest.slippage
         t.pnl -= (comm + slip)
         self.balance += t.pnl
         sim_exit = exit_time.to_pydatetime() if hasattr(exit_time, "to_pydatetime") else exit_time

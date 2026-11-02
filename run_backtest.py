@@ -11,19 +11,14 @@ START = "2026-09-29"
 END = "2026-10-29"
 
 
-@dataclass
-class BacktestConfig:
-    initial_balance: float = 1000.0
-    commission_pct: float = 0.001
-    slippage_pct: float = 0.0005
-
-
-def run_one(strat_name, symbol, df, commission, slippage):
+def run_one(strat_name, symbol, df, commission, slippage, entry_mode="market"):
     cfg = BotConfig()
     cfg.strategy.active_strategy = strat_name
-    cfg.backtest = BacktestConfig()
-    cfg.backtest.commission_pct = commission
-    cfg.backtest.slippage_pct = slippage
+    cfg.execution.entry_mode = entry_mode
+    cfg.backtest.initial_balance = 1000.0
+    cfg.backtest.taker_fee = commission
+    cfg.backtest.maker_fee = commission * 0.66
+    cfg.backtest.slippage = slippage
     bt = Backtester(cfg)
     m = bt.run(df.copy(), symbol)
     return m, bt.trades
@@ -46,7 +41,7 @@ def main():
             for sym in SYMBOLS:
                 if sym not in data:
                     continue
-                m, trades = run_one(strat, sym, data[sym], comm, slip)
+                m, trades = run_one(strat, sym, data[sym], comm, slip, entry_mode="market")
                 if "error" in m:
                     print(f"{fee_label} {strat} {sym}: NO TRADES")
                     continue

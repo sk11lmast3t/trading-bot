@@ -279,6 +279,52 @@ class ExchangeConnector:
             check_slippage=False,
         )
 
+    def create_best_bid_ask_limit_order(self, symbol: str, side: str, amount: float,
+                                        post_only: bool = True, params: dict = None):
+        """Place a post-only limit order at the best bid (buy) or best ask (sell)."""
+        try:
+            orderbook = self.fetch_orderbook(symbol, limit=1)
+        except Exception as e:
+            logger.warning(f'[{symbol}] Failed to fetch orderbook for best-bid/ask: {e}')
+            return None
+        if not orderbook:
+            return None
+        if side in ('buy', 'long'):
+            book = orderbook.get('bids') or []
+        else:
+            book = orderbook.get('asks') or []
+        if not book:
+            return None
+        best_price = float(book[0][0])
+        return self.create_limit_order(symbol, side, amount, best_price,
+                                       params=params, post_only=post_only)
+
+    def check_maker_fill(self, symbol: str, order_id: str, limit_price: float, side: str):
+        """Poll a live maker limit order; return updated OrderRecord (or None)."""
+        order = self.orders.get(order_id)
+        if order is None:
+            return None
+        try:
+            raw = self.exchange.fetch_order(order_id, symbol)
+        except Exception as e:
+            logger.warning(f'[{symbol}] fetch_order {order_id} failed: {e}')
+            return order
+        filled = float(raw.get('filled', 0.0))
+        status = raw.get('status', '').lower()
+        if filled > 0:
+            order.filled = filled
+            order.remaining = order.amount - filled
+            order.average_price = float(raw.get('average', limit_price))
+            order.state = OrderState.FILLED if filled >= order.amount else OrderState.PARTIAL
+        elif status in ('closed', 'filled'):
+            order.state = OrderState.FILLED
+            order.filled = order.amount
+        elif status in ('canceled', 'cancelled'):
+            order.state = OrderState.CANCELLED
+        elif status in ('rejected',):
+            order.state = OrderState.REJECTED
+        return order
+
     def create_stop_loss(self, symbol: str, side: str, amount: float, stop_price: float):
         params = {'stopPrice': stop_price}
         if self.exec_cfg.reduce_only_stops:
@@ -498,6 +544,98 @@ class PaperExchange:
         }
         self.orders[order['id']] = order
         self.trade_history.append(order)
+        return order
+
+    def create_best_bid_ask_limit_order(self, symbol: str, side: str, amount: float,
+                                          post_only: bool = True, params: dict = None) -> Dict:
+        """Place a post-only limit order at the best bid (buy) or best ask (sell)."""
+        self._simulate_latency()
+        reject_reason = self._simulate_outcome()
+        if reject_reason:
+            self.order_id += 1
+            return {
+                'id': f"paper_{self.order_id}",
+                'symbol': symbol,
+                'side': side,
+                'amount': amount,
+                'price': 0.0,
+                'status': 'rejected',
+                'timestamp': datetime.now().isoformat(),
+                'reject_reason': reject_reason,
+            }
+        best_price = self._get_best_price(symbol, side)
+        if best_price is None:
+            self.order_id += 1
+            return {
+                'id': f"paper_{self.order_id}",
+                'symbol': symbol,
+                'side': side,
+                'amount': amount,
+                'price': 0.0,
+                'status': 'rejected',
+                'timestamp': datetime.now().isoformat(),
+                'reject_reason': 'No orderbook price available',
+            }
+        return self.create_limit_order(symbol, side, amount, best_price,
+                                       params=params, post_only=post_only)
+
+    def _get_best_price(self, symbol: str, side: str):
+        """Best bid for buys, best ask for sells from the public orderbook."""
+        if self._current_public is None:
+            return None
+        try:
+            orderbook = self._current_public.fetch_order_book(symbol, limit=1)
+        except Exception as e:
+            logger.warning('orderbook fetch failed for %s: %s' % (symbol, e))
+            return None
+        if not orderbook:
+            return None
+        if side in ('buy', 'long'):
+            book = orderbook.get('bids') or []
+        else:
+            book = orderbook.get('asks') or []
+        if not book:
+            return None
+        try:
+            return float(book[0][0])
+        except (TypeError, IndexError, ValueError):
+            return None
+
+    def check_limit_fill(self, symbol: str, order_id: str, limit_price: float, side: str) -> Dict:
+        """Adverse-selection fill model: fill only if price trades through the limit on the next bar."""
+        self._simulate_latency()
+        order = self.orders.get(order_id)
+        if not order or order.get('status') != 'open':
+            return order
+        df = self.fetch_ohlcv(symbol, self.config.scalping.timeframe, 2)
+        if df is None or len(df) < 2:
+            return order
+        cur = df.iloc[-1]
+        high = float(cur['high'])
+        low = float(cur['low'])
+        # Price traded through the limit price during the bar.
+        traded_through = (low <= limit_price <= high)
+        if traded_through:
+            order['status'] = 'filled'
+            order['filled'] = order['amount']
+            order['price'] = limit_price
+            if side in ('buy', 'long'):
+                self.positions[symbol] = {
+                    'symbol': symbol,
+                    'side': 'long',
+                    'contracts': order['amount'],
+                    'entryPrice': limit_price,
+                    'timestamp': datetime.now().isoformat(),
+                }
+            else:
+                self.positions[symbol] = {
+                    'symbol': symbol,
+                    'side': 'short',
+                    'contracts': order['amount'],
+                    'entryPrice': limit_price,
+                    'timestamp': datetime.now().isoformat(),
+                }
+            self.trade_history.append(order)
         return order
 
     def create_stop_loss(self, symbol: str, side: str, amount: float, stop_price: float) -> Dict:

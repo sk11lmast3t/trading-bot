@@ -147,6 +147,10 @@ class ExecutionConfig:
     paper_slippage_pct: float = 0.0005        # 0.1% simulated slippage
     paper_partial_fill_chance: float = 0.1   # 10% chance of partial fill
     paper_reject_chance: float = 0.02        # 2% chance of order rejection
+    # Entry mode: "market" (taker) or "maker" (post-only limit at best bid/ask)
+    entry_mode: str = "market"
+    # Maker order timeout (seconds) before cancelling unfilled limit
+    maker_cancel_seconds: int = 30
 
 
 
