@@ -63,6 +63,8 @@ class UnifiedCryptoBot:
         self.cycle_count = 0
         self.position_entry_cycle = {}
         self.position_targets = {}
+        self.entries_blocked = False
+        self.loaded_positions = []
         self.last_rejection_log = {}
         self.trade_lock = threading.Lock()
         self.last_symbol_refresh = 0
@@ -105,6 +107,12 @@ class UnifiedCryptoBot:
         console.print("[bold cyan]----------------------------------------------------[/bold cyan]")
 
     def process_symbol(self, symbol: str):
+        if self.entries_blocked and symbol not in getattr(self.risk_manager, "open_positions", {}):
+            try:
+                self.check_exits(symbol)
+            except Exception:
+                pass
+            return
         try:
             # 1. Fetch OHLCV
             df = self.exchange.fetch_ohlcv(symbol, self.config.scalping.timeframe, 201)
@@ -355,40 +363,58 @@ class UnifiedCryptoBot:
             logger.error(f"persist_state failed: {e}")
 
     def load_state(self):
-        path = self._state_path()
-        if not os.path.exists(path):
-            return
+        import core.state as cstate
         try:
-            with open(path) as f:
-                data = json.load(f)
+            self.loaded_positions = cstate.load_open_positions()
         except Exception as e:
             logger.error(f"load_state failed: {e}")
-            return
+            self.loaded_positions = []
         try:
+            ex_positions = {}
+            try:
+                ex_positions = self.exchange.get_positions() or {}
+            except Exception:
+                for pp in self.loaded_positions:
+                    sym = pp.get('symbol')
+                    if sym:
+                        try:
+                            ep = self.exchange.get_position(sym)
+                            if ep:
+                                ex_positions[sym] = ep
+                        except Exception:
+                            pass
+            loaded_syms = set(p.get('symbol') for p in self.loaded_positions if p.get('symbol'))
+            ex_syms = set(ex_positions.keys()) if isinstance(ex_positions, dict) else set()
+            if loaded_syms != ex_syms:
+                self.entries_blocked = True
+                logger.warning(f"Restart reconcile mismatch: loaded={loaded_syms} exchange={ex_syms}")
+                return
             rm = self.risk_manager
-            for sym, pos in data.get('open_positions', {}).items():
-                p = dict(pos)
-                if p.get('entry_time'):
+            for pp in self.loaded_positions:
+                sym = pp.get('symbol')
+                if not sym:
+                    continue
+                pos = dict(pp)
+                if pos.get('entry_time'):
                     try:
-                        p['entry_time'] = datetime.fromisoformat(p['entry_time'])
+                        pos['entry_time'] = datetime.fromisoformat(pos['entry_time'])
                     except Exception:
                         pass
-                rm.open_positions[sym] = p
+                rm.open_positions[sym] = pos
+            path = self._state_path()
+            if os.path.exists(path):
+                try:
+                    with open(path) as f:
+                        data = json.load(f)
+                    self.position_targets = data.get('position_targets', self.position_targets)
+                    self.position_entry_cycle = data.get('position_entry_cycle', self.position_entry_cycle)
+                except Exception:
+                    pass
+            if os.environ.get('RECONCILE_CONFIRM') == '1':
+                self.entries_blocked = False
+            logger.info("State loaded")
         except Exception as e:
-            logger.error(f"restore positions failed: {e}")
-        self.position_targets = data.get('position_targets', self.position_targets)
-        self.position_entry_cycle = data.get('position_entry_cycle', self.position_entry_cycle)
-        for sym in list(self.risk_manager.open_positions.keys()):
-            try:
-                ex_pos = self.exchange.get_position(sym)
-            except Exception:
-                ex_pos = None
-            if not ex_pos:
-                logger.warning(f"State mismatch for {sym}: not found on exchange, skipping")
-                self.risk_manager.open_positions.pop(sym, None)
-                self.position_targets.pop(sym, None)
-                self.position_entry_cycle.pop(sym, None)
-        logger.info("State loaded")
+            logger.error(f"reconcile failed: {e}")
 
     def run(self):
         self.show_banner()
