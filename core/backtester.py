@@ -78,7 +78,7 @@ class Backtester:
         logger.info(f"Backtest: {len(df)} candles, ${self.balance}")
         df = Indicators.calculate_all(df, self.config)
         for i in range(60, len(df)):
-            window = df.iloc[:i+1].copy()
+            window = df.iloc[max(0, i-299):i+1].copy()
             cur = df.iloc[i]
             price, high, low = cur["close"], cur["high"], cur["low"]
             ts = df.index[i]
@@ -103,15 +103,22 @@ class Backtester:
                     continue
                 setup = self.strategy.analyze(window)
                 if setup.signal in (Signal.LONG, Signal.SHORT):
+                    side = "long" if setup.signal == Signal.LONG else "short"
+                    slip = self.config.backtest.slippage_pct
+                    entry_price = price * (1 + slip) if side == "long" else price * (1 - slip)
+                    atr = cur.get("atr") if "atr" in cur else None
+                    try:
+                        atr = float(atr) if atr is not None else None
+                    except (TypeError, ValueError):
+                        atr = None
                     size = self.risk_manager.calculate_position_size(
-                        self.balance, setup.entry_price, setup.stop_loss)
+                        self.balance, entry_price, setup.stop_loss, atr=atr)
                     if size <= 0:
                         continue
                     cost = (size * price) / self.config.scalping.leverage
                     if cost > self.balance * 0.95:
                         continue
-                    side = "long" if setup.signal == Signal.LONG else "short"
-                    trade = BacktestTrade(symbol, side, price, size, ts,
+                    trade = BacktestTrade(symbol, side, entry_price, size, ts,
                                           setup.stop_loss, setup.take_profit,
                                           setup.strategy_name)
                     self.open_trades[symbol] = trade
@@ -164,8 +171,9 @@ class Backtester:
         durs = [(t.exit_time - t.entry_time).total_seconds()/60
                 for t in self.trades if t.exit_time and t.entry_time]
         init = self.config.backtest.initial_balance
-        rets = eq.pct_change().dropna()
-        sharpe = (rets.mean() / rets.std()) * np.sqrt(525600) if rets.std() > 0 else 0
+        eq_df = pd.DataFrame({"bal": [e["bal"] for e in self.equity_curve]}, index=pd.to_datetime([e["ts"] for e in self.equity_curve]))
+        daily = eq_df["bal"].resample("1D").last().pct_change().dropna()
+        sharpe = (daily.mean() / daily.std()) * np.sqrt(365) if daily.std() > 0 else 0
         return {
             "total_trades": len(self.trades), "wins": len(wins),
             "losses": len(losses),
