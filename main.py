@@ -107,7 +107,7 @@ class UnifiedCryptoBot:
         console.print("[bold cyan]----------------------------------------------------[/bold cyan]")
 
     def process_symbol(self, symbol: str):
-        if self.entries_blocked and symbol not in getattr(self.risk_manager, "open_positions", {}):
+        if getattr(self, "entries_blocked", False) and symbol not in getattr(self.risk_manager, "open_positions", {}):
             try:
                 self.check_exits(symbol)
             except Exception:
