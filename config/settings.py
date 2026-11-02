@@ -149,6 +149,20 @@ class ExecutionConfig:
     paper_reject_chance: float = 0.02        # 2% chance of order rejection
 
 
+
+
+@dataclass
+class BacktestConfig:
+    """Backtest execution costs and funding parameters.
+    Fees are expressed as a fraction of notional (e.g. 0.0004 = 0.04%).
+    """
+    initial_balance: float = 1000.0
+    maker_fee: float = 0.0004      # 0.04% maker (limit orders)
+    taker_fee: float = 0.0006      # 0.06% taker (market orders)
+    slippage: float = 0.0005       # 0.05% simulated slippage
+    funding_rate: float = 0.0      # per-8h funding rate (0 = disabled)
+
+
 @dataclass
 class BotConfig:
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
@@ -156,6 +170,7 @@ class BotConfig:
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    backtest: BacktestConfig = field(default_factory=BacktestConfig)
     log_level: str = "INFO"
     log_file: str = "logs/bot.log"
     mode: str = "paper"
