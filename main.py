@@ -10,6 +10,7 @@ Integrates:
 import time
 import logging
 import os
+import json
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,6 +37,15 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+os.makedirs('logs', exist_ok=True)
+audit_logger = logging.getLogger('audit')
+audit_logger.setLevel(logging.INFO)
+if not audit_logger.handlers:
+    ah = logging.FileHandler('logs/audit.log')
+    ah.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+    audit_logger.addHandler(ah)
+def audit(symbol, side, qty, price, order_id, action='send'):
+    audit_logger.info(f"{action} symbol={symbol} side={side} qty={qty} price={price} order_id={order_id}")
 
 
 class UnifiedCryptoBot:
@@ -63,6 +73,8 @@ class UnifiedCryptoBot:
 
         if self.config.scalping.scan_all_coins:
             self.refresh_symbols()
+
+        self.load_state()
 
     def refresh_symbols(self):
         try:
@@ -172,15 +184,18 @@ class UnifiedCryptoBot:
             if self.config.mode == "live":
                 self.exchange.set_leverage(symbol, self.config.scalping.leverage)
                 entry_order = self.exchange.create_market_order(symbol, side, size)
+                audit(symbol, side, size, setup.entry_price, getattr(entry_order,'id',None) or getattr(entry_order,'order_id',None))
                 if entry_order and entry_order.state != 'filled':
                     logger.error(f"[{symbol}] Entry order not filled: state={entry_order.state}, error={entry_order.last_error}")
                     return
                 opp_side = 'sell' if side == 'buy' else 'buy'
                 sl_order = self.exchange.create_stop_loss(symbol, opp_side, size, setup.stop_loss)
+                audit(symbol, opp_side, size, setup.stop_loss, getattr(sl_order,'id',None) or getattr(sl_order,'order_id',None), 'send')
                 if sl_order and sl_order.state == 'rejected':
                     logger.error(f"[{symbol}] Stop-loss order rejected: {sl_order.last_error}")
             else:
                 entry_order = self.exchange.create_market_order(symbol, side, size, {'price': setup.entry_price})
+                audit(symbol, side, size, setup.entry_price, getattr(entry_order,'id',None) or getattr(entry_order,'order_id',None) or (entry_order.get('id') if isinstance(entry_order,dict) else None))
                 if isinstance(entry_order, dict) and entry_order.get('status') == 'rejected':
                     logger.error(f"[{symbol}] Entry order rejected: {entry_order.get('reject_reason')}")
                     return
@@ -209,17 +224,21 @@ class UnifiedCryptoBot:
         logger.info(f"[{symbol}] Closed {side.upper()} position: {reason} | PnL: ${pnl:.4f}")
         if self.config.mode == "live":
             opp_side = 'sell' if side == 'long' else 'buy'
-            self.exchange.create_market_order(symbol, opp_side, contracts)
+            co = self.exchange.create_market_order(symbol, opp_side, contracts)
+            audit(symbol, opp_side, contracts, price, getattr(co,'id',None) or getattr(co,'order_id',None))
             try:
                 self.exchange.cancel_all_orders(symbol)
+                audit(symbol, 'cancel', contracts, price, None, 'cancel')
             except Exception:
                 pass
         else:
             self.exchange.close_position(symbol, price)
+            audit(symbol, 'close', contracts, price, None, 'fill')
         self.risk_manager.record_trade(pnl, symbol)
         self.risk_manager.release_position(symbol)
         self.position_entry_cycle.pop(symbol, None)
         self.position_targets.pop(symbol, None)
+        self.persist_state()
 
     def check_exits(self, symbol: str):
         try:
@@ -296,6 +315,63 @@ class UnifiedCryptoBot:
         table.add_row("Cycle Iteration", str(self.cycle_count))
         console.print(table)
 
+    def _state_path(self):
+        return 'state.json'
+
+    def persist_state(self):
+        try:
+            data = {
+                'open_positions': {},
+                'position_targets': self.position_targets,
+                'position_entry_cycle': self.position_entry_cycle,
+            }
+            for sym, pos in getattr(self.risk_manager, 'open_positions', {}).items():
+                p = dict(pos)
+                if isinstance(p.get('entry_time'), datetime):
+                    p['entry_time'] = p['entry_time'].isoformat()
+                data['open_positions'][sym] = p
+            with open(self._state_path(), 'w') as f:
+                json.dump(data, f, default=str)
+            logger.info("State persisted")
+        except Exception as e:
+            logger.error(f"persist_state failed: {e}")
+
+    def load_state(self):
+        path = self._state_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.error(f"load_state failed: {e}")
+            return
+        try:
+            rm = self.risk_manager
+            for sym, pos in data.get('open_positions', {}).items():
+                p = dict(pos)
+                if p.get('entry_time'):
+                    try:
+                        p['entry_time'] = datetime.fromisoformat(p['entry_time'])
+                    except Exception:
+                        pass
+                rm.open_positions[sym] = p
+        except Exception as e:
+            logger.error(f"restore positions failed: {e}")
+        self.position_targets = data.get('position_targets', self.position_targets)
+        self.position_entry_cycle = data.get('position_entry_cycle', self.position_entry_cycle)
+        for sym in list(self.risk_manager.open_positions.keys()):
+            try:
+                ex_pos = self.exchange.get_position(sym)
+            except Exception:
+                ex_pos = None
+            if not ex_pos:
+                logger.warning(f"State mismatch for {sym}: not found on exchange, skipping")
+                self.risk_manager.open_positions.pop(sym, None)
+                self.position_targets.pop(sym, None)
+                self.position_entry_cycle.pop(sym, None)
+        logger.info("State loaded")
+
     def run(self):
         self.show_banner()
         self.running = True
@@ -315,6 +391,12 @@ class UnifiedCryptoBot:
         except KeyboardInterrupt:
             logger.info("Bot manually terminated by user.")
             self.print_status()
+            self.persist_state()
+        finally:
+            try:
+                self.persist_state()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
