@@ -177,20 +177,32 @@ class RiskManager:
         entry = pos['entry_price'] or price
         side = normalize_side(pos.get('side', ''))
         high = pos['high_watermark'] or price
+        low = pos['low_watermark'] or price
 
-        # Breakeven: move stop to entry after activation pct
-        if not pos['breakeven_armed'] and self.rc.breakeven_activation_pct > 0:
+        # Breakeven: arm at breakeven_activation_pct, offset stop by round_trip_cost_pct
+        if not pos.get('breakeven_armed', False) and self.rc.breakeven_activation_pct > 0:
             if side == 'long' and price >= entry * (1 + self.rc.breakeven_activation_pct):
                 pos['breakeven_armed'] = True
-                pos['trailing_stop'] = entry
-                logger.info(f"[{symbol}] Breakeven armed at {entry:.4f}")
+                if pos.get('trailing_stop') is None:
+                    pos['trailing_stop'] = entry * (1 + self.rc.round_trip_cost_pct)
+                logger.info(f"[{symbol}] Breakeven armed at {pos.get('trailing_stop'):.4f}")
             elif side == 'short' and price <= entry * (1 - self.rc.breakeven_activation_pct):
                 pos['breakeven_armed'] = True
-                pos['trailing_stop'] = entry
-                logger.info(f"[{symbol}] Breakeven armed at {entry:.4f}")
+                if pos.get('trailing_stop') is None:
+                    pos['trailing_stop'] = entry * (1 - self.rc.round_trip_cost_pct)
+                logger.info(f"[{symbol}] Breakeven armed at {pos.get('trailing_stop'):.4f}")
 
-        # Trailing stop
-        if pos['trailing_stop'] is not None:
+        # Trailing stop activation: arm when price moves trailing_stop_activation_pct in favor
+        if pos.get('trailing_stop') is None and self.rc.trailing_stop_activation_pct > 0:
+            if side == 'long' and price >= entry * (1 + self.rc.trailing_stop_activation_pct):
+                pos['trailing_stop'] = high * (1 - self.rc.trailing_stop_pct)
+                logger.info(f"[{symbol}] Trailing armed at {pos['trailing_stop']:.4f}")
+            elif side == 'short' and price <= entry * (1 - self.rc.trailing_stop_activation_pct):
+                pos['trailing_stop'] = low * (1 + self.rc.trailing_stop_pct)
+                logger.info(f"[{symbol}] Trailing armed at {pos['trailing_stop']:.4f}")
+
+        # Trailing stop update & hit check
+        if pos.get('trailing_stop') is not None:
             if side == 'long':
                 new_trail = high * (1 - self.rc.trailing_stop_pct)
                 if new_trail > pos['trailing_stop']:
@@ -198,12 +210,13 @@ class RiskManager:
                 if price <= pos['trailing_stop']:
                     return True, f"Trailing stop hit at {pos['trailing_stop']:.4f}"
             else:
-                new_trail = high * (1 + self.rc.trailing_stop_pct)
-                if new_trail < pos['trailing_stop'] or pos['trailing_stop'] == entry:
+                new_trail = low * (1 + self.rc.trailing_stop_pct)
+                if new_trail < pos['trailing_stop']:
                     pos['trailing_stop'] = new_trail
                 if price >= pos['trailing_stop']:
                     return True, f"Trailing stop hit at {pos['trailing_stop']:.4f}"
         return False, ""
+
 
     def release_position(self, symbol: str):
         if symbol in self.symbol_exposure:
