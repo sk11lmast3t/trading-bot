@@ -13,6 +13,13 @@ from typing import List, Dict, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
+def normalize_side(side: str) -> str:
+    s = str(side).strip().lower()
+    if s in ('buy', 'long'):
+        return 'long'
+    if s in ('sell', 'short'):
+        return 'short'
+    raise ValueError(f"Unknown side: {side!r}")
 
 class CircuitBreaker:
     """Tracks rapid drawdown and error streaks to halt trading automatically."""
@@ -140,6 +147,7 @@ class RiskManager:
         return True, "OK"
 
     def register_position(self, symbol: str, notional_value: float, side: str):
+        side = normalize_side(side)
         self.symbol_exposure[symbol] = self.symbol_exposure.get(symbol, 0.0) + notional_value
         self.open_positions[symbol] = {
             'notional': notional_value,
@@ -167,7 +175,7 @@ class RiskManager:
             return False, ""
 
         entry = pos['entry_price'] or price
-        side = pos['side']
+        side = normalize_side(pos.get('side', ''))
         high = pos['high_watermark'] or price
 
         # Breakeven: move stop to entry after activation pct
