@@ -24,6 +24,7 @@ from core.indicators import Indicators
 from core.strategies import get_strategy, Signal
 from core.exchange import ExchangeConnector, PaperExchange, OrderState
 from core.risk_manager import RiskManager
+from core import state
 from core.gru_predictor import GRUPredictor
 
 console = Console()
@@ -217,6 +218,7 @@ class UnifiedCryptoBot:
 
             # 10. Register position for heat & trailing stop tracking
             self.risk_manager.register_position(symbol, notional_value, side)
+            state.save_position_at_entry(symbol, side, size, setup.entry_price, setup.take_profit, setup.stop_loss, setup.strategy_name)
             self.risk_manager.update_position_price(symbol, setup.entry_price)
             self.position_entry_cycle[symbol] = self.cycle_count
             self.position_targets[symbol] = {
@@ -250,6 +252,7 @@ class UnifiedCryptoBot:
             self.exchange.close_position(symbol, price)
             audit(symbol, 'close', contracts, price, None, 'fill')
         self.risk_manager.record_trade(pnl, symbol)
+        state.record_trade(pnl, symbol, reason)
         self.risk_manager.release_position(symbol)
         self.position_entry_cycle.pop(symbol, None)
         self.position_targets.pop(symbol, None)
@@ -441,3 +444,6 @@ if __name__ == "__main__":
             sys.exit(1)
     bot = UnifiedCryptoBot(cfg)
     bot.run()
+
+
+
