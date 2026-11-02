@@ -22,7 +22,7 @@ from rich.table import Table
 from config.settings import BotConfig
 from core.indicators import Indicators
 from core.strategies import get_strategy, Signal
-from core.exchange import ExchangeConnector, PaperExchange
+from core.exchange import ExchangeConnector, PaperExchange, OrderState
 from core.risk_manager import RiskManager
 from core.gru_predictor import GRUPredictor
 
@@ -185,17 +185,32 @@ class UnifiedCryptoBot:
                 self.exchange.set_leverage(symbol, self.config.scalping.leverage)
                 entry_order = self.exchange.create_market_order(symbol, side, size)
                 audit(symbol, side, size, setup.entry_price, getattr(entry_order,'id',None) or getattr(entry_order,'order_id',None))
-                if entry_order and entry_order.state != 'filled':
-                    logger.error(f"[{symbol}] Entry order not filled: state={entry_order.state}, error={entry_order.last_error}")
+                if entry_order is None or getattr(entry_order, 'state') != OrderState.FILLED:
+                    logger.error(f"[{symbol}] Entry order not filled: state={getattr(entry_order,'state',None)}, error={getattr(entry_order,'last_error',None)}")
                     return
                 opp_side = 'sell' if side == 'buy' else 'buy'
                 sl_order = self.exchange.create_stop_loss(symbol, opp_side, size, setup.stop_loss)
                 audit(symbol, opp_side, size, setup.stop_loss, getattr(sl_order,'id',None) or getattr(sl_order,'order_id',None), 'send')
-                if sl_order and sl_order.state == 'rejected':
-                    logger.error(f"[{symbol}] Stop-loss order rejected: {sl_order.last_error}")
+                if sl_order is None or getattr(sl_order, 'state') == OrderState.REJECTED:
+                    logger.error(f"[{symbol}] Stop-loss order rejected: {getattr(sl_order,'last_error',None)}")
+                    try:
+                        self.exchange.close_position(symbol)
+                    except Exception:
+                        try:
+                            self.exchange.create_market_order(symbol, opp_side, size)
+                        except Exception:
+                            pass
+                    try:
+                        self.exchange.cancel_all_orders(symbol)
+                    except Exception:
+                        pass
+                    return
             else:
                 entry_order = self.exchange.create_market_order(symbol, side, size, {'price': setup.entry_price})
                 audit(symbol, side, size, setup.entry_price, getattr(entry_order,'id',None) or getattr(entry_order,'order_id',None) or (entry_order.get('id') if isinstance(entry_order,dict) else None))
+                if entry_order is None:
+                    logger.error(f"[{symbol}] Entry order rejected: None")
+                    return
                 if isinstance(entry_order, dict) and entry_order.get('status') == 'rejected':
                     logger.error(f"[{symbol}] Entry order rejected: {entry_order.get('reject_reason')}")
                     return
