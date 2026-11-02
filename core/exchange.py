@@ -546,7 +546,9 @@ class PaperExchange:
 
     def cancel_all_orders(self, symbol: str):
         self._simulate_latency()
-        self.orders = {k: v for k, v in self.orders.items() if k.get('symbol') != symbol}
+        to_cancel = [k for k,v in self.orders.items() if v.get('symbol') == symbol]
+        self.orders = {k: v for k, v in self.orders.items() if v.get('symbol') != symbol}
+        return len(to_cancel)
 
     def get_order(self, order_id: str) -> Optional[Dict]:
         return self.orders.get(order_id)

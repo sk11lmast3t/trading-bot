@@ -94,9 +94,10 @@ class UnifiedCryptoBot:
     def process_symbol(self, symbol: str):
         try:
             # 1. Fetch OHLCV
-            df = self.exchange.fetch_ohlcv(symbol, self.config.scalping.timeframe, 200)
+            df = self.exchange.fetch_ohlcv(symbol, self.config.scalping.timeframe, 201)
             if df is None or len(df) < 30:
                 return
+            df = df.iloc[:-1]
 
             # 2. Vectorized Indicators & Disparity
             df = Indicators.calculate_all(df, self.config)
@@ -138,6 +139,11 @@ class UnifiedCryptoBot:
 
             # 6. Check existing positions (No Averaging Down)
             if self.exchange.get_position(symbol):
+                return
+
+            # 6b. Max positions enforcement
+            if len(self.risk_manager.open_positions) >= self.config.risk.max_open_positions:
+                logger.info(f"[{symbol}] {setup.signal.value} skipped: max open positions reached")
                 return
 
             # 7. Position Sizing
@@ -262,12 +268,20 @@ class UnifiedCryptoBot:
             except Exception as e:
                 logger.error(f"Trailing check error for {symbol}: {e}")
 
-            # 4. Time exit (using cycle count for now; 1.6 migrates to wall clock)
-            entry_cycle = self.position_entry_cycle.get(symbol, self.cycle_count)
-            max_hold = getattr(sc, 'max_hold_cycles', 60)
-            if self.cycle_count - entry_cycle > max_hold:
-                self._close_position(symbol, pos, price, "TIME EXIT")
-                return
+            # 4. Time exit (wall-clock)
+            rm_pos = self.risk_manager.open_positions.get(symbol, {})
+            entry_time = rm_pos.get('entry_time')
+            if entry_time is not None:
+                hold_min = (datetime.now() - entry_time).total_seconds() / 60.0
+                if hold_min > self.config.risk.max_hold_time_minutes:
+                    self._close_position(symbol, pos, price, "Time exit (wall-clock)")
+                    return
+            else:
+                entry_cycle = self.position_entry_cycle.get(symbol, self.cycle_count)
+                max_hold = getattr(sc, 'max_hold_cycles', 60)
+                if self.cycle_count - entry_cycle > max_hold:
+                    self._close_position(symbol, pos, price, "TIME EXIT")
+                    return
 
         except Exception as e:
             logger.error(f"Error checking exits for {symbol}: {e}")

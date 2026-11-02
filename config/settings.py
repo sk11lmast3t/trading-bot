@@ -105,6 +105,8 @@ class RiskConfig:
     max_position_size_pct: float = 0.1
     max_position_per_symbol_pct: float = 0.15
     max_portfolio_heat_pct: float = 0.95
+    max_open_positions: int = 3
+    max_hold_time_minutes: float = 30.0
     reduce_size_on_loss: bool = True
     size_reduction_factor: float = 0.5
     # Volatility-adjusted position sizing
