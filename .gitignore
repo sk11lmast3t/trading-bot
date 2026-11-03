@@ -46,3 +46,6 @@ logs/
 .DS_Store
 Thumbs.db
 data/
+state.json
+*.db
+out*.txt
