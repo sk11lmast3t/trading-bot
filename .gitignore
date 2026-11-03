@@ -49,3 +49,4 @@ data/
 state.json
 *.db
 out*.txt
+reports/*_trades.csv.gz

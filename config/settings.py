@@ -165,6 +165,10 @@ class BacktestConfig:
     taker_fee: float = 0.0006      # 0.06% taker (market orders)
     slippage: float = 0.0005       # 0.05% simulated slippage
     funding_rate: float = 0.0      # per-8h funding rate (0 = disabled)
+    # Maker-fill queue model: a post-only limit only fills if the next bar trades
+    # THROUGH the limit by at least this fraction (0.0001 = 1 bp). A modelling
+    # assumption, not a measured fill rate: measure the real one in paper/live.
+    maker_penetration: float = 0.0001
 
 
 @dataclass

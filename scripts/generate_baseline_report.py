@@ -1,381 +1,498 @@
-﻿"""
-Generate the baseline walk-forward + backtest report.
+﻿"""Generate reports/baseline_<date>.md: do any of the bot's strategies have a NET edge?
 
-Runs every strategy x fee scenario through the walk-forward engine
-(train 3mo / test 1mo windows) and writes reports/baseline_<date>.md.
+Prerequisite (on your machine, needs network):   python scripts/download_data.py
+Then:                                            python scripts/generate_baseline_report.py --jobs 4
 
-No strategy parameters are tuned; config defaults are used as-is.
-
-Fee scenarios (exit is always a taker fill in the backtester):
-  all-maker  : entry_mode="maker" (post-only limit, modeled next-bar fill),
-               maker fee on entry, taker fee on exit, light slippage
-  mixed      : entry_mode="market", blended entry fee (maker+taker)/2,
-               taker fee on exit, medium slippage
-  all-taker  : entry_mode="market", taker fee on entry and exit,
-               heavy slippage
+What it does
+  * Reads data/*_5m.csv, cuts every symbol into consecutive calendar-month test windows.
+    Nothing is fitted, so every window is out-of-sample by construction (--skip-months N
+    drops the first N months if you later add a tuning step and want a real train period).
+  * Runs each strategy x cost scenario through core.backtester.Backtester, which records
+    gross pnl and every cost on every trade. This script never recomputes costs: it reads
+    those fields, so report, balance and risk manager share ONE cost model.
+  * Reports gross edge, cost and NET edge per trade in bps of notional and in R (R uses
+    each trade's own stop distance), a bootstrap 95% CI, the share of profitable months,
+    exit reasons, maker fill rates, signal diagnostics and a plain verdict per strategy.
+Risk-limit halts are switched off for measurement (otherwise one 5% drawdown stops a test
+window for good), so this measures the SIGNAL, not the risk layer.
 """
-import os
-import sys
+import argparse
 import datetime as dt
-from collections import defaultdict
+import glob
+import os
+import subprocess
+import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
 import numpy as np
 import pandas as pd
 
-from config.settings import BotConfig
-from core.backtester import Backtester, DataDownloader
-from core.walk_forward import WalkForwardEngine
-
 STRATEGIES = ["grid_scalper", "ema_rsi_atr", "momentum_scalper", "kairi_disparity", "combined"]
-SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-START = "2026-06-01"
-END = "2026-11-02"
-TIMEFRAME = "5m"
-EXCHANGE = "binance"
-
-INITIAL_BALANCE = 1000.0
-RISK_PER_TRADE = 0.01            # config default risk_per_trade
-RISK_DOLLAR = INITIAL_BALANCE * RISK_PER_TRADE   # 1R = $10.00
-
-FEE_SCENARIOS = [
-    {
-        "label": "all_maker",
-        "name": "All-maker (modeled fills)",
-        "entry_mode": "maker",
-        "maker_fee": 0.0002,
-        "taker_fee": 0.0005,
-        "slippage": 0.0001,
-    },
-    {
-        "label": "mixed",
-        "name": "Mixed",
-        "entry_mode": "market",
-        "maker_fee": 0.0002,
-        "taker_fee": 0.0005,
-        "slippage": 0.0003,
-    },
-    {
-        "label": "all_taker",
-        "name": "All-taker",
-        "entry_mode": "market",
-        "maker_fee": 0.0002,
-        "taker_fee": 0.0005,
-        "slippage": 0.0005,
-    },
+SCENARIOS = [  # label, title, backtester entry_mode
+    ("all_maker", "All-maker (strict fills, skipped if unfilled)", "maker"),
+    ("mixed", "Mixed (maker first, taker fallback)", "maker_fallback"),
+    ("all_taker", "All-taker (market entries, as main.py trades today)", "market"),
 ]
-
-REPORT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "reports")
-
-
-def entry_fee_rate(scenario):
-    """Effective entry fee rate per scenario."""
-    if scenario["label"] == "all_maker":
-        return scenario["maker_fee"]
-    if scenario["label"] == "mixed":
-        return (scenario["maker_fee"] + scenario["taker_fee"]) / 2.0
-    return scenario["taker_fee"]
+REALISTIC = "all_taker"
+WARMUP_BARS = 300
+INITIAL_BALANCE = 1000.0
+TRADE_COLS = ["strategy", "scenario", "symbol", "window", "side", "entry_how", "exit_reason",
+              "notional", "gross", "costs", "net", "risk", "minutes"]
 
 
-def make_cfg(strat_name, scenario):
-    cfg = BotConfig()
-    cfg.strategy.active_strategy = strat_name
-    cfg.execution.entry_mode = scenario["entry_mode"]
-    cfg.backtest.initial_balance = INITIAL_BALANCE
-    cfg.backtest.maker_fee = scenario["maker_fee"]
-    cfg.backtest.taker_fee = scenario["taker_fee"]
-    cfg.backtest.slippage = scenario["slippage"]
-    return cfg
+# --------------------------------------------------------------------------- config
+def make_cfg(strategy, entry_mode, p):
+    """BotConfig for one run. Risk-limit halts OFF: we measure the signal, not the risk layer."""
+    from config.settings import BotConfig
+    c = BotConfig()
+    c.strategy.active_strategy = strategy
+    c.execution.entry_mode = entry_mode
+    c.backtest.initial_balance = INITIAL_BALANCE
+    c.backtest.maker_fee = p["maker_fee"]
+    c.backtest.taker_fee = p["taker_fee"]
+    c.backtest.slippage = p["slippage"]
+    c.backtest.funding_rate = p["funding"]
+    c.backtest.maker_penetration = p["penetration"]
+    c.risk.max_drawdown_pct = 1.0
+    c.risk.max_daily_loss_pct = 1.0
+    c.risk.max_consecutive_losses = 10 ** 9
+    c.risk.daily_trade_limit = 0
+    c.risk.circuit_breaker_enabled = False
+    c.risk.reduce_size_on_loss = False
+    return c
 
 
-def run_backtest(test_df, symbol, strat_name, scenario):
-    cfg = make_cfg(strat_name, scenario)
-    bt = Backtester(cfg)
-    m = bt.run(test_df.copy(), symbol)
-    trades = []
-    for t in bt.trades:
-        trades.append({
-            "symbol": t.symbol,
-            "side": t.side,
-            "entry": float(t.entry_price),
-            "exit": float(t.exit_price),
-            "size": float(t.size),
-            "entry_time": t.entry_time,
-            "exit_time": t.exit_time,
-            "exit_reason": t.exit_reason,
-            "strategy": t.strategy,
-        })
-    return m, trades
+# --------------------------------------------------------------------------- windows
+def month_windows(index, test_months=1, skip_months=0):
+    """Consecutive calendar-month windows fully covered by the data: [(start, end), ...]."""
+    if len(index) == 0:
+        return []
+    first, last = index.min(), index.max()
+    start = first.normalize().replace(day=1)
+    if start < first.normalize():
+        start = start + pd.DateOffset(months=1)
+    wins = []
+    while True:
+        end = start + pd.DateOffset(months=test_months)
+        if end > last + pd.Timedelta(minutes=5):      # month must be fully covered (bars are 5m)
+            break
+        wins.append((start, end))
+        start = end
+    return wins[skip_months:]
 
 
-def trade_pnl(trade, entry_fee_rate, exit_fee_rate, slip_rate):
-    if trade["side"] == "long":
-        gross = (trade["exit"] - trade["entry"]) * trade["size"]
-    else:
-        gross = (trade["entry"] - trade["exit"]) * trade["size"]
-    entry_cost = trade["entry"] * trade["size"] * entry_fee_rate
-    exit_cost = trade["exit"] * trade["size"] * exit_fee_rate
-    slip = trade["exit"] * trade["size"] * slip_rate
-    net = gross - entry_cost - exit_cost - slip
-    return gross, net, entry_cost + exit_cost + slip
+def load_csv(path):
+    df = pd.read_csv(path, index_col="timestamp", parse_dates=True).sort_index()
+    return df[~df.index.duplicated(keep="last")]
 
 
-def summarize(trades, scenario, days):
-    if not trades:
+def symbol_from_path(path):
+    stem = os.path.basename(path).rsplit("_", 1)[0]          # BTC_USDT_5m.csv -> BTC_USDT
+    return stem.replace("_", "/", 1)
+
+
+# --------------------------------------------------------------------------- one task
+def run_task(task):
+    """All windows for one (symbol, strategy, scenario). Returns (rows, run_rows, stats, max_acct_err)."""
+    from core.backtester import Backtester
+    path, symbol, strategy, label, mode, p = task
+    df = load_csv(path)
+    if p["last_months"]:
+        df = df[df.index >= df.index.max() - pd.DateOffset(months=p["last_months"])]
+    rows, runs, stats, acct_err = [], [], {}, 0.0
+    for wi, (ws, we) in enumerate(month_windows(df.index, p["test_months"], p["skip_months"])):
+        i0, i1 = df.index.searchsorted(ws), df.index.searchsorted(we)
+        if i1 - i0 < 500:
+            continue
+        seg = df.iloc[max(0, i0 - WARMUP_BARS):i1]
+        bt = Backtester(make_cfg(strategy, mode, p))
+        m = bt.run(seg.copy(), symbol, trade_from=ws)
+        acct_err = max(acct_err, abs(bt.balance - (INITIAL_BALANCE + sum(t.pnl for t in bt.trades))))
+        window_label = f"{ws:%Y-%m}"
+        for t in bt.trades:
+            if t.exit_reason == "END":                        # truncated by the window edge
+                stats["end_excluded"] = stats.get("end_excluded", 0) + 1
+                continue
+            rows.append((strategy, label, symbol, window_label, t.side, t.entry_how, t.exit_reason,
+                         t.notional, t.gross_pnl, t.costs, t.pnl,
+                         abs(t.entry_price - t.sl) * t.size,
+                         (t.exit_time - t.entry_time).total_seconds() / 60.0))
+        runs.append({"strategy": strategy, "scenario": label, "symbol": symbol, "window": window_label,
+                     "days": (we - ws).days, "dd": float(m.get("max_drawdown_pct", 0.0)) if "error" not in m else 0.0})
+        for k, v in bt.stats.items():
+            stats[k] = stats.get(k, 0) + v
+    return rows, runs, stats, acct_err
+
+
+# --------------------------------------------------------------------------- metrics
+def add_derived(t):
+    t = t.copy()
+    n = t["notional"].replace(0, np.nan)
+    t["gross_bps"] = t["gross"] / n * 1e4
+    t["cost_bps"] = t["costs"] / n * 1e4
+    t["net_bps"] = t["net"] / n * 1e4
+    risk = t["risk"].replace(0, np.nan)
+    t["net_R"] = t["net"] / risk
+    t["gross_R"] = t["gross"] / risk
+    return t
+
+
+def cluster_bootstrap_ci(t, value="net_bps", reps=2000, seed=7):
+    """95% CI of the pooled mean, resampling (symbol, window) clusters (trades inside a
+    cluster are not independent: same market, same month)."""
+    g = t.groupby(["symbol", "window"])[value].agg(["sum", "count"])
+    if len(g) < 2:
+        return (np.nan, np.nan)
+    s, c = g["sum"].to_numpy(), g["count"].to_numpy()
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(g), size=(reps, len(g)))
+    means = s[idx].sum(axis=1) / c[idx].sum(axis=1)
+    return (float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5)))
+
+
+def summarize(t, symbol_days, reps=2000, seed=7):
+    """One row of metrics. t = derived trades df for one strategy x scenario."""
+    if len(t) == 0:
         return None
-    efr = entry_fee_rate(scenario)
-    processed = [trade_pnl(t, efr, scenario["taker_fee"], scenario["slippage"]) for t in trades]
-    nets = [p[1] for p in processed]
-    grosss = [p[0] for p in processed]
-    costs = sum(p[2] for p in processed)
-    n = len(nets)
-    wins = [x for x in nets if x > 0]
-    losses = [x for x in nets if x <= 0]
-    win_rate = len(wins) / n * 100
-    avg_win = float(np.mean([g for g, n_ in zip(grosss, nets) if n_ > 0])) if wins else 0.0
-    avg_loss = float(np.mean([n_ for n_ in nets if n_ <= 0])) if losses else 0.0
-    gross_win_sum = sum(g for g, n_ in zip(grosss, nets) if n_ > 0)
-    net_expectancy = float(np.mean(nets))
-    gross_expectancy = (len(wins) / n) * avg_win
-    total_pnl = float(sum(nets))
-    bal = INITIAL_BALANCE
-    peak = INITIAL_BALANCE
-    max_dd = 0.0
-    for net in nets:
-        bal += net
-        if bal > peak:
-            peak = bal
-        dd = (peak - bal) / peak * 100
-        if dd > max_dd:
-            max_dd = dd
-    pf = (sum(wins) / abs(sum(losses))) if losses and sum(losses) != 0 else float("inf")
-    c2t = (costs / gross_win_sum) if gross_win_sum > 0 else float("inf")
-    trades_per_day = n / days if days else 0.0
-
-    def pct(x):
-        return x / INITIAL_BALANCE * 100
-
-    def bps(x):
-        return pct(x) * 100
-
-    def r(x):
-        return x / RISK_DOLLAR
-
-    exit_reasons = defaultdict(lambda: {"n": 0, "pnl": 0.0})
-    for t, net in zip(trades, nets):
-        b = exit_reasons[t["exit_reason"]]
-        b["n"] += 1
-        b["pnl"] += net
-
+    win = t["net"] > 0
+    losses = t.loc[~win, "net"]
+    lo, hi = cluster_bootstrap_ci(t, "net_bps", reps, seed)
+    month_means = t.groupby("window")["net_bps"].mean()
     return {
-        "trades": n,
-        "win_rate": win_rate,
-        "net_exp_$": net_expectancy,
-        "net_exp_%": pct(net_expectancy),
-        "net_exp_bps": bps(net_expectancy),
-        "net_exp_R": r(net_expectancy),
-        "gross_exp_$": gross_expectancy,
-        "gross_exp_%": pct(gross_expectancy),
-        "gross_exp_bps": bps(gross_expectancy),
-        "gross_exp_R": r(gross_expectancy),
-        "avg_win_$": avg_win,
-        "avg_win_%": pct(avg_win),
-        "avg_win_bps": bps(avg_win),
-        "avg_win_R": r(avg_win),
-        "avg_loss_$": avg_loss,
-        "avg_loss_%": pct(avg_loss),
-        "avg_loss_bps": bps(avg_loss),
-        "avg_loss_R": r(avg_loss),
-        "total_pnl_$": total_pnl,
-        "roi_%": pct(total_pnl),
-        "profit_factor": pf,
-        "max_dd_%": max_dd,
-        "cost_to_target": c2t,
-        "cost_to_target_%": c2t * 100 if c2t != float("inf") else float("inf"),
-        "trades_per_day": trades_per_day,
-        "total_costs_$": costs,
-        "gross_profit_$": gross_win_sum,
-        "exit_reasons": dict(exit_reasons),
+        "n": len(t),
+        "per_day": len(t) / symbol_days if symbol_days else np.nan,
+        "win_pct": float(win.mean() * 100),
+        "gross_bps": float(t["gross_bps"].mean()),                 # mean over ALL trades
+        "cost_bps": float(t["cost_bps"].mean()),
+        "net_bps": float(t["net_bps"].mean()),
+        "ci_lo": lo, "ci_hi": hi,
+        "net_R": float(t["net_R"].mean()),
+        "net_usd": float(t["net"].mean()),
+        "avg_win_bps": float(t.loc[win, "net_bps"].mean()) if win.any() else 0.0,
+        "avg_loss_bps": float(t.loc[~win, "net_bps"].mean()) if (~win).any() else 0.0,
+        "pf": float(t.loc[win, "net"].sum() / abs(losses.sum())) if len(losses) and losses.sum() != 0 else np.inf,
+        "pos_months": int((month_means > 0).sum()),
+        "months": int(len(month_means)),
+        "pos_symbols": int((t.groupby("symbol")["net_bps"].mean() > 0).sum()),
+        "symbols": int(t["symbol"].nunique()),
     }
 
 
-def fmt_exit_breakdown(er):
-    lines = []
-    total = sum(v["n"] for v in er.values())
-    for reason in ("SL", "TP", "END"):
-        v = er.get(reason, {"n": 0, "pnl": 0.0})
-        share = v["n"] / total * 100 if total else 0
-        avg = v["pnl"] / v["n"] if v["n"] else 0
-        lines.append(f"| {reason} | {v['n']} | {share:5.1f}% | ${avg:9.2f} |")
-    if not lines:
-        lines.append("| - | - | - | - |")
-    return "\n".join(lines)
+def verdict(s):
+    """Plain-language call. 'Edge candidate' needs a positive CI AND a majority of positive months."""
+    if s is None:
+        return "NO TRADES"
+    if np.isnan(s["ci_lo"]):
+        return "TOO FEW WINDOWS"
+    if s["ci_lo"] > 0 and s["pos_months"] > s["months"] / 2:
+        return "EDGE CANDIDATE (confirm on fresh data + paper)"
+    if s["ci_hi"] < 0:
+        return "LOSES MONEY (CI below 0)"
+    return "NO EDGE DEMONSTRATED (CI includes 0)"
 
 
-def main():
-    os.makedirs(REPORT_DIR, exist_ok=True)
-    print("Downloading data...")
-    data = {}
-    for sym in SYMBOLS:
-        try:
-            df = DataDownloader.download(EXCHANGE, sym, TIMEFRAME, START, END)
-            data[sym] = df.sort_index()
-            print(f"  {sym}: {len(df)} candles")
-        except Exception as e:
-            print(f"  {sym} FAILED: {e}")
+# --------------------------------------------------------------------------- formatting
+def f(x, d=1, signed=False):
+    if x is None or (isinstance(x, float) and (np.isnan(x))):
+        return "n/a"
+    if isinstance(x, float) and np.isinf(x):
+        return "inf"
+    return f"{x:+.{d}f}" if signed else f"{x:.{d}f}"
 
-    if not data:
-        print("No data downloaded; aborting.")
-        return 1
 
-    wf = WalkForwardEngine(train_months=3, test_months=1, step_months=1)
-    windows = wf.windows(next(iter(data.values())))
-    window_count = len(windows)
-    test_days = sum(
-        (w["test"].index.max() - w["test_start"]).days for w in windows
-    ) or 1
+def md_table(headers, rows):
+    out = ["| " + " | ".join(headers) + " |", "|" + "|".join("---" for _ in headers) + "|"]
+    out += ["| " + " | ".join(str(c) for c in r) + " |" for r in rows]
+    return "\n".join(out)
 
-    results = {}  # (strat, scenario_label) -> pooled metrics + per symbol
-    for strat in STRATEGIES:
-        for scenario in FEE_SCENARIOS:
-            pooled_trades = []
-            per_symbol = {}
-            for sym in SYMBOLS:
-                df = data[sym]
 
-                def evaluate(train_df, test_df, _sym=sym, _strat=strat, _scen=scenario):
-                    _, trades = run_backtest(test_df, _sym, _strat, _scen)
-                    return trades
+def git_rev():
+    try:
+        return subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=10).stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
 
-                out = wf.run(df, evaluate)
-                sym_trades = []
-                for res in out["oos"]:
-                    sym_trades.extend(res or [])
-                per_symbol[sym] = sym_trades
-                pooled_trades.extend(sym_trades)
-                print(f"  {strat:16s} {scenario['label']:10s} {sym:9s} trades={len(sym_trades)} windows={out['windows']}")
 
-            m = summarize(pooled_trades, scenario, test_days)
-            if m is None:
-                m = {"trades": 0, "win_rate": 0.0, "net_exp_$": 0.0, "net_exp_%": 0.0,
-                     "net_exp_bps": 0.0, "net_exp_R": 0.0, "gross_exp_$": 0.0,
-                     "gross_exp_%": 0.0, "gross_exp_bps": 0.0, "gross_exp_R": 0.0,
-                     "avg_win_$": 0.0, "avg_win_%": 0.0, "avg_win_bps": 0.0, "avg_win_R": 0.0,
-                     "avg_loss_$": 0.0, "avg_loss_%": 0.0, "avg_loss_bps": 0.0, "avg_loss_R": 0.0,
-                     "total_pnl_$": 0.0, "roi_%": 0.0, "profit_factor": 0.0,
-                     "max_dd_%": 0.0, "cost_to_target": float("inf"),
-                     "cost_to_target_%": 0.0, "trades_per_day": 0.0,
-                     "total_costs_$": 0.0, "gross_profit_$": 0.0, "exit_reasons": {}}
-            m["per_symbol"] = {}
-            for sym, sym_trades in per_symbol.items():
-                m["per_symbol"][sym] = summarize(sym_trades, scenario, test_days)
-            results[(strat, scenario["label"])] = m
+# --------------------------------------------------------------------------- report
+def kairi_diagnostics(files, last_months):
+    from core.indicators import Indicators
+    from config.settings import BotConfig
+    thr = BotConfig().strategy.disparity_panic_threshold
+    crash = BotConfig().strategy.disparity_crash_threshold
+    rows = []
+    for path in files:
+        df = load_csv(path)
+        if last_months:
+            df = df[df.index >= df.index.max() - pd.DateOffset(months=last_months)]
+        d = Indicators.disparity(df["close"], 25).dropna()
+        rows.append((symbol_from_path(path), len(d), f(d.min(), 2), f(d.quantile(0.001), 2),
+                     f(d.quantile(0.01), 2), int((d <= thr).sum()), int((d <= crash).sum())))
+    return thr, crash, rows
 
-    report_date = dt.date.today().isoformat()
-    path = os.path.join(REPORT_DIR, f"baseline_{report_date}.md")
-    lines = []
-    lines.append(f"# Baseline Report — Unified Crypto Scalper ({report_date})")
-    lines.append("")
-    lines.append("Generated by `scripts/generate_baseline_report.py`. No strategy parameters were tuned;")
-    lines.append("config defaults (`config/settings.py`) are used as-is.")
-    lines.append("")
-    lines.append("## Data & setup")
-    lines.append(f"- Data range: {START} to {END} ({TIMEFRAME} candles, {EXCHANGE})")
-    lines.append(f"- Symbol count: {len(SYMBOLS)} — {', '.join(SYMBOLS)}")
-    lines.append(f"- Walk-forward windows: {window_count} (train 3mo / test 1mo, step 1mo), out-of-sample test period only")
-    lines.append(f"- Initial balance: ${INITIAL_BALANCE:,.2f}, leverage 1x")
-    lines.append(f"- Risk per trade: {RISK_PER_TRADE*100:.2f}% of capital = ${RISK_DOLLAR:,.2f} (1R)")
-    lines.append("")
-    lines.append("## Fee scenarios")
-    lines.append("| Scenario | Entry | Entry fee | Exit fee | Slippage | Notes |")
-    lines.append("|----------|-------|-----------|----------|----------|-------|")
-    for s in FEE_SCENARIOS:
-        efr = entry_fee_rate(s)
-        lines.append(
-            f"| {s['name']} | {s['entry_mode']} | {efr*100:5.3f}% | "
-            f"{s['taker_fee']*100:5.3f}% | {s['slippage']*100:5.3f}% | "
-            f"{'modeled next-bar fill' if s['entry_mode']=='maker' else 'blended maker/taker entry cost' if s['label']=='mixed' else 'aggressive'} |"
-        )
-    lines.append("")
-    lines.append("Exit fees are taker fees in all scenarios (the backtester exits at market).")
-    lines.append("Expectancy per trade: net = mean(net PnL/trade); gross = win rate × avg win.")
-    lines.append("Percent/bps are vs initial balance ($1,000); R is vs $10.00 risk per trade.")
-    lines.append("Cost-to-target = total transaction costs / gross profit from winning trades.")
-    lines.append("")
-    lines.append("## Summary by strategy × fee scenario (pooled across symbols & walk-forward windows)")
-    lines.append("")
-    lines.append("| Strategy | Scenario | Trades | Trades/day | Win % | Net exp ($ / % / bps / R) | Gross exp ($ / % / bps / R) | Avg win ($) | Avg loss ($) | Cost→target | Max DD % |")
-    lines.append("|----------|----------|--------|------------|-------|---------------------------|-----------------------------|-------------|--------------|-------------|----------|")
-    for strat in STRATEGIES:
-        for scenario in FEE_SCENARIOS:
-            m = results[(strat, scenario["label"])]
-            net = m["net_exp_$"]
-            gross = m["gross_exp_$"]
-            lines.append(
-                f"| {strat} | {scenario['name']} | {m['trades']} | {m['trades_per_day']:6.2f} | "
-                f"{m['win_rate']:5.2f} | ${net:9.2f} / {m['net_exp_%']:6.3f}% / {m['net_exp_bps']:7.1f} / {m['net_exp_R']:7.3f} | "
-                f"${gross:9.2f} / {m['gross_exp_%']:6.3f}% / {m['gross_exp_bps']:7.1f} / {m['gross_exp_R']:7.3f} | "
-                f"${m['avg_win_$']:9.2f} | ${m['avg_loss_$']:9.2f} | "
-                f"{m['cost_to_target'] if m['cost_to_target'] != float('inf') else 'n/a':>5} "
-                f"({m['cost_to_target_%'] if m['cost_to_target_%'] != float('inf') else 0:5.1f}%) | {m['max_dd_%']:6.2f} |"
-            )
-    lines.append("")
 
-    for scenario in FEE_SCENARIOS:
-        lines.append(f"## {scenario['name']}")
-        lines.append("")
-        lines.append("### Exit-reason breakdown (pooled across symbols & windows)")
-        lines.append("")
-        lines.append("| Reason | Trades | Share | Avg PnL ($) |")
-        lines.append("|--------|--------|-------|-------------|")
-        any_trades = False
-        for strat in STRATEGIES:
-            m = results[(strat, scenario["label"])]
-            er = m["exit_reasons"]
-            total = sum(v["n"] for v in er.values())
-            if total == 0:
+def build_report(trades, runs, stats, files, args, params, acct_err, scen_filter):
+    t = add_derived(trades) if len(trades) else trades
+    runs = pd.DataFrame(runs, columns=["strategy", "scenario", "symbol", "window", "days", "dd"])
+    L = []
+    L.append(f"# Baseline Report - {args.date}")
+    L.append("")
+    L.append(f"Generated by `scripts/generate_baseline_report.py` at commit `{git_rev()}`. "
+             "No strategy parameter was tuned: `config/settings.py` defaults are used as-is.")
+    L.append("")
+    # ---- data
+    L.append("## 1. Data and method")
+    d_rows = []
+    for path in files:
+        df = load_csv(path)
+        exp = int((df.index[-1] - df.index[0]) / pd.Timedelta(minutes=5)) + 1
+        d_rows.append((symbol_from_path(path), f"{df.index[0]:%Y-%m-%d}", f"{df.index[-1]:%Y-%m-%d}",
+                       f"{len(df):,}", f"{len(df) / exp:.2%}"))
+    L.append(md_table(["Symbol", "From", "To", "5m bars", "Coverage"], d_rows))
+    L.append("")
+    n_windows = runs["window"].nunique() if len(runs) else 0
+    sym_days = (runs.drop_duplicates(["symbol", "window"])["days"].sum() if len(runs) else 0)
+    L.append(f"- **{len(files)} symbols x {n_windows} test months** ({sym_days:,} symbol-days). "
+             f"Each month is tested on bars the strategy never saw; nothing is fitted, so there is no look-ahead "
+             f"(indicators are warmed on the {WARMUP_BARS} bars before each month, with no trading during warm-up).")
+    L.append(f"- Symbols are ranked by **current** volume, so the set is biased towards coins that are big today "
+             f"(survivorship). Treat results as optimistic for alts.")
+    L.append(f"- **Risk-limit halts are off** for measurement (drawdown, daily loss, loss-streak, circuit breaker); "
+             f"sizing is the bot's own (1% risk, position capped at 10% of capital), so dollar pnl is small. "
+             f"Compare strategies in **bps of notional** and **R** (R = pnl / that trade's own stop distance).")
+    L.append(f"- Trades cut off by a month boundary are excluded ({stats.get('end_excluded', 0)} of them).")
+    L.append(f"- Accounting self-check (balance == start + sum of net trade pnl, every run): "
+             f"**{'PASS' if acct_err < 1e-6 else 'FAIL'}** (max error {acct_err:.2e}).")
+    L.append("")
+    L.append("### Cost assumptions (edit with CLI flags)")
+    L.append(md_table(["Maker fee", "Taker fee", "Slippage / market leg", "Maker fill rule", "Funding"], [(
+        f"{params['maker_fee'] * 1e4:.1f} bps", f"{params['taker_fee'] * 1e4:.1f} bps",
+        f"{params['slippage'] * 1e4:.1f} bps",
+        f"limit at signal close; next bar must trade {params['penetration'] * 1e4:.1f} bps through",
+        f"{params['funding'] * 100:.4f}% per 8h")]))
+    L.append("")
+    L.append("Defaults are Binance USD-M futures VIP0 (maker 2 bps / taker 5 bps); Binance spot is 10 / 10 bps. "
+             "**Use your real fee tier** (`--maker-fee`, `--taker-fee`). Every exit is a market order "
+             "(taker fee + slippage), as in `main.py`. Maker entries pay no slippage.")
+    L.append("")
+    L.append(md_table(["Scenario", "Entry"], [(title, f"`{mode}`") for lab, title, mode in SCENARIOS if lab in scen_filter]))
+    L.append("")
+    # ---- verdicts
+    sums, rows = {}, []
+    for strat in args.strategies:
+        for lab, title, _ in SCENARIOS:
+            if lab not in scen_filter:
                 continue
-            any_trades = True
-            for reason in ("SL", "TP", "END"):
-                v = er.get(reason, {"n": 0, "pnl": 0.0})
-                if v["n"] == 0:
-                    continue
-                share = v["n"] / total * 100
-                avg = v["pnl"] / v["n"]
-                lines.append(f"| {strat} / {reason} | {v['n']} | {share:5.1f}% | ${avg:9.2f} |")
-        if not any_trades:
-            lines.append("| - | - | - | - |")
-        lines.append("")
-        lines.append("### Per-symbol detail")
-        lines.append("")
-        lines.append("| Symbol | Trades | Trades/day | Win % | Net exp/trade ($) | Net exp (R) | Avg win ($) | Avg loss ($) | Cost→target (%) | Max DD % |")
-        lines.append("|--------|--------|------------|-------|-------------------|-------------|-------------|--------------|-----------------|----------|")
-        for strat in STRATEGIES:
-            for sym in SYMBOLS:
-                m = results[(strat, scenario["label"])]["per_symbol"][sym]
-                if m is None:
-                    continue
-                c2t = m["cost_to_target_%"] if m["cost_to_target_%"] != float("inf") else 0.0
-                lines.append(
-                    f"| {sym} | {m['trades']} | {m['trades_per_day']:6.2f} | {m['win_rate']:5.2f} | "
-                    f"${m['net_exp_$']:9.2f} | {m['net_exp_R']:7.3f} | ${m['avg_win_$']:9.2f} | "
-                    f"${m['avg_loss_$']:9.2f} | {c2t:6.2f}% | {m['max_dd_%']:6.2f} |"
-                )
-        lines.append("")
+            sub = t[(t["strategy"] == strat) & (t["scenario"] == lab)] if len(t) else t
+            days = runs[(runs["strategy"] == strat) & (runs["scenario"] == lab)].drop_duplicates(["symbol", "window"])["days"].sum() if len(runs) else 0
+            sums[(strat, lab)] = summarize(sub, days, args.bootstrap, args.seed) if len(sub) else None
+    L.append("## 2. Verdict")
+    L.append("An **edge candidate** needs the 95% CI of NET expectancy above zero *and* a majority of profitable months. "
+             "Anything else is *not demonstrated*, which is weaker than *proven absent*.")
+    L.append("")
+    v_rows = []
+    for strat in args.strategies:
+        for lab, title, _ in SCENARIOS:
+            if lab not in scen_filter:
+                continue
+            s = sums[(strat, lab)]
+            if s is None:
+                v_rows.append((f"`{strat}`", lab, 0, "-", "-", "-", "NO TRADES"))
+                continue
+            v_rows.append((f"`{strat}`", lab, f"{s['n']:,}", f(s["net_bps"], 2, True),
+                           f"[{f(s['ci_lo'], 2, True)}, {f(s['ci_hi'], 2, True)}]",
+                           f"{s['pos_months']}/{s['months']}", verdict(s)))
+    L.append(md_table(["Strategy", "Scenario", "Trades", "Net bps/trade", "95% CI", "Profitable months", "Verdict"], v_rows))
+    L.append("")
+    # ---- per scenario
+    L.append("## 3. Results by scenario")
+    for lab, title, mode in SCENARIOS:
+        if lab not in scen_filter:
+            continue
+        L.append(f"### {title}")
+        rows = []
+        for strat in args.strategies:
+            s = sums[(strat, lab)]
+            if s is None:
+                rows.append((f"`{strat}`", 0, "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"))
+                continue
+            dd = runs[(runs["strategy"] == strat) & (runs["scenario"] == lab)]["dd"]
+            rows.append((f"`{strat}`", f"{s['n']:,}", f(s["per_day"], 1), f(s["win_pct"], 1),
+                         f(s["gross_bps"], 2, True), f(s["cost_bps"], 2), f(s["net_bps"], 2, True),
+                         f(s["net_R"], 3, True), f(s["net_usd"], 3, True),
+                         f"{f(s['avg_win_bps'], 1, True)} / {f(s['avg_loss_bps'], 1, True)}",
+                         f(s["pf"], 2), f(float(dd.min()), 1)))
+        L.append(md_table(["Strategy", "Trades", "/symbol-day", "Win %", "Gross bps", "Cost bps", "**Net bps**",
+                           "Net R", "Net $", "Avg win / loss bps", "Profit factor", "Worst-month DD %"], rows))
+        L.append("")
+        L.append("Gross = mean over ALL trades before costs. Net = gross - cost. A strategy needs gross bps "
+                 "comfortably above cost bps before it can pay for itself.")
+        L.append("")
+        # exit reasons
+        sub = t[t["scenario"] == lab] if len(t) else t
+        if len(sub):
+            er = (sub.groupby(["strategy", "exit_reason"])
+                  .agg(n=("net", "size"), net_bps=("net_bps", "mean")).reset_index())
+            tot = er.groupby("strategy")["n"].transform("sum")
+            er["share"] = er["n"] / tot * 100
+            L.append("Exit reasons")
+            L.append(md_table(["Strategy", "Exit", "Trades", "Share %", "Mean net bps"],
+                              [(f"`{r.strategy}`", r.exit_reason, f"{r.n:,}", f(r.share, 1), f(r.net_bps, 2, True))
+                               for r in er.itertuples()]))
+            L.append("")
+    # ---- pivots
+    L.append("## 4. Where it works and where it does not")
+    for lab, title, _ in SCENARIOS:
+        if lab not in scen_filter or not len(t):
+            continue
+        sub = t[t["scenario"] == lab]
+        piv = sub.pivot_table(index="symbol", columns="strategy", values="net_bps", aggfunc="mean")
+        cnt = sub.pivot_table(index="symbol", columns="strategy", values="net_bps", aggfunc="size")
+        cols = [s for s in args.strategies if s in piv.columns]
+        L.append(f"### Net bps per trade by symbol - {lab}")
+        L.append(md_table(["Symbol"] + [f"`{c}`" for c in cols],
+                          [(sym, *[f"{f(piv.loc[sym, c], 1, True)} ({int(cnt.loc[sym, c]) if not np.isnan(cnt.loc[sym, c]) else 0})"
+                                    if not np.isnan(piv.loc[sym, c]) else "-" for c in cols]) for sym in piv.index]))
+        L.append("")
+        pm = sub.pivot_table(index="window", columns="strategy", values="net_bps", aggfunc="mean")
+        L.append(f"### Net bps per trade by month - {lab}")
+        L.append(md_table(["Month"] + [f"`{c}`" for c in cols],
+                          [(w, *[f(pm.loc[w, c], 1, True) if c in pm.columns and not np.isnan(pm.loc[w, c]) else "-" for c in cols])
+                           for w in pm.index]))
+        L.append("")
+    # ---- maker
+    L.append("## 5. Maker-entry diagnostics")
+    L.append("Fill behaviour of the `maker` / `maker_fallback` scenarios. The fill rule is an assumption "
+             "(see cost assumptions): **measure the real fill rate in paper/live before relying on maker fees.**")
+    L.append("")
+    mrows = []
+    for key, lab in (("maker", "all_maker"), ("maker_fallback", "mixed")):
+        if lab not in scen_filter:
+            continue
+        a, fl, un = stats["by"].get(lab, {}).get("maker_attempts", 0), stats["by"].get(lab, {}).get("maker_fills", 0), \
+            stats["by"].get(lab, {}).get("maker_unfilled", 0)
+        fb = stats["by"].get(lab, {}).get("maker_fallbacks", 0)
+        mrows.append((lab, f"{a:,}", f"{fl:,}", f"{fl / a:.1%}" if a else "n/a", f"{un:,}", f"{fb:,}"))
+    L.append(md_table(["Scenario", "Orders", "Filled as maker", "Fill rate", "Skipped (maker)", "Taker fallbacks"], mrows))
+    L.append("")
+    # ---- signals
+    L.append("## 6. Signal diagnostics")
+    srows = []
+    for strat in args.strategies:
+        sig = stats["by_strat"].get(strat, {}).get("signals", 0)
+        days = runs[(runs["strategy"] == strat) & (runs["scenario"] == stats["sig_scen"])].drop_duplicates(["symbol", "window"])["days"].sum() if len(runs) else 0
+        srows.append((f"`{strat}`", f"{sig:,}", f(sig / days, 2) if days else "n/a"))
+    L.append(f"Signals seen in the `{stats['sig_scen']}` run (before position-size and balance checks):")
+    L.append("")
+    L.append(md_table(["Strategy", "Signals", "Per symbol-day"], srows))
+    L.append("")
+    if "kairi_disparity" in args.strategies:
+        thr, crash, krow = kairi_diagnostics(files, args.last_months)
+        L.append(f"`kairi_disparity` buys when 25-bar disparity <= **{thr}%** (crash regime {crash}%). "
+                 f"On 5m bars of liquid pairs that depth is rare, which is why it can show 0 trades. "
+                 f"Disparity (%) of the closing price vs its 25-bar SMA:")
+        L.append("")
+        L.append(md_table(["Symbol", "Bars", "Min", "0.1th pct", "1st pct", f"Bars <= {thr}%", f"Bars <= {crash}%"], krow))
+        L.append("")
+    # ---- limitations
+    L.append("## 7. What this report does NOT prove")
+    for line in [
+        "**Backtester vs live.** The backtester exits on stop, target or the 30 min time limit only. The live bot also "
+        "arms a breakeven stop and a trailing stop (`risk_manager.py`), which are NOT simulated here. They can change results either way.",
+        "**Intrabar order.** If a bar touches both stop and target, the stop is assumed first (pessimistic). Gaps through a stop fill at the stop price (optimistic).",
+        "**Maker fills** use a simple queue-penetration rule. Real fill rates and adverse selection must be measured live.",
+        "**Fees and slippage** are assumptions (flags above), identical for every symbol. Small alts slip more than BTC.",
+        "**Per-symbol independence.** Each symbol is simulated alone on a fresh $1,000; portfolio caps, margin and "
+        "exchange limits are not modelled.",
+        "**One market history.** Months here are the months that happened. A regime not present in the data is not tested.",
+        "**Survivorship** in the symbol list (ranked by today's volume).",
+    ]:
+        L.append(f"- {line}")
+    L.append("")
+    return "\n".join(L)
 
-    lines.append("## Notes")
-    lines.append("- All figures are out-of-sample walk-forward results (no training-window leakage into reported metrics).")
-    lines.append("- Maker entries use modeled next-bar fills: unposted limit orders that do not trade through are skipped.")
-    lines.append("- Expectancy in R uses $10.00 per trade (1% of $1,000 capital).")
-    lines.append("- Drawdown is computed on the trade-close balance curve per run.")
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+# --------------------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data", default=os.path.join(ROOT, "data"))
+    ap.add_argument("--out", default=os.path.join(ROOT, "reports"))
+    ap.add_argument("--strategies", nargs="*", default=STRATEGIES)
+    ap.add_argument("--scenarios", nargs="*", default=[s[0] for s in SCENARIOS],
+                    choices=[s[0] for s in SCENARIOS])
+    ap.add_argument("--maker-fee", type=float, default=0.0002)
+    ap.add_argument("--taker-fee", type=float, default=0.0005)
+    ap.add_argument("--slippage", type=float, default=0.0003)
+    ap.add_argument("--penetration", type=float, default=0.0001)
+    ap.add_argument("--funding", type=float, default=0.0, help="per-8h funding rate, longs pay when positive")
+    ap.add_argument("--test-months", type=int, default=1)
+    ap.add_argument("--skip-months", type=int, default=0, help="drop the first N test months (train period)")
+    ap.add_argument("--last-months", type=int, default=0, help="only use the most recent N months (quick runs)")
+    ap.add_argument("--bootstrap", type=int, default=2000)
+    ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    ap.add_argument("--save-trades", action="store_true", help="also write the trade list as .csv.gz")
+    ap.add_argument("--date", default=dt.date.today().isoformat())
+    args = ap.parse_args()
 
-    print(f"\nReport written to {path}")
-    return 0
+    files = sorted(glob.glob(os.path.join(args.data, "*_5m.csv")))
+    if not files:
+        sys.exit(f"No *_5m.csv files in {args.data}. Run: python scripts/download_data.py")
+    params = {"maker_fee": args.maker_fee, "taker_fee": args.taker_fee, "slippage": args.slippage,
+              "penetration": args.penetration, "funding": args.funding,
+              "test_months": args.test_months, "skip_months": args.skip_months, "last_months": args.last_months}
+    scen = [s for s in SCENARIOS if s[0] in args.scenarios]
+    tasks = [(p, symbol_from_path(p), st, lab, mode, params)
+             for p in files for st in args.strategies for lab, _, mode in scen]
+    print(f"{len(files)} symbols x {len(args.strategies)} strategies x {len(scen)} scenarios = {len(tasks)} tasks, jobs={args.jobs}")
+
+    all_rows, all_runs, acct_err = [], [], 0.0
+    stats = {"end_excluded": 0, "by": {}, "by_strat": {},
+             "sig_scen": REALISTIC if REALISTIC in args.scenarios else args.scenarios[0]}
+    def absorb(res):
+        nonlocal acct_err
+        rows, runs, st, err = res
+        all_rows.extend(rows)
+        all_runs.extend(runs)
+        acct_err = max(acct_err, err)
+        stats["end_excluded"] += st.get("end_excluded", 0)
+        if runs:
+            lab, strat = runs[0]["scenario"], runs[0]["strategy"]
+            for k, v in st.items():
+                stats["by"].setdefault(lab, {}).setdefault(k, 0)
+                stats["by"][lab][k] += v
+                if lab == stats["sig_scen"]:
+                    stats["by_strat"].setdefault(strat, {}).setdefault(k, 0)
+                    stats["by_strat"][strat][k] += v
+
+    done = 0
+    if args.jobs <= 1:
+        for task in tasks:
+            absorb(run_task(task))
+            done += 1
+            print(f"  [{done}/{len(tasks)}] {task[1]} {task[2]} {task[3]}", flush=True)
+    else:
+        with ProcessPoolExecutor(max_workers=args.jobs) as ex:
+            futs = {ex.submit(run_task, tk): tk for tk in tasks}
+            for fu in as_completed(futs):
+                absorb(fu.result())
+                done += 1
+                tk = futs[fu]
+                print(f"  [{done}/{len(tasks)}] {tk[1]} {tk[2]} {tk[3]}", flush=True)
+
+    trades = pd.DataFrame(all_rows, columns=TRADE_COLS)
+    os.makedirs(args.out, exist_ok=True)
+    report = build_report(trades, all_runs, stats, files, args, params, acct_err, set(args.scenarios))
+    path = os.path.join(args.out, f"baseline_{args.date}.md")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(report)
+    if args.save_trades:
+        trades.to_csv(os.path.join(args.out, f"baseline_{args.date}_trades.csv.gz"), index=False)
+    print(f"\nWrote {path}")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
