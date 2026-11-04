@@ -99,6 +99,9 @@ def run_task(task):
     """All windows for one (symbol, strategy, scenario). Returns (rows, run_rows, stats, max_acct_err)."""
     from core.backtester import Backtester
     path, symbol, strategy, label, mode, p = task
+    # "name@240" = strategy `name` with a 240-minute time exit (hold-time sweeps need no extra flag)
+    strat_name, _, hold = strategy.partition("@")
+    hold_min = float(hold) if hold else None
     df = load_csv(path)
     if p["last_months"]:
         df = df[df.index >= df.index.max() - pd.DateOffset(months=p["last_months"])]
@@ -107,8 +110,9 @@ def run_task(task):
         i0, i1 = df.index.searchsorted(ws), df.index.searchsorted(we)
         if i1 - i0 < 500:
             continue
-        seg = df.iloc[max(0, i0 - WARMUP_BARS):i1]
-        bt = Backtester(make_cfg(strategy, mode, p))
+        bt = Backtester(make_cfg(strat_name, mode, p), max_hold_minutes=hold_min)
+        warm = max(WARMUP_BARS, int(getattr(bt.strategy, "lookback_bars", 0)))
+        seg = df.iloc[max(0, i0 - warm):i1]
         m = bt.run(seg.copy(), symbol, trade_from=ws)
         acct_err = max(acct_err, abs(bt.balance - (INITIAL_BALANCE + sum(t.pnl for t in bt.trades))))
         window_label = f"{ws:%Y-%m}"
@@ -400,7 +404,7 @@ def build_report(trades, runs, stats, files, args, params, acct_err, scen_filter
     # ---- limitations
     L.append("## 7. What this report does NOT prove")
     for line in [
-        "**Backtester vs live.** The backtester exits on stop, target or the 30 min time limit only. The live bot also "
+        "**Backtester vs live.** The backtester exits on stop, target or the time limit only (30 min unless a strategy label says `name@MINUTES`). The live bot also "
         "arms a breakeven stop and a trailing stop (`risk_manager.py`), which are NOT simulated here. They can change results either way.",
         "**Intrabar order.** If a bar touches both stop and target, the stop is assumed first (pessimistic). Gaps through a stop fill at the stop price (optimistic).",
         "**Maker fills** use a simple queue-penetration rule. Real fill rates and adverse selection must be measured live.",

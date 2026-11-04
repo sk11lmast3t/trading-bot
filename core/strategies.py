@@ -337,8 +337,94 @@ class CombinedStrategy(BaseStrategy):
         return TradeSetup(Signal.HOLD)
 
 
+def completed_bars(window: pd.DataFrame, rule: str, minutes: int, base_minutes: int = 5) -> pd.DataFrame:
+    """Resample 5m bars (indexed by OPEN time) to `rule`, keeping only COMPLETED higher-timeframe bars.
+
+    The newest bucket is dropped unless the window's last 5m bar is the final one of that bucket.
+    Keeping a partial bucket would leak the future into the trend filter.
+    """
+    ohlc = window.resample(rule, label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+    if len(ohlc) == 0:
+        return ohlc
+    bucket_end = ohlc.index[-1] + pd.Timedelta(minutes=minutes)
+    if window.index[-1] + pd.Timedelta(minutes=base_minutes) < bucket_end:
+        ohlc = ohlc.iloc[:-1]
+    return ohlc
+
+
+class MtfTrendPullbackStrategy(BaseStrategy):
+    """30m + 1h trend bias, 5m pullback-and-resume entry. ONE fixed rule set (pre-registered, not tuned).
+
+    Trend (completed bars only): LONG bias when the 1h close is above its EMA(20), the 1h EMA(20) is
+    rising over 3 bars, and the 30m close is above its EMA(20). SHORT bias is the mirror image.
+    Entry (5m): LONG when RSI fell to <= 40 within the last 6 bars and price closes back above the 5m
+    EMA(fast) after closing at/below it; SHORT is the mirror (RSI >= 60, close back below the EMA).
+    Exits: stop 1.5 x ATR(14) of the 1h bars, target 3 x that (2R); the time exit comes from the
+    backtester (use the `name@MINUTES` label in the report script).
+    """
+    lookback_bars = 720            # 60h of 5m bars: enough for EMA(20)/ATR(14) on 1h bars
+
+    HTF_EMA = 20
+    SLOPE_BARS = 3
+    ATR_N = 14
+    SL_ATR = 1.5
+    TP_ATR = 3.0
+    PULLBACK_BARS = 6
+    PULLBACK_RSI_LONG = 40.0
+    PULLBACK_RSI_SHORT = 60.0
+    MIN_HTF_BARS = 25
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.name = "mtf_trend_pullback"
+
+    def _trigger(self, df):
+        """Cheap 5m check first, so the resampling only runs on the few bars that could trade."""
+        if len(df) < self.PULLBACK_BARS + 2:
+            return None
+        last, prev = df.iloc[-1], df.iloc[-2]
+        rsi = df["rsi"].iloc[-self.PULLBACK_BARS:]
+        if rsi.isna().any() or pd.isna(last["ema_fast"]) or pd.isna(prev["ema_fast"]):
+            return None
+        if rsi.min() <= self.PULLBACK_RSI_LONG and last["close"] > last["ema_fast"] \
+                and prev["close"] <= prev["ema_fast"]:
+            return "long"
+        if rsi.max() >= self.PULLBACK_RSI_SHORT and last["close"] < last["ema_fast"] \
+                and prev["close"] >= prev["ema_fast"]:
+            return "short"
+        return None
+
+    def analyze(self, df: pd.DataFrame) -> TradeSetup:
+        side = self._trigger(df)
+        if side is None:
+            return TradeSetup(Signal.HOLD)
+        h1 = completed_bars(df, "1h", 60)
+        h30 = completed_bars(df, "30min", 30)
+        if len(h1) < self.MIN_HTF_BARS or len(h30) < self.MIN_HTF_BARS:
+            return TradeSetup(Signal.HOLD)
+        ema1 = Indicators.ema(h1["close"], self.HTF_EMA)
+        ema30 = Indicators.ema(h30["close"], self.HTF_EMA)
+        rising = ema1.iloc[-1] > ema1.iloc[-1 - self.SLOPE_BARS]
+        falling = ema1.iloc[-1] < ema1.iloc[-1 - self.SLOPE_BARS]
+        up = h1["close"].iloc[-1] > ema1.iloc[-1] and rising and h30["close"].iloc[-1] > ema30.iloc[-1]
+        down = h1["close"].iloc[-1] < ema1.iloc[-1] and falling and h30["close"].iloc[-1] < ema30.iloc[-1]
+        atr = float(Indicators.atr(h1["high"], h1["low"], h1["close"], self.ATR_N).iloc[-1])
+        if not np.isfinite(atr) or atr <= 0:
+            return TradeSetup(Signal.HOLD)
+        price = float(df["close"].iloc[-1])
+        if side == "long" and up:
+            return TradeSetup(Signal.LONG, price, price - self.SL_ATR * atr,
+                              price + self.TP_ATR * atr, 0.7, self.name)
+        if side == "short" and down:
+            return TradeSetup(Signal.SHORT, price, price + self.SL_ATR * atr,
+                              price - self.TP_ATR * atr, 0.7, self.name)
+        return TradeSetup(Signal.HOLD)
+
+
 def get_strategy(config) -> BaseStrategy:
     strategies = {
+        "mtf_trend_pullback": MtfTrendPullbackStrategy,
         "ema_rsi_atr": EmaRsiAtrStrategy,
         "momentum_scalper": MomentumScalperStrategy,
         "grid_scalper": GridScalperStrategy,
