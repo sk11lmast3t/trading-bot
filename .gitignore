@@ -45,3 +45,8 @@ logs/
 .idea/
 .DS_Store
 Thumbs.db
+data/
+state.json
+*.db
+out*.txt
+reports/*_trades.csv.gz

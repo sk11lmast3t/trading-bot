@@ -22,8 +22,9 @@ from rich.table import Table
 from config.settings import BotConfig
 from core.indicators import Indicators
 from core.strategies import get_strategy, Signal
-from core.exchange import ExchangeConnector, PaperExchange
+from core.exchange import ExchangeConnector, PaperExchange, OrderState
 from core.risk_manager import RiskManager
+from core import state
 from core.gru_predictor import GRUPredictor
 
 console = Console()
@@ -62,6 +63,8 @@ class UnifiedCryptoBot:
         self.cycle_count = 0
         self.position_entry_cycle = {}
         self.position_targets = {}
+        self.entries_blocked = False
+        self.loaded_positions = []
         self.last_rejection_log = {}
         self.trade_lock = threading.Lock()
         self.last_symbol_refresh = 0
@@ -104,6 +107,12 @@ class UnifiedCryptoBot:
         console.print("[bold cyan]----------------------------------------------------[/bold cyan]")
 
     def process_symbol(self, symbol: str):
+        if getattr(self, "entries_blocked", False) and symbol not in getattr(self.risk_manager, "open_positions", {}):
+            try:
+                self.check_exits(symbol)
+            except Exception:
+                pass
+            return
         try:
             # 1. Fetch OHLCV
             df = self.exchange.fetch_ohlcv(symbol, self.config.scalping.timeframe, 201)
@@ -181,27 +190,89 @@ class UnifiedCryptoBot:
             )
 
             # 9. Order Placement with retry & slippage checks
-            if self.config.mode == "live":
+            entry_mode = self.config.execution.entry_mode
+            if entry_mode == "maker":
+                # Post-only limit at best bid/ask; track fill rate; cancel after timeout.
+                if self.config.mode == "live":
+                    self.exchange.set_leverage(symbol, self.config.scalping.leverage)
+                    entry_order = self.exchange.create_best_bid_ask_limit_order(
+                        symbol, side, size, post_only=True
+                    )
+                else:
+                    entry_order = self.exchange.create_best_bid_ask_limit_order(
+                        symbol, side, size, post_only=True
+                    )
+                entry_id = (getattr(entry_order, 'id', None) or
+                            getattr(entry_order, 'order_id', None) or
+                            (entry_order.get('id') if isinstance(entry_order, dict) else None))
+                audit(symbol, side, size, setup.entry_price, entry_id)
+                if entry_order is None:
+                    logger.error(f"[{symbol}] Maker entry order rejected: None")
+                    return
+                if isinstance(entry_order, dict) and entry_order.get('status') == 'rejected':
+                    logger.error(f"[{symbol}] Maker entry order rejected: {entry_order.get('reject_reason')}")
+                    return
+                # Track fill rate and cancel after timeout if unfilled.
+                filled = False
+                cancel_deadline = time.time() + self.config.execution.maker_cancel_seconds
+                while time.time() < cancel_deadline:
+                    if self.config.mode == "live":
+                        checked = self.exchange.check_maker_fill(symbol, entry_id, setup.entry_price, side)
+                    else:
+                        checked = self.exchange.check_limit_fill(symbol, entry_id, setup.entry_price, side)
+                    status = getattr(checked, 'state', None) or (checked.get('status') if isinstance(checked, dict) else None)
+                    if status in ('filled', 'closed') or (isinstance(checked, dict) and checked.get('filled', 0) >= size):
+                        filled = True
+                        entry_order = checked
+                        break
+                    if status in ('cancelled', 'canceled', 'rejected'):
+                        break
+                    time.sleep(1)
+                if not filled:
+                    logger.info(f"[{symbol}] Maker entry not filled within {self.config.execution.maker_cancel_seconds}s; cancelling")
+                    try:
+                        self.exchange.cancel_all_orders(symbol)
+                        audit(symbol, 'cancel', size, setup.entry_price, entry_id, 'cancel')
+                    except Exception:
+                        pass
+                    return
+            elif self.config.mode == "live":
                 self.exchange.set_leverage(symbol, self.config.scalping.leverage)
                 entry_order = self.exchange.create_market_order(symbol, side, size)
                 audit(symbol, side, size, setup.entry_price, getattr(entry_order,'id',None) or getattr(entry_order,'order_id',None))
-                if entry_order and entry_order.state != 'filled':
-                    logger.error(f"[{symbol}] Entry order not filled: state={entry_order.state}, error={entry_order.last_error}")
+                if entry_order is None or getattr(entry_order, 'state') != OrderState.FILLED:
+                    logger.error(f"[{symbol}] Entry order not filled: state={getattr(entry_order,'state',None)}, error={getattr(entry_order,'last_error',None)}")
                     return
                 opp_side = 'sell' if side == 'buy' else 'buy'
                 sl_order = self.exchange.create_stop_loss(symbol, opp_side, size, setup.stop_loss)
                 audit(symbol, opp_side, size, setup.stop_loss, getattr(sl_order,'id',None) or getattr(sl_order,'order_id',None), 'send')
-                if sl_order and sl_order.state == 'rejected':
-                    logger.error(f"[{symbol}] Stop-loss order rejected: {sl_order.last_error}")
+                if sl_order is None or getattr(sl_order, 'state') == OrderState.REJECTED:
+                    logger.error(f"[{symbol}] Stop-loss order rejected: {getattr(sl_order,'last_error',None)}")
+                    try:
+                        self.exchange.close_position(symbol)
+                    except Exception:
+                        try:
+                            self.exchange.create_market_order(symbol, opp_side, size)
+                        except Exception:
+                            pass
+                    try:
+                        self.exchange.cancel_all_orders(symbol)
+                    except Exception:
+                        pass
+                    return
             else:
                 entry_order = self.exchange.create_market_order(symbol, side, size, {'price': setup.entry_price})
                 audit(symbol, side, size, setup.entry_price, getattr(entry_order,'id',None) or getattr(entry_order,'order_id',None) or (entry_order.get('id') if isinstance(entry_order,dict) else None))
+                if entry_order is None:
+                    logger.error(f"[{symbol}] Entry order rejected: None")
+                    return
                 if isinstance(entry_order, dict) and entry_order.get('status') == 'rejected':
                     logger.error(f"[{symbol}] Entry order rejected: {entry_order.get('reject_reason')}")
                     return
 
             # 10. Register position for heat & trailing stop tracking
             self.risk_manager.register_position(symbol, notional_value, side)
+            state.save_position_at_entry(symbol, side, size, setup.entry_price, setup.take_profit, setup.stop_loss, setup.strategy_name)
             self.risk_manager.update_position_price(symbol, setup.entry_price)
             self.position_entry_cycle[symbol] = self.cycle_count
             self.position_targets[symbol] = {
@@ -235,6 +306,7 @@ class UnifiedCryptoBot:
             self.exchange.close_position(symbol, price)
             audit(symbol, 'close', contracts, price, None, 'fill')
         self.risk_manager.record_trade(pnl, symbol)
+        state.record_trade(pnl, symbol, reason)
         self.risk_manager.release_position(symbol)
         self.position_entry_cycle.pop(symbol, None)
         self.position_targets.pop(symbol, None)
@@ -337,40 +409,58 @@ class UnifiedCryptoBot:
             logger.error(f"persist_state failed: {e}")
 
     def load_state(self):
-        path = self._state_path()
-        if not os.path.exists(path):
-            return
+        import core.state as cstate
         try:
-            with open(path) as f:
-                data = json.load(f)
+            self.loaded_positions = cstate.load_open_positions()
         except Exception as e:
             logger.error(f"load_state failed: {e}")
-            return
+            self.loaded_positions = []
         try:
+            ex_positions = {}
+            try:
+                ex_positions = self.exchange.get_positions() or {}
+            except Exception:
+                for pp in self.loaded_positions:
+                    sym = pp.get('symbol')
+                    if sym:
+                        try:
+                            ep = self.exchange.get_position(sym)
+                            if ep:
+                                ex_positions[sym] = ep
+                        except Exception:
+                            pass
+            loaded_syms = set(p.get('symbol') for p in self.loaded_positions if p.get('symbol'))
+            ex_syms = set(ex_positions.keys()) if isinstance(ex_positions, dict) else set()
+            if loaded_syms != ex_syms:
+                self.entries_blocked = True
+                logger.warning(f"Restart reconcile mismatch: loaded={loaded_syms} exchange={ex_syms}")
+                return
             rm = self.risk_manager
-            for sym, pos in data.get('open_positions', {}).items():
-                p = dict(pos)
-                if p.get('entry_time'):
+            for pp in self.loaded_positions:
+                sym = pp.get('symbol')
+                if not sym:
+                    continue
+                pos = dict(pp)
+                if pos.get('entry_time'):
                     try:
-                        p['entry_time'] = datetime.fromisoformat(p['entry_time'])
+                        pos['entry_time'] = datetime.fromisoformat(pos['entry_time'])
                     except Exception:
                         pass
-                rm.open_positions[sym] = p
+                rm.open_positions[sym] = pos
+            path = self._state_path()
+            if os.path.exists(path):
+                try:
+                    with open(path) as f:
+                        data = json.load(f)
+                    self.position_targets = data.get('position_targets', self.position_targets)
+                    self.position_entry_cycle = data.get('position_entry_cycle', self.position_entry_cycle)
+                except Exception:
+                    pass
+            if os.environ.get('RECONCILE_CONFIRM') == '1':
+                self.entries_blocked = False
+            logger.info("State loaded")
         except Exception as e:
-            logger.error(f"restore positions failed: {e}")
-        self.position_targets = data.get('position_targets', self.position_targets)
-        self.position_entry_cycle = data.get('position_entry_cycle', self.position_entry_cycle)
-        for sym in list(self.risk_manager.open_positions.keys()):
-            try:
-                ex_pos = self.exchange.get_position(sym)
-            except Exception:
-                ex_pos = None
-            if not ex_pos:
-                logger.warning(f"State mismatch for {sym}: not found on exchange, skipping")
-                self.risk_manager.open_positions.pop(sym, None)
-                self.position_targets.pop(sym, None)
-                self.position_entry_cycle.pop(sym, None)
-        logger.info("State loaded")
+            logger.error(f"reconcile failed: {e}")
 
     def run(self):
         self.show_banner()
@@ -426,3 +516,6 @@ if __name__ == "__main__":
             sys.exit(1)
     bot = UnifiedCryptoBot(cfg)
     bot.run()
+
+
+
