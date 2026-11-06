@@ -187,6 +187,8 @@ class Backtester:
         if mode in ("maker", "maker_fallback"):
             self.stats["maker_attempts"] += 1
             if i + 1 >= len(df):
+                # Signal on the last candle of the run: no next bar to test a fill against.
+                self.stats["maker_no_next_bar"] += 1
                 return
             nxt = df.iloc[i + 1]
             pen = float(getattr(bt, "maker_penetration", 0.0))

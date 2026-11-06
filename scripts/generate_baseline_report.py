@@ -330,10 +330,12 @@ def build_report(trades, runs, stats, files, args, params, acct_err, scen_filter
                          f"{f(s['avg_win_bps'], 1, True)} / {f(s['avg_loss_bps'], 1, True)}",
                          f(s["pf"], 2), f(float(dd.min()), 1)))
         L.append(md_table(["Strategy", "Trades", "/symbol-day", "Win %", "Gross bps", "Cost bps", "**Net bps**",
-                           "Net R", "Net $", "Avg win / loss bps", "Profit factor", "Worst-month DD %"], rows))
+                           "Net R", "Net $/trade", "Avg win / loss bps", "Profit factor", "Worst-month DD %"], rows))
         L.append("")
         L.append("Gross = mean over ALL trades before costs. Net = gross - cost. A strategy needs gross bps "
                  "comfortably above cost bps before it can pay for itself.")
+        L.append("")
+        L.append("Net $/trade = mean net pnl per trade in USD on a fresh $1,000 account.")
         L.append("")
         # exit reasons
         sub = t[t["scenario"] == lab] if len(t) else t
@@ -373,14 +375,30 @@ def build_report(trades, runs, stats, files, args, params, acct_err, scen_filter
              "(see cost assumptions): **measure the real fill rate in paper/live before relying on maker fees.**")
     L.append("")
     mrows = []
+    warn = []
     for key, lab in (("maker", "all_maker"), ("maker_fallback", "mixed")):
         if lab not in scen_filter:
             continue
-        a, fl, un = stats["by"].get(lab, {}).get("maker_attempts", 0), stats["by"].get(lab, {}).get("maker_fills", 0), \
-            stats["by"].get(lab, {}).get("maker_unfilled", 0)
-        fb = stats["by"].get(lab, {}).get("maker_fallbacks", 0)
-        mrows.append((lab, f"{a:,}", f"{fl:,}", f"{fl / a:.1%}" if a else "n/a", f"{un:,}", f"{fb:,}"))
-    L.append(md_table(["Scenario", "Orders", "Filled as maker", "Fill rate", "Skipped (maker)", "Taker fallbacks"], mrows))
+        s = stats["by"].get(lab, {})
+        a = s.get("maker_attempts", 0)
+        fl = s.get("maker_fills", 0)
+        un = s.get("maker_unfilled", 0)
+        fb = s.get("maker_fallbacks", 0)
+        nn = s.get("maker_no_next_bar", 0)
+        unacc = a - fl - un - fb - nn
+        evaluated = a - nn
+        if unacc != 0:
+            warn.append(lab)
+        mrows.append((lab, f"{a:,}", f"{fl:,}", f"{fl / evaluated:.1%}" if evaluated else "n/a",
+                      f"{un:,}", f"{fb:,}", f"{nn:,}", f"{unacc:,}"))
+    L.append(md_table(["Scenario", "Orders", "Filled as maker", "Fill rate", "Skipped (maker)",
+                      "Taker fallbacks", "No next bar", "Unaccounted"], mrows))
+    L.append("")
+    L.append("Fill rate = filled / (orders - no next bar). **Unaccounted must be 0**: "
+             "orders = filled + skipped + fallbacks + no next bar.")
+    if warn:
+        L.append("")
+        L.append(f"**WARNING: unaccounted maker orders in {', '.join(warn)}**")
     L.append("")
     # ---- signals
     L.append("## 6. Signal diagnostics")

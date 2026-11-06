@@ -75,7 +75,7 @@ def test_maker_fills_are_strictly_through_and_filter_signals():
     mk, kt = run(cfg("maker"), df), run(cfg("market"), df)
     assert mk.stats["maker_attempts"] > 0
     assert mk.stats["maker_unfilled"] > 0                    # some orders must NOT fill
-    assert mk.stats["maker_fills"] + mk.stats["maker_unfilled"] == mk.stats["maker_attempts"]
+    assert mk.stats["maker_fills"] + mk.stats["maker_unfilled"] + mk.stats["maker_no_next_bar"] == mk.stats["maker_attempts"]
     assert all(t.entry_how == "maker" and t.entry_slip == 0 for t in mk.trades)
 
 
@@ -170,3 +170,40 @@ def test_funding_sign_long_pays_when_positive():
     assert longs and shorts
     assert all(t.funding >= 0 for t in longs)
     assert all(t.funding <= 0 for t in shorts)
+
+
+class FinalBarOnly:
+    """Fires one LONG signal, only on the very last candle."""
+    name = "final"
+    def __init__(self, last_ts): self.last_ts = last_ts
+    def analyze(self, window):
+        if window.index[-1] == self.last_ts:
+            p = float(window.iloc[-1]["close"])
+            return TradeSetup(Signal.LONG, p, p * 0.9, p * 1.1, 0.9, "final")
+        return TradeSetup(Signal.HOLD)
+
+
+@pytest.mark.parametrize("mode", ["maker", "maker_fallback"])
+def test_maker_signal_on_final_candle_is_counted_separately(mode):
+    df = make_df(n=200)
+    for c in ("open", "close", "high", "low"):
+        df[c] = 100.0
+    df["volume"] = 500.0
+    bt = Backtester(cfg(mode))
+    bt.strategy = FinalBarOnly(df.index[-1])
+    bt.run(df, "X/USDT")
+    assert bt.stats["maker_attempts"] == 1
+    assert bt.stats["maker_no_next_bar"] == 1
+    assert bt.stats["maker_fills"] == 0
+    assert bt.stats["maker_unfilled"] == 0
+    assert bt.stats["maker_fallbacks"] == 0
+    assert not bt.trades
+
+
+@pytest.mark.parametrize("mode", ["maker", "maker_fallback"])
+def test_every_maker_order_has_exactly_one_outcome(mode):
+    for seed in (1, 2, 3):
+        bt = run(cfg(mode), make_df(n=3000, seed=seed))
+        s = bt.stats
+        assert s["maker_attempts"] == (s["maker_fills"] + s["maker_unfilled"]
+                                       + s["maker_fallbacks"] + s["maker_no_next_bar"])
