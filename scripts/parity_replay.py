@@ -79,6 +79,11 @@ class ReplayExchange:
         return self.positions.pop(symbol, None)
 
 
+class TradeRun(list):
+    """List of closed paper trades plus the bot's decision trace."""
+    decision_rows = ()
+
+
 def make_cfg(strategy, symbol, hold_minutes, capital, fees):
     c = BotConfig()
     c.mode = "paper"
@@ -118,6 +123,8 @@ def run_bot(frame, symbol, cfg, start, end):
     bot.entries_blocked = False
     bot.last_rejection_log = {}
     bot.decision_log_path = None
+    bot.decision_rows = []
+    bot._append_decision = lambda row: bot.decision_rows.append(dict(row))
     bot.persist_state = lambda: None
     old_save, old_record = main.state.save_position_at_entry, main.state.record_trade
     main.state.save_position_at_entry = lambda *a, **k: None
@@ -131,15 +138,20 @@ def run_bot(frame, symbol, cfg, start, end):
         meta = dict(bot.paper_trade_meta.get(sym, {}))
         original_close(sym, pos, price, reason)
         log = bot.risk_manager.trade_log[-1]
+        exit_fee = float(price) * float(before["contracts"]) * cfg.backtest.taker_fee
+        exit_slippage = float(price) * float(before["contracts"]) * cfg.backtest.slippage
         completed.append({"side": before["side"], "entry_time": entry_time,
+            "signal_bar_open": entry_time - timedelta(minutes=5),
             "entry_price": float(before["entryPrice"]), "exit_price": float(price),
             "exit_time": clock(), "exit_reason": reason, "net": log["pnl"],
             "quantity": float(before["contracts"]), "sl": targets.get("sl"),
             "tp": targets.get("tp"),
-            "costs": (float(meta.get("entry_fee", 0.0)) +
-                float(meta.get("entry_slippage", 0.0)) +
-                float(price) * float(before["contracts"]) *
-                (cfg.backtest.taker_fee + cfg.backtest.slippage))})
+            "entry_fee": float(meta.get("entry_fee", 0.0)),
+            "exit_fee": exit_fee,
+            "entry_slippage": float(meta.get("entry_slippage", 0.0)),
+            "exit_slippage": exit_slippage,
+            "costs": (float(meta.get("entry_fee", 0.0)) + exit_fee +
+                float(meta.get("entry_slippage", 0.0)) + exit_slippage)})
     bot._close_position = capture_close
     try:
         for ts in frame.index[(frame.index >= start) & (frame.index < end)]:
@@ -150,7 +162,9 @@ def run_bot(frame, symbol, cfg, start, end):
             bot.process_symbol(symbol)
     finally:
         main.state.save_position_at_entry, main.state.record_trade = old_save, old_record
-    return completed
+    result = TradeRun(completed)
+    result.decision_rows = tuple(bot.decision_rows)
+    return result
 
 
 def run_backtester(frame, symbol, cfg, start, end, hold):
@@ -158,74 +172,148 @@ def run_backtester(frame, symbol, cfg, start, end, hold):
     warm = max(300, int(getattr(strategy, "lookback_bars", 300)))
     i0, i1 = frame.index.searchsorted(start), frame.index.searchsorted(end)
     bt = Backtester(cfg, max_hold_minutes=hold)
+    bt.decision_signals = {}
+    original_analyze = bt.strategy.analyze
+    def capture_signal(window):
+        setup = original_analyze(window)
+        ts = pd.Timestamp(window.index[-1])
+        bt.decision_signals[ts] = setup
+        return setup
+    bt.strategy.analyze = capture_signal
     bt.run(frame.iloc[max(0, i0 - warm):i1].copy(), symbol, trade_from=start)
+    bt.all_trades = list(bt.trades)
     return [t for t in bt.trades if t.exit_reason != "END"], bt
 
 
-def compare(bot_trades, bt_trades, frame):
-    def key(t):
-        return (t["side"], pd.Timestamp(t["entry_time"]))
-    bot_map = {key(t): t for t in bot_trades}
-    bt_map = {key({"side": t.side, "entry_time": t.entry_time}): t for t in bt_trades}
+def compare(bot_trades, bt_trades, frame, bt_obj=None):
+    def key_bot(t):
+        bar_open = t.get("signal_bar_open", pd.Timestamp(t["entry_time"]) - pd.Timedelta(minutes=5))
+        return (t["side"], pd.Timestamp(bar_open))
+    def key_bt(t):
+        return (t.side, pd.Timestamp(t.entry_time))
+    bot_map = {key_bot(t): t for t in bot_trades}
+    bt_map = {key_bt(t): t for t in bt_trades}
     common = sorted(bot_map.keys() & bt_map.keys(), key=lambda x: x[1])
     only_bot, only_bt = sorted(bot_map.keys() - bt_map.keys()), sorted(bt_map.keys() - bot_map.keys())
+    # Histogram uses a one-to-one nearest same-side pairing, independent of match keys.
+    remaining = set(range(len(bt_trades)))
+    nearest_pairs = []
+    for bi, b in enumerate(sorted(bot_trades, key=lambda x: pd.Timestamp(x["entry_time"]))):
+        candidates = [j for j in remaining if bt_trades[j].side == b["side"]]
+        if not candidates:
+            continue
+        bj = min(candidates, key=lambda j: abs((pd.Timestamp(b["entry_time"]) -
+                    pd.Timestamp(bt_trades[j].entry_time)).total_seconds()))
+        remaining.remove(bj)
+        delta = (pd.Timestamp(b["entry_time"]) - pd.Timestamp(bt_trades[bj].entry_time)).total_seconds() / 60
+        nearest_pairs.append((b, bt_trades[bj], delta))
+    histogram = {}
+    exceptions = []
+    for b, t, delta in nearest_pairs:
+        label = f"{delta:+g} min"
+        histogram[label] = histogram.get(label, 0) + 1
+        if abs(delta - 5.0) > 1e-9:
+            exceptions.append((b, t, delta))
+
     mismatch_rows = []
+    bot_decisions = {pd.Timestamp(d["ts"]): d for d in getattr(bot_trades, "decision_rows", ())}
+    bt_decisions = getattr(bt_obj, "decision_signals", {})
     for k in only_bot:
-        near = min((t for t in bt_trades if t.side == k[0]),
-                   key=lambda t: abs((pd.Timestamp(t.entry_time) - k[1]).total_seconds()), default=None)
-        evidence = "No backtester trade with same side and entry timestamp"
-        cause = "bot-only entry"
-        if near and abs((pd.Timestamp(near.entry_time) - k[1]).total_seconds()) <= 300:
-            cause = "entry timing: bot enters at signal-bar close"
-            evidence += f"; nearest backtester entry={near.entry_time}, bot entry={k[1]} (<=5m offset)"
-        elif near:
-            evidence += f"; nearest backtester entry={near.entry_time}, offset={(pd.Timestamp(near.entry_time) - k[1]).total_seconds()/60:.1f}m (>5m)"
-            cause = "other: no nearby backtester entry"
-        mismatch_rows.append({"side": k[0], "entry_time": str(k[1]), "cause": cause, "evidence": evidence})
+        observed = bt_decisions.get(k[1])
+        if observed is not None:
+            other_saw = f"strategy signal={observed.signal.value}, entry={observed.entry_price:g}, SL={observed.stop_loss:g}, TP={observed.take_profit:g}"
+        else:
+            active = next((t for t in getattr(bt_obj, "all_trades", ())
+                           if t.entry_time <= k[1] < (t.exit_time or k[1])), None)
+            other_saw = f"strategy not evaluated; backtester position open from {active.entry_time} through {active.exit_time}" if active else "strategy evaluation not captured (could not identify a matching decision)"
+        mismatch_rows.append({"side": k[0], "entry_time": str(k[1]), "cause": "other: no normalized backtester trade",
+            "evidence": f"signal bar {k[1]}; close/high/low={_ohlc_evidence(frame, k[1])}; {other_saw}"})
     for k in only_bt:
-        near = min((t for t in bot_trades if t["side"] == k[0]),
-                   key=lambda t: abs((pd.Timestamp(t["entry_time"]) - k[1]).total_seconds()), default=None)
-        evidence = "No bot trade with same side and entry timestamp"
-        cause = "backtester-only entry"
-        if near and abs((pd.Timestamp(near["entry_time"]) - k[1]).total_seconds()) <= 300:
-            cause = "entry timing: backtester timestamps signal bar"
-            evidence += f"; nearest bot entry={near['entry_time']}, backtester entry={k[1]} (<=5m offset)"
-        elif near:
-            evidence += f"; nearest bot entry={near['entry_time']}, offset={(pd.Timestamp(near['entry_time']) - k[1]).total_seconds()/60:.1f}m (>5m)"
-            cause = "other: no nearby bot entry"
-        mismatch_rows.append({"side": k[0], "entry_time": str(k[1]), "cause": cause, "evidence": evidence})
+        observed = bot_decisions.get(k[1])
+        bot_saw = (f"signal={observed.get('signal')}, status={observed.get('status')}, entry={observed.get('intended_entry')}, SL={observed.get('sl')}, TP={observed.get('tp')}"
+                   if observed else "bot did not record a decision at this bar")
+        mismatch_rows.append({"side": k[0], "entry_time": str(k[1]), "cause": "other: no normalized bot trade",
+            "evidence": f"signal bar {k[1]}; close/high/low={_ohlc_evidence(frame, k[1])}; {bot_saw}"})
     matches = []
+    mismatch_rows.extend({"side": b["side"], "entry_time": str(b["entry_time"]),
+        "cause": "entry timing offset", "evidence": f"bot entry={b['entry_time']}, backtester entry={t.entry_time}; delta={delta:+g} minutes (expected +5)"}
+        for b, t, delta in exceptions)
     for k in common:
         b, t = bot_map[k], bt_map[k]
         pnl_bps = (b["net"] - t.pnl) / t.notional * 10000 if t.notional else 0
         reason_ok = (b["exit_reason"].lower().replace("take profit", "tp").replace("stop loss", "sl")
                      == t.exit_reason.lower())
         row = {"side": k[0], "entry_time": str(k[1]),
-            "entry_diff": b["entry_price"] - t.entry_price,
-            "sl_diff": (b["sl"] - t.sl) if b["sl"] is not None else "n/a",
-            "tp_diff": (b["tp"] - t.tp) if b["tp"] is not None else "n/a",
+            "entry_price_diff_bps": _bps_diff(b["entry_price"], t.entry_price),
+            "sl_diff_bps": _bps_diff(b["sl"], t.sl),
+            "tp_diff_bps": _bps_diff(b["tp"], t.tp),
+            "size_diff_pct": (b["quantity"] - t.size) / t.size * 100 if t.size else 0,
             "exit_reason_agrees": reason_ok,
-            "exit_time_diff_minutes": (b["exit_time"] - t.exit_time).total_seconds() / 60,
+            "bot_exit_reason": _normalize_reason(b["exit_reason"]),
+            "bt_exit_reason": _normalize_reason(t.exit_reason),
+            "exit_time_diff_bars": (b["exit_time"] - t.exit_time).total_seconds() / 300,
+            "exit_price_diff_bps": _bps_diff(b["exit_price"], t.exit_price),
+            "entry_fee_diff": b["entry_fee"] - t.entry_fee,
+            "exit_fee_diff": b["exit_fee"] - t.exit_fee,
+            "slippage_diff": (b["entry_slippage"] + b["exit_slippage"] - t.entry_slip - t.exit_slip),
             "net_pnl_diff_bps": pnl_bps}
         matches.append(row)
         causes = []
+        bot_reason, bt_reason = row["bot_exit_reason"], row["bt_exit_reason"]
+        at = pd.Timestamp(t.exit_time)
+        bar = frame.loc[at] if at in frame.index else None
+        intrabar_hit = bool(bar is not None and (
+            (t.side == "long" and ((bt_reason == "SL" and bar.low <= t.sl) or (bt_reason == "TP" and bar.high >= t.tp))) or
+            (t.side == "short" and ((bt_reason == "SL" and bar.high >= t.sl) or (bt_reason == "TP" and bar.low <= t.tp)))))
         if not reason_ok:
-            at = pd.Timestamp(t.exit_time)
-            if at in frame.index:
-                bar = frame.loc[at]
-                if t.side == "long" and (bar.low <= t.sl or bar.high >= t.tp):
-                    causes.append("bot close vs backtester high/low")
-                elif t.side == "short" and (bar.high >= t.sl or bar.low <= t.tp):
-                    causes.append("bot close vs backtester high/low")
-        if abs(row["exit_time_diff_minutes"]) >= 5:
-            causes.append("entry/exit timing")
+            if intrabar_hit and bot_reason != bt_reason:
+                causes.append("bot close vs backtester high/low")
+            elif "TIME" in (bt_reason, bot_reason):
+                causes.append("time-exit timing")
+            else:
+                causes.append("other exit-reason mismatch")
+        if abs(row["exit_price_diff_bps"]) > 1e-9 and not intrabar_hit:
+            causes.append("time-exit timing" if "TIME" in (bt_reason, bot_reason) else "other exit-price mismatch")
+        if abs(row["exit_time_diff_bars"]) > 1e-9 and "TIME" in (bt_reason, bot_reason):
+            causes.append("time-exit timing")
         if abs(b["quantity"] - t.size) > max(1e-10, abs(t.size) * 1e-6):
-            causes.append("position sizing")
+            causes.append("sizing")
         if abs(b["costs"] - t.costs) > max(1e-8, abs(t.costs) * 1e-6):
-            causes.append("fees/slippage formula")
+            causes.append("slippage/fee formula")
+        if abs(pnl_bps) > 1e-9 and not causes:
+            causes.append("other pnl mismatch")
         if causes:
             mismatch_rows.append({"side": k[0], "entry_time": str(k[1]), "cause": "; ".join(causes), "evidence": str(row)})
-    return common, only_bot, only_bt, matches, mismatch_rows
+    return common, only_bot, only_bt, matches, mismatch_rows, histogram, exceptions
+
+
+def _bps_diff(bot_value, bt_value):
+    return (float(bot_value) - float(bt_value)) / abs(float(bt_value)) * 10000 if bt_value else 0.0
+
+
+def _normalize_reason(reason):
+    value = str(reason).upper()
+    if "STOP LOSS" in value: return "SL"
+    if "TAKE PROFIT" in value: return "TP"
+    if "TIME" in value: return "TIME"
+    return value
+
+
+def _ohlc_evidence(frame, ts):
+    ts = pd.Timestamp(ts)
+    if ts not in frame.index:
+        return "bar missing from CSV"
+    bar = frame.loc[ts]
+    return f"O={bar.open:g},H={bar.high:g},L={bar.low:g},C={bar.close:g}"
+
+
+def metric_summary(rows, field, tol=1e-9):
+    values = pd.Series([float(row[field]) for row in rows if row.get(field) is not None], dtype=float)
+    if values.empty:
+        return {"count": 0, "mean": "n/a", "median": "n/a", "p95": "n/a", "max": "n/a", "nonzero": 0}
+    return {"count": len(values), "mean": values.mean(), "median": values.median(),
+            "p95": values.abs().quantile(.95), "max": values.abs().max(),
+            "nonzero": int((values.abs() > tol).sum())}
 
 
 def main_cli():
@@ -252,40 +340,92 @@ def main_cli():
     cfg = make_cfg(a.strategy, a.symbol, a.hold_minutes, a.capital, fees)
     bot = run_bot(frame, a.symbol, cfg, start, end)
     bt_trades, bt = run_backtester(frame, a.symbol, cfg, start, end, a.hold_minutes)
-    matched, only_bot, only_bt, details, mismatches = compare(bot, bt_trades, frame)
+    matched, only_bot, only_bt, details, mismatches, histogram, exceptions = compare(bot, bt_trades, frame, bt)
     os.makedirs(a.out, exist_ok=True)
     date = f"{start:%Y%m%d}_{end:%Y%m%d}"
-    stem = f"parity_{a.symbol.replace('/', '_')}_{date}"
+    stem = f"parity_compare_{a.symbol.replace('/', '_')}_{date}"
     sides = lambda rows, side: sum(1 for t in rows if (t["side"] if isinstance(t, dict) else t.side) == side)
     causes = {}
     for m in mismatches:
         for cause in m["cause"].split("; "):
             causes[cause] = causes.get(cause, 0) + 1
-    for cause in ("bot close vs backtester high/low", "fees/slippage formula",
-                  "position sizing", "other: no nearby bot entry",
-                  "other: no nearby backtester entry"):
+    for cause in ("bot close vs backtester high/low", "time-exit timing",
+                  "slippage/fee formula", "sizing", "other exit-reason mismatch",
+                  "other exit-price mismatch", "other pnl mismatch",
+                  "other: no normalized backtester trade", "other: no normalized bot trade",
+                  "entry timing offset"):
         causes.setdefault(cause, 0)
     with open(os.path.join(a.out, stem + "_mismatches.csv"), "w", newline="", encoding="utf-8") as f:
         cols = ["side", "entry_time", "cause", "evidence"]
         w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(mismatches)
-    lines = [f"# Paper vs backtester parity: {a.symbol}", "", f"Window: {start} through {end} (end exclusive); strategy `{a.strategy}`; scenario `{a.scenario}`.",
-        "", "Replay rule: clock advances to candle close; only completed candles are available for strategy analysis. A flat forming row duplicates the last completed close solely because `check_exits` reads the last fetched row's close; `process_symbol` drops that row before analysis.", "",
-        "## Trade counts", "", "| Engine | Long | Short | Total |", "|---|---:|---:|---:|",
+    metric_fields = [
+        ("Entry price diff", "entry_price_diff_bps", "bps"),
+        ("SL diff", "sl_diff_bps", "bps"), ("TP diff", "tp_diff_bps", "bps"),
+        ("Position size diff", "size_diff_pct", "%"),
+        ("Exit time diff", "exit_time_diff_bars", "bars"),
+        ("Exit price diff", "exit_price_diff_bps", "bps"),
+        ("Entry fee diff", "entry_fee_diff", "quote"),
+        ("Exit fee diff", "exit_fee_diff", "quote"),
+        ("Slippage diff", "slippage_diff", "quote"),
+        ("Net PnL diff", "net_pnl_diff_bps", "bps of BT notional"),
+    ]
+    def fmt(value):
+        return f"{value:+.5f}" if isinstance(value, (int, float)) else str(value)
+    reason_labels = sorted({_normalize_reason(x["exit_reason"]) for x in bot} |
+                          {_normalize_reason(t.exit_reason) for t in bt_trades})
+    reason_matrix = {(br, tr): 0 for br in reason_labels for tr in reason_labels}
+    for d in details:
+        reason_matrix[(d["bot_exit_reason"], d["bt_exit_reason"])] += 1
+    histogram_rows = [f"| {delta} | {count} |" for delta, count in sorted(histogram.items())]
+    lines = [f"# Paper/backtester comparison: {a.symbol}", "",
+        f"Window: {start} through {end} (end exclusive); strategy `{a.strategy}`; scenario `{a.scenario}`.",
+        "", "Replay clock advances to each five-minute candle close. Only completed CSV candles are used. A flat forming row repeats the latest completed close as the sentinel that `process_symbol` drops before analysis and as the close mark `check_exits` reads. It contains no future OHLC information.", "",
+        "## Nearest same-side entry offset histogram", "", "| Bot entry time minus Backtester entry time | Pairs |", "|---|---:|"] + histogram_rows
+    if not histogram_rows:
+        lines.append("| none | 0 |")
+    lines += ["", "Expected offset is exactly +5 minutes. Matching uses `(side, bot_entry_time - 5 minutes)` against `(side, backtester_entry_time)`.", "", "### Nearest pairs not exactly +5 minutes", ""]
+    if exceptions:
+        lines.extend(f"- {b['side']} bot={b['entry_time']}, backtester={t.entry_time}, offset={delta:+g} minutes; not normalized into a match." for b,t,delta in exceptions)
+    else:
+        lines.append("None.")
+    bot_net_bps = [t["net"] / (t["entry_price"] * t["quantity"]) * 10000 for t in bot if t["entry_price"] and t["quantity"]]
+    bt_net_bps = [t.pnl / t.notional * 10000 for t in bt_trades if t.notional]
+    lines += ["", "## Trade totals", "", "| Path | Trades | Net bps per trade (mean) | Total net PnL |", "|---|---:|---:|---:|",
+        f"| Bot | {len(bot)} | {sum(bot_net_bps)/len(bot_net_bps) if bot_net_bps else 0:+.5f} | {sum(t['net'] for t in bot):+.8f} |",
+        f"| Backtester | {len(bt_trades)} | {sum(bt_net_bps)/len(bt_net_bps) if bt_net_bps else 0:+.5f} | {sum(t.pnl for t in bt_trades):+.8f} |", "",
+        "## Counts by side", "", "| Path | Long | Short | Total |", "|---|---:|---:|---:|",
         f"| Bot | {sides(bot,'long')} | {sides(bot,'short')} | {len(bot)} |",
         f"| Backtester | {sides(bt_trades,'long')} | {sides(bt_trades,'short')} | {len(bt_trades)} |",
         f"| Matched | {sum(1 for k in matched if k[0]=='long')} | {sum(1 for k in matched if k[0]=='short')} | {len(matched)} |",
-        f"| Bot only | {sum(1 for k in only_bot if k[0]=='long')} | {sum(1 for k in only_bot if k[0]=='short')} | {len(only_bot)} |",
-        f"| Backtester only | {sum(1 for k in only_bt if k[0]=='long')} | {sum(1 for k in only_bt if k[0]=='short')} | {len(only_bt)} |", "",
-        f"Matched trades: {len(matched)}; only in bot: {len(only_bot)}; only in backtester: {len(only_bt)}.", "",
-        "## Matched trade differences", "", "| Side | Entry time | Entry Δ | SL Δ | TP Δ | Exit reason agrees | Exit Δ min | Net PnL Δ bps |", "|---|---|---:|---:|---:|---|---:|---:|"]
-    for d in details:
-        lines.append(f"| {d['side']} | {d['entry_time']} | {d['entry_diff']:.8g} | {d['sl_diff']} | {d['tp_diff']} | {d['exit_reason_agrees']} | {d['exit_time_diff_minutes']:.2f} | {d['net_pnl_diff_bps']:.3f} |")
+        f"| Bot unmatched | {sum(1 for k in only_bot if k[0]=='long')} | {sum(1 for k in only_bot if k[0]=='short')} | {len(only_bot)} |",
+        f"| Backtester unmatched | {sum(1 for k in only_bt if k[0]=='long')} | {sum(1 for k in only_bt if k[0]=='short')} | {len(only_bt)} |", "",
+        "## Matched trade difference summary", "",
+        "Mean and median retain the sign. P95 and max are absolute difference magnitudes. `Nonzero` counts values above a small numeric tolerance.",
+        "", "| Metric | Unit | Count | Mean | Median | P95 abs | Max abs | Nonzero |", "|---|---|---:|---:|---:|---:|---:|---:|"]
+    for label, field, unit in metric_fields:
+        stats = metric_summary(details, field)
+        lines.append(f"| {label} | {unit} | {stats['count']} | {fmt(stats['mean'])} | {fmt(stats['median'])} | {fmt(stats['p95'])} | {fmt(stats['max'])} | {stats['nonzero']} |")
+    lines += ["", "## Exit reason agreement matrix", "", "Rows are bot exit reason; columns are Backtester exit reason.", "",
+        "| Bot \\ Backtester | " + " | ".join(reason_labels) + " |",
+        "|---|" + "|".join("---:" for _ in reason_labels) + "|"]
+    for br in reason_labels:
+        lines.append("| " + br + " | " + " | ".join(str(reason_matrix[(br,tr)]) for tr in reason_labels) + " |")
+    lines += ["", "## Unmatched trade explanations", ""]
+    if only_bot or only_bt:
+        for row in mismatches:
+            if row["cause"].startswith("other: no normalized"):
+                lines.append(f"- {row['side']} {row['entry_time']}: {row['evidence']}")
+    else:
+        lines.append("None.")
     lines += ["", "## Mismatch causes", "", "| Cause | Count |", "|---|---:|"]
     lines.extend(f"| {cause} | {count} |" for cause, count in sorted(causes.items()))
-    lines += ["", f"Mismatch detail CSV: `{stem}_mismatches.csv`.", "", "Exact `(side, entry_time)` pairs are compared directly. Where no exact pair exists, the mismatch CSV records the nearest same-side entry and its timestamp offset; offsets up to five minutes are classified as entry timing (bot signal-bar close versus backtester signal-bar timestamp). Close-vs-high/low exits, fees/slippage, and sizing can only be isolated for exact-key matched trades."]
+    lines += ["", f"Mismatch detail CSV: `{stem}_mismatches.csv`.", "", "For each unmatched entry the report records the signal bar, its OHLC values, and the other path's captured decision or explains that the decision was not captured. Exit mismatch causes use the backtest exit bar's high/low and separate time exits, size, and cost differences."]
     with open(os.path.join(a.out, stem + ".md"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-    print("\n".join(lines[:21]).encode("ascii", "replace").decode("ascii"))
+    preview = ["Entry offset histogram: " + ", ".join(f"{k}={v}" for k,v in sorted(histogram.items())),
+               f"Parity comparison {a.symbol}: bot={len(bot)} backtester={len(bt_trades)} matched={len(matched)} unmatched_bot={len(only_bot)} unmatched_backtester={len(only_bt)}"]
+    preview.extend(f"Non +5m pair: {b['side']} bot={b['entry_time']} backtester={t.entry_time} offset={delta:+g}m" for b,t,delta in exceptions)
+    print("\n".join(preview).encode("ascii", "replace").decode("ascii"))
 
 
 if __name__ == "__main__":

@@ -96,8 +96,8 @@ def test_replay_runner_returns_the_known_bot_and_backtester_trades(monkeypatch):
     cfg = replay.make_cfg("synthetic", "BTC/USDT", 10_000, 100.0,
                           (0.0002, 0.0005, 0.0003))
     bot_trades = replay.run_bot(frame, "BTC/USDT", cfg, fire, fire + pd.Timedelta(minutes=15))
-    bt_trades, _ = replay.run_backtester(frame, "BTC/USDT", cfg, fire,
-                                         fire + pd.Timedelta(minutes=15), 10_000)
+    bt_trades, bt = replay.run_backtester(frame, "BTC/USDT", cfg, fire,
+                                          fire + pd.Timedelta(minutes=15), 10_000)
 
     assert len(bot_trades) == 1
     assert bot_trades[0]["side"] == "long"
@@ -111,3 +111,12 @@ def test_replay_runner_returns_the_known_bot_and_backtester_trades(monkeypatch):
     assert bt_trades[0].entry_price == 100.0
     assert bt_trades[0].exit_time == (fire + pd.Timedelta(minutes=5)).to_pydatetime()
     assert bt_trades[0].exit_price == 101.0
+
+    matched, only_bot, only_bt, details, _, histogram, exceptions = replay.compare(
+        bot_trades, bt_trades, frame, bt)
+    assert len(matched) == 1
+    assert only_bot == only_bt == exceptions == []
+    assert histogram == {"+5 min": 1}
+    assert details[0]["entry_price_diff_bps"] == 0.0
+    assert details[0]["exit_time_diff_bars"] == 1.0
+    assert details[0]["exit_price_diff_bps"] > 0
