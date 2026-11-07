@@ -281,7 +281,7 @@ def compare(bot_trades, bt_trades, frame, bt_obj=None):
                 causes.append("time-exit timing" if "TIME" in (bt_reason, bot_reason) else "other exit-price mismatch")
         if abs(row["exit_time_diff_bars"]) > 1e-9 and "TIME" in (bt_reason, bot_reason):
             causes.append("time-exit timing")
-        if abs(b["quantity"] - t.size) > max(1e-10, abs(t.size) * 1e-6):
+        if abs(row["size_diff_pct"]) > 1e-9:
             causes.append("sizing")
         rate_diffs = (
             _rate_diff(b["entry_fee"], b["entry_price"] * b["quantity"],
@@ -297,6 +297,7 @@ def compare(bot_trades, bt_trades, frame, bt_obj=None):
             causes.append("slippage/fee formula")
         if abs(pnl_bps) > 1e-9 and not causes:
             causes.append("other pnl mismatch")
+        causes = list(dict.fromkeys(causes))
         if causes:
             mismatch_rows.append({"side": k[0], "entry_time": str(k[1]), "cause": "; ".join(causes), "evidence": str(row)})
     return common, only_bot, only_bt, matches, mismatch_rows, histogram, exceptions
@@ -393,7 +394,7 @@ def main_cli():
         ("Net PnL diff", "net_pnl_diff_bps", "bps of BT notional"),
     ]
     def fmt(value):
-        return f"{value:+.5f}" if isinstance(value, (int, float)) else str(value)
+        return f"{value:+.8f}" if isinstance(value, (int, float)) else str(value)
     reason_labels = sorted({_normalize_reason(x["exit_reason"]) for x in bot} |
                           {_normalize_reason(t.exit_reason) for t in bt_trades})
     reason_matrix = {(br, tr): 0 for br in reason_labels for tr in reason_labels}
