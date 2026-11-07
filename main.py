@@ -52,10 +52,12 @@ def audit(symbol, side, qty, price, order_id, action='send'):
 
 
 class UnifiedCryptoBot:
-    def __init__(self, config=None):
+    def __init__(self, config=None, clock=None):
         self.config = config or BotConfig()
+        clock_source = clock or getattr(self.config, "clock", None)
+        self.clock = clock_source or datetime.now
         self.strategy = get_strategy(self.config)
-        self.risk_manager = RiskManager(self.config)
+        self.risk_manager = RiskManager(self.config, clock=clock_source)
         self.gru_predictor = GRUPredictor(
             model_path=self.config.strategy.gru_model_path,
             scaler_path=self.config.strategy.gru_scaler_path,
@@ -252,7 +254,7 @@ class UnifiedCryptoBot:
                         return
 
             # 5. Risk Governor Verification
-            now = datetime.now()
+            now = getattr(self, "clock", datetime.now)()
             can_trade, reason = self.risk_manager.can_trade(now)
             if not can_trade:
                 last_time = self.last_rejection_log.get((symbol, reason), 0)
@@ -407,14 +409,17 @@ class UnifiedCryptoBot:
                     "quantity": filled_amount,
                     "entry_fee": fill_price * filled_amount * fee_rate,
                     "entry_slippage": fill_price * filled_amount * slip_rate,
-                    "entry_time": datetime.now(),
+                    "entry_time": getattr(self, "clock", datetime.now)(),
                     "strategy": setup.strategy_name,
                     "signal": setup.signal.value,
                 }
                 self.paper_trade_meta = meta
 
             self.risk_manager.register_position(symbol, notional_value, side)
-            state.save_position_at_entry(symbol, side, filled_amount, fill_price, setup.take_profit, setup.stop_loss, setup.strategy_name)
+            state.save_position_at_entry(
+                symbol, side, filled_amount, fill_price, setup.take_profit, setup.stop_loss,
+                setup.strategy_name, entry_time=getattr(self, "clock", datetime.now)().isoformat(),
+            )
             self.risk_manager.update_position_price(symbol, fill_price)
             self.position_entry_cycle[symbol] = self.cycle_count
             self.position_targets[symbol] = {
@@ -427,7 +432,7 @@ class UnifiedCryptoBot:
                 "ts": decision["ts"],
                 "symbol": symbol,
                 "strategy": decision["strategy"],
-                "entry_time": datetime.now(),
+                "entry_time": getattr(self, "clock", datetime.now)(),
             }
             self.active_decisions = active
             meta = getattr(self, "paper_trade_meta", {}).get(symbol, {})
@@ -449,7 +454,7 @@ class UnifiedCryptoBot:
         decision_context = getattr(self, "active_decisions", {}).pop(symbol, None)
         hold_minutes = ""
         if decision_context and isinstance(decision_context.get("entry_time"), datetime):
-            hold_minutes = max((datetime.now() - decision_context["entry_time"]).total_seconds() / 60.0, 0.0)
+            hold_minutes = max((getattr(self, "clock", datetime.now)() - decision_context["entry_time"]).total_seconds() / 60.0, 0.0)
         if side == 'long':
             gross_pnl = (price - entry) * contracts
         else:
@@ -543,7 +548,7 @@ class UnifiedCryptoBot:
             rm_pos = self.risk_manager.open_positions.get(symbol, {})
             entry_time = rm_pos.get('entry_time')
             if entry_time is not None:
-                hold_min = (datetime.now() - entry_time).total_seconds() / 60.0
+                hold_min = (getattr(self, "clock", datetime.now)() - entry_time).total_seconds() / 60.0
                 if hold_min > self.config.risk.max_hold_time_minutes:
                     self._close_position(symbol, pos, price, "Time exit (wall-clock)")
                     return
