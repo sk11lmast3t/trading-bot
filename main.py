@@ -681,7 +681,7 @@ def build_config_from_args(argv=None, environ=None):
     parser.add_argument("--demo", action="store_true", help="Run in paper mode")
     parser.add_argument("--parity", action="store_true", help="Use deterministic paper/backtest parity settings")
     parser.add_argument("--strategy", help="Select the strategy by registered name")
-    parser.add_argument("--symbols", help="Comma-separated fixed symbol list")
+    parser.add_argument("--symbols", nargs="+", help="Fixed symbols separated by spaces or commas")
     parser.add_argument("--hold-minutes", type=float, default=30.0)
     parser.add_argument("--capital", type=float, default=100.0)
     parser.add_argument("--exchange", help="Pin candle data to this CCXT exchange")
@@ -705,7 +705,8 @@ def build_config_from_args(argv=None, environ=None):
     if args.exchange:
         cfg.exchange.name = args.exchange.lower()
     if args.symbols:
-        cfg.scalping.symbols = [symbol.strip() for symbol in args.symbols.split(",") if symbol.strip()]
+        cfg.scalping.symbols = [symbol.strip() for value in args.symbols
+                                for symbol in value.split(",") if symbol.strip()]
     if args.parity:
         if args.capital <= 0 or args.hold_minutes <= 0:
             raise SystemExit("--capital and --hold-minutes must be greater than zero in parity mode.")

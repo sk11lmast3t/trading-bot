@@ -63,6 +63,13 @@ def test_strategy_cli_selects_name_and_keeps_default():
     assert cfg.strategy.active_strategy == "grid_scalper"
 
 
+def test_symbols_cli_accepts_space_and_comma_separators():
+    cfg = main.build_config_from_args([
+        "--symbols", "BTC/USDT", "ETH/USDT,XRP/USDT", "SOL/USDT",
+    ], environ={})
+    assert cfg.scalping.symbols == ["BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT"]
+
+
 def test_paper_exchange_sticks_to_one_candle_source_and_skips_on_error(monkeypatch, caplog):
     calls = []
 
