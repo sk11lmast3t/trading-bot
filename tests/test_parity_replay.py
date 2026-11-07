@@ -6,6 +6,8 @@ import pandas as pd
 import main
 from config.settings import BotConfig
 from core.risk_manager import RiskManager
+from core.strategies import Signal, TradeSetup
+import scripts.parity_replay as replay
 
 
 class FakeClock:
@@ -67,3 +69,45 @@ def test_main_wall_clock_time_exit_uses_injected_clock():
 
     bot._close_position.assert_called_once()
     assert bot._close_position.call_args.args[3] == "Time exit (wall-clock)"
+
+
+def test_replay_runner_returns_the_known_bot_and_backtester_trades(monkeypatch):
+    fire = pd.Timestamp("2024-01-01 05:00:00")
+    index = pd.date_range("2024-01-01", periods=75, freq="5min")
+    close = [100.0] * len(index)
+    close[index.get_loc(fire) + 1] = 102.0
+    frame = pd.DataFrame({"open": close, "high": close, "low": close,
+                          "close": close, "volume": [1.0] * len(index)}, index=index)
+
+    class OneSignal:
+        lookback_bars = 30
+        name = "synthetic"
+
+        def __init__(self, config):
+            pass
+
+        def analyze(self, window):
+            if window.index[-1] == fire:
+                return TradeSetup(Signal.LONG, 100.0, 90.0, 101.0, 1.0, "synthetic")
+            return TradeSetup(Signal.HOLD)
+
+    monkeypatch.setattr(replay, "get_strategy", OneSignal)
+    monkeypatch.setattr("core.backtester.get_strategy", OneSignal)
+    cfg = replay.make_cfg("synthetic", "BTC/USDT", 10_000, 100.0,
+                          (0.0002, 0.0005, 0.0003))
+    bot_trades = replay.run_bot(frame, "BTC/USDT", cfg, fire, fire + pd.Timedelta(minutes=15))
+    bt_trades, _ = replay.run_backtester(frame, "BTC/USDT", cfg, fire,
+                                         fire + pd.Timedelta(minutes=15), 10_000)
+
+    assert len(bot_trades) == 1
+    assert bot_trades[0]["side"] == "long"
+    assert bot_trades[0]["entry_time"] == (fire + pd.Timedelta(minutes=5)).to_pydatetime()
+    assert bot_trades[0]["entry_price"] == 100.0
+    assert bot_trades[0]["exit_time"] == (fire + pd.Timedelta(minutes=10)).to_pydatetime()
+    assert bot_trades[0]["exit_price"] == 102.0
+    assert len(bt_trades) == 1
+    assert bt_trades[0].side == "long"
+    assert bt_trades[0].entry_time == fire.to_pydatetime()
+    assert bt_trades[0].entry_price == 100.0
+    assert bt_trades[0].exit_time == (fire + pd.Timedelta(minutes=5)).to_pydatetime()
+    assert bt_trades[0].exit_price == 101.0
