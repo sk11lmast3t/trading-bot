@@ -680,6 +680,7 @@ def build_config_from_args(argv=None, environ=None):
     parser.add_argument("--mode", dest="mode_option", choices=("paper", "live"))
     parser.add_argument("--demo", action="store_true", help="Run in paper mode")
     parser.add_argument("--parity", action="store_true", help="Use deterministic paper/backtest parity settings")
+    parser.add_argument("--strategy", help="Select the strategy by registered name")
     parser.add_argument("--symbols", help="Comma-separated fixed symbol list")
     parser.add_argument("--hold-minutes", type=float, default=30.0)
     parser.add_argument("--capital", type=float, default=100.0)
@@ -699,6 +700,8 @@ def build_config_from_args(argv=None, environ=None):
 
     cfg = BotConfig()
     cfg.mode = requested_mode
+    if args.strategy:
+        cfg.strategy.active_strategy = args.strategy
     if args.exchange:
         cfg.exchange.name = args.exchange.lower()
     if args.symbols:

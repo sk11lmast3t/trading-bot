@@ -57,6 +57,12 @@ def test_parity_rejects_live_mode():
         main.build_config_from_args(["live", "--parity"], environ={"CONFIRM_LIVE": "YES"})
 
 
+def test_strategy_cli_selects_name_and_keeps_default():
+    assert main.build_config_from_args([], environ={}).strategy.active_strategy == "ema_rsi_atr"
+    cfg = main.build_config_from_args(["--strategy", "grid_scalper"], environ={})
+    assert cfg.strategy.active_strategy == "grid_scalper"
+
+
 def test_paper_exchange_sticks_to_one_candle_source_and_skips_on_error(monkeypatch, caplog):
     calls = []
 
