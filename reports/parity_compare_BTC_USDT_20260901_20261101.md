@@ -8,31 +8,32 @@ Replay clock advances to each five-minute candle close. Only completed CSV candl
 
 | Bot entry time minus Backtester entry time | Pairs |
 |---|---:|
-| +20 min | 1 |
-| +5 min | 87 |
+| +5 min | 90 |
 
 Expected offset is exactly +5 minutes. Matching uses `(side, bot_entry_time - 5 minutes)` against `(side, backtester_entry_time)`.
 
 ### Nearest pairs not exactly +5 minutes
 
-- short bot=2026-10-24 07:25:00, backtester=2026-10-24 07:05:00, offset=+20 minutes; not normalized into a match.
+None.
+
+All difference columns use bot minus Backtester. Exit-time residual subtracts the known +1 bar entry-stamp convention.
 
 ## Trade totals
 
-| Path | Trades | Net bps per trade (mean) | Total net PnL |
-|---|---:|---:|---:|
-| Bot | 88 | -18.98263 | -1.65806174 |
-| Backtester | 90 | -16.13439 | -1.44302147 |
+| Path | Trades | All trades net bps/trade | Matched-only net bps/trade | Total net PnL |
+|---|---:|---:|---:|---:|
+| Bot | 90 | -16.13439 | -16.13439 | -1.44302147 |
+| Backtester | 90 | -16.13439 | -16.13439 | -1.44302147 |
 
 ## Counts by side
 
 | Path | Long | Short | Total |
 |---|---:|---:|---:|
-| Bot | 40 | 48 | 88 |
+| Bot | 41 | 49 | 90 |
 | Backtester | 41 | 49 | 90 |
-| Matched | 40 | 47 | 87 |
-| Bot unmatched | 0 | 1 | 1 |
-| Backtester unmatched | 1 | 2 | 3 |
+| Matched | 41 | 49 | 90 |
+| Bot unmatched | 0 | 0 | 0 |
+| Backtester unmatched | 0 | 0 | 0 |
 
 ## Matched trade difference summary
 
@@ -40,18 +41,18 @@ Mean and median retain the sign. P95 and max are absolute difference magnitudes.
 
 | Metric | Unit | Count | Mean | Median | P95 abs | Max abs | Nonzero |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Entry price diff | bps | 87 | +0.00000000 | +0.00000000 | +0.00000000 | +0.00000000 | 0 |
-| SL diff | bps | 87 | +0.00000000 | +0.00000000 | +0.00000000 | +0.00000000 | 0 |
-| TP diff | bps | 87 | +0.00000000 | +0.00000000 | +0.00000000 | +0.00000000 | 0 |
-| Position size diff | % | 87 | -0.09797020 | -0.12175782 | +0.20195615 | +0.20988082 | 86 |
-| Exit time diff | bars | 87 | +2.83908046 | +2.00000000 | +5.40000000 | +32.00000000 | 87 |
-| Exit price diff | bps | 87 | +0.03817480 | +0.02019321 | +23.33927987 | +42.48736806 | 87 |
-| Entry fee diff | quote | 87 | -0.00000484 | -0.00000602 | +0.00001000 | +0.00001039 | 86 |
-| Exit fee diff | quote | 87 | -0.00000482 | -0.00000468 | +0.00001548 | +0.00002446 | 87 |
-| Entry slippage diff | quote | 87 | -0.00000291 | -0.00000361 | +0.00000600 | +0.00000623 | 86 |
-| Exit slippage diff | quote | 87 | -0.00000289 | -0.00000281 | +0.00000929 | +0.00001467 | 87 |
-| Slippage diff | quote | 87 | -0.00000580 | -0.00000360 | +0.00001511 | +0.00001846 | 87 |
-| Net PnL diff | bps of BT notional | 87 | -0.82143145 | -0.61809590 | +23.51319545 | +42.52171168 | 87 |
+| Entry price diff (bot - backtester) | bps | 90 | +0.00000000 | +0.00000000 | +0.00000000 | +0.00000000 | 0 |
+| SL diff (bot - backtester) | bps | 90 | +0.00000000 | +0.00000000 | +0.00000000 | +0.00000000 | 0 |
+| TP diff (bot - backtester) | bps | 90 | +0.00000000 | +0.00000000 | +0.00000000 | +0.00000000 | 0 |
+| Position size diff (bot - backtester) | % | 90 | -0.00000000 | -0.00000000 | +0.00000000 | +0.00000000 | 0 |
+| Residual exit time diff (bot - backtester; after -1 bar) | bars | 90 | +0.00000000 | +0.00000000 | +0.00000000 | +0.00000000 | 0 |
+| Exit price diff (bot - backtester) | bps | 90 | -0.20000000 | +0.00000000 | +3.00000000 | +3.00000000 | 24 |
+| Entry fee diff (bot - backtester) | quote | 90 | -0.00000000 | -0.00000000 | +0.00000000 | +0.00000000 | 0 |
+| Exit fee diff (bot - backtester) | quote | 90 | -0.00000000 | -0.00000000 | +0.00000000 | +0.00000000 | 0 |
+| Entry slippage diff (bot - backtester) | quote | 90 | -0.00000000 | -0.00000000 | +0.00000000 | +0.00000000 | 0 |
+| Exit slippage diff (bot - backtester) | quote | 90 | -0.00000000 | -0.00000000 | +0.00000000 | +0.00000000 | 0 |
+| Slippage diff (bot - backtester) | quote | 90 | -0.00000000 | -0.00000000 | +0.00000000 | +0.00000000 | 0 |
+| Net PnL diff (bot - backtester) | bps of BT notional | 90 | +0.00000000 | +0.00000000 | +0.00000000 | +0.00000000 | 0 |
 
 ## Exit reason agreement matrix
 
@@ -59,32 +60,43 @@ Rows are bot exit reason; columns are Backtester exit reason.
 
 | Bot \ Backtester | SL | TIME | TP |
 |---|---:|---:|---:|
-| SL | 17 | 0 | 0 |
-| TIME | 1 | 64 | 0 |
-| TP | 0 | 0 | 5 |
+| SL | 18 | 0 | 0 |
+| TIME | 0 | 66 | 0 |
+| TP | 0 | 0 | 6 |
 
 ## Unmatched trade explanations
 
-- short 2026-10-24 07:20:00: signal bar 2026-10-24 07:20:00; close/high/low=O=80922,H=80922,L=80793.2,C=80793.2; strategy not evaluated; backtester position open from 2026-10-24 07:05:00 through 2026-10-24 11:05:00
-- long 2026-10-02 01:45:00: signal bar 2026-10-02 01:45:00; close/high/low=O=84578,H=84671.4,L=84577.1,C=84666.7; signal=LONG, status=skipped:position_open, entry=84666.72, SL=84007.99589416727, TP=85984.16821166547
-- short 2026-09-10 04:10:00: signal bar 2026-09-10 04:10:00; close/high/low=O=78373.1,H=78377.8,L=78344.9,C=78344.9; signal=SHORT, status=skipped:position_open, entry=78344.86, SL=78991.75540254396, TP=77051.06919491208
-- short 2026-10-24 07:05:00: signal bar 2026-10-24 07:05:00; close/high/low=O=80922,H=80922,L=80793.2,C=80793.2; signal=SHORT, status=skipped:position_open, entry=80793.22, SL=81309.9862184404, TP=79759.6875631192
+None.
 
 ## Mismatch causes
 
 | Cause | Count |
 |---|---:|
-| bot close vs backtester high/low | 23 |
-| entry timing offset | 1 |
+| bot close vs backtester high/low | 24 |
+| entry timing offset | 0 |
 | other exit-price mismatch | 0 |
 | other exit-reason mismatch | 0 |
 | other pnl mismatch | 0 |
-| other: no normalized backtester trade | 1 |
-| other: no normalized bot trade | 3 |
-| sizing | 86 |
-| slippage/fee formula | 0 |
-| time-exit timing | 65 |
+| other: no normalized backtester trade | 0 |
+| other: no normalized bot trade | 0 |
+| sizing | 0 |
+| slippage/fee formula | 24 |
+| time-exit timing | 0 |
 
 Mismatch detail CSV: `parity_compare_BTC_USDT_20260901_20261101_mismatches.csv`.
 
 For each unmatched entry the report records the signal bar, its OHLC values, and the other path's captured decision or explains that the decision was not captured. Exit mismatch causes use the backtest exit bar's high/low and separate time exits, size, and cost differences.
+
+## Before/after touch-exit summary
+
+Exit price mean retains its sign; exit price p95 and max are absolute magnitudes. Residual exit time is bot minus Backtester after subtracting the known +1 bar entry-stamp offset. Before values are the prior close-only replay summary with this same offset removed from the exit-time distribution.
+
+| Measure | Before touch exits | After touch exits |
+|---|---:|---:|
+| Exit-reason disagreements | 1 | 0 |
+| Exit price diff mean (bps; bot - Backtester) | +0.03817 | -0.20000 |
+| Exit price diff p95 abs (bps) | 23.33928 | 3.00000 |
+| Exit price diff max abs (bps) | 42.48737 | 3.00000 |
+| Residual exit-time diff mean (bars; bot - Backtester) | +1.83908 | 0.00000 |
+| Residual exit-time diff p95 abs (bars) | 4.40000 | 0.00000 |
+| Residual exit-time diff max abs (bars) | 31.00000 | 0.00000 |

@@ -104,7 +104,7 @@ def test_replay_runner_returns_the_known_bot_and_backtester_trades(monkeypatch):
     assert bot_trades[0]["entry_time"] == (fire + pd.Timedelta(minutes=5)).to_pydatetime()
     assert bot_trades[0]["entry_price"] == 100.0
     assert bot_trades[0]["exit_time"] == (fire + pd.Timedelta(minutes=10)).to_pydatetime()
-    assert bot_trades[0]["exit_price"] == 102.0
+    assert bot_trades[0]["exit_price"] == 101.0 * (1 - cfg.backtest.slippage)
     assert len(bt_trades) == 1
     assert bt_trades[0].side == "long"
     assert bt_trades[0].entry_time == fire.to_pydatetime()
@@ -118,8 +118,8 @@ def test_replay_runner_returns_the_known_bot_and_backtester_trades(monkeypatch):
     assert only_bot == only_bt == exceptions == []
     assert histogram == {"+5 min": 1}
     assert details[0]["entry_price_diff_bps"] == 0.0
-    assert details[0]["exit_time_diff_bars"] == 1.0
-    assert details[0]["exit_price_diff_bps"] > 0
+    assert details[0]["exit_time_diff_bars"] == 0.0
+    assert details[0]["exit_price_diff_bps"] < 0
 
 
 def test_compare_keeps_nearest_pair_outside_five_minutes_unmatched():
