@@ -1,11 +1,10 @@
 """Compare main.py's paper execution path with the bar-based backtester.
 
 Replay timing follows candle opens: the clock is advanced to each bar's close,
-    so that bar is complete and may drive a decision. ReplayExchange also appends a
-flat forming candle whose OHLC equals the latest completed close. It is needed as
-the sentinel for process_symbol's unconditional final-row drop, and as the latest
-close mark read by check_exits. The duplicated close has no future OHLC information;
-main.py does not inspect high/low when checking exits.
+so that bar is complete and may drive a decision. ReplayExchange appends a flat
+forming candle as the sentinel for process_symbol's final-row drop. check_exits
+uses OHLC on post-signal bars; the replay sentinel repeats the latest completed
+close and carries no future range information.
 """
 from __future__ import annotations
 
@@ -131,15 +130,16 @@ def run_bot(frame, symbol, cfg, start, end):
     main.state.record_trade = lambda *a, **k: None
     completed = []
     original_close = bot._close_position
-    def capture_close(sym, pos, price, reason):
+    def capture_close(sym, pos, price, reason, **kwargs):
         before = dict(pos)
         entry_time = bot.active_decisions.get(sym, {}).get("entry_time")
         targets = bot.position_targets.get(sym, {})
         meta = dict(bot.paper_trade_meta.get(sym, {}))
-        original_close(sym, pos, price, reason)
+        original_close(sym, pos, price, reason, **kwargs)
         log = bot.risk_manager.trade_log[-1]
-        exit_fee = float(price) * float(before["contracts"]) * cfg.backtest.taker_fee
-        exit_slippage = float(price) * float(before["contracts"]) * cfg.backtest.slippage
+        reference = float(kwargs.get("reference_price", price))
+        exit_fee = reference * float(before["contracts"]) * cfg.backtest.taker_fee
+        exit_slippage = reference * float(before["contracts"]) * cfg.backtest.slippage
         completed.append({"side": before["side"], "entry_time": entry_time,
             "signal_bar_open": entry_time - timedelta(minutes=5),
             "entry_price": float(before["entryPrice"]), "exit_price": float(price),
@@ -243,6 +243,8 @@ def compare(bot_trades, bt_trades, frame, bt_obj=None):
         pnl_bps = (b["net"] - t.pnl) / t.notional * 10000 if t.notional else 0
         reason_ok = _normalize_reason(b["exit_reason"]) == _normalize_reason(t.exit_reason)
         row = {"side": k[0], "entry_time": str(k[1]),
+            "bot_net": b["net"], "bot_entry": b["entry_price"], "bot_size": b["quantity"],
+            "bt_net": t.pnl, "bt_entry": t.entry_price, "bt_size": t.size,
             "entry_price_diff_bps": _bps_diff(b["entry_price"], t.entry_price),
             "sl_diff_bps": _bps_diff(b["sl"], t.sl),
             "tp_diff_bps": _bps_diff(b["tp"], t.tp),
@@ -250,7 +252,9 @@ def compare(bot_trades, bt_trades, frame, bt_obj=None):
             "exit_reason_agrees": reason_ok,
             "bot_exit_reason": _normalize_reason(b["exit_reason"]),
             "bt_exit_reason": _normalize_reason(t.exit_reason),
-            "exit_time_diff_bars": (b["exit_time"] - t.exit_time).total_seconds() / 300,
+            # Bot timestamps the completed signal candle close; BT timestamps its open.
+            # Remove that known +1 bar convention to isolate exit timing residual.
+            "exit_time_diff_bars": (b["exit_time"] - t.exit_time).total_seconds() / 300 - 1,
             "exit_price_diff_bps": _bps_diff(b["exit_price"], t.exit_price),
             "entry_fee_diff": b["entry_fee"] - t.entry_fee,
             "exit_fee_diff": b["exit_fee"] - t.exit_fee,
@@ -381,17 +385,17 @@ def main_cli():
         cols = ["side", "entry_time", "cause", "evidence"]
         w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(mismatches)
     metric_fields = [
-        ("Entry price diff", "entry_price_diff_bps", "bps"),
-        ("SL diff", "sl_diff_bps", "bps"), ("TP diff", "tp_diff_bps", "bps"),
-        ("Position size diff", "size_diff_pct", "%"),
-        ("Exit time diff", "exit_time_diff_bars", "bars"),
-        ("Exit price diff", "exit_price_diff_bps", "bps"),
-        ("Entry fee diff", "entry_fee_diff", "quote"),
-        ("Exit fee diff", "exit_fee_diff", "quote"),
-        ("Entry slippage diff", "entry_slippage_diff", "quote"),
-        ("Exit slippage diff", "exit_slippage_diff", "quote"),
-        ("Slippage diff", "slippage_diff", "quote"),
-        ("Net PnL diff", "net_pnl_diff_bps", "bps of BT notional"),
+        ("Entry price diff (bot - backtester)", "entry_price_diff_bps", "bps"),
+        ("SL diff (bot - backtester)", "sl_diff_bps", "bps"), ("TP diff (bot - backtester)", "tp_diff_bps", "bps"),
+        ("Position size diff (bot - backtester)", "size_diff_pct", "%"),
+        ("Residual exit time diff (bot - backtester; after -1 bar)", "exit_time_diff_bars", "bars"),
+        ("Exit price diff (bot - backtester)", "exit_price_diff_bps", "bps"),
+        ("Entry fee diff (bot - backtester)", "entry_fee_diff", "quote"),
+        ("Exit fee diff (bot - backtester)", "exit_fee_diff", "quote"),
+        ("Entry slippage diff (bot - backtester)", "entry_slippage_diff", "quote"),
+        ("Exit slippage diff (bot - backtester)", "exit_slippage_diff", "quote"),
+        ("Slippage diff (bot - backtester)", "slippage_diff", "quote"),
+        ("Net PnL diff (bot - backtester)", "net_pnl_diff_bps", "bps of BT notional"),
     ]
     def fmt(value):
         return f"{value:+.8f}" if isinstance(value, (int, float)) else str(value)
@@ -414,9 +418,11 @@ def main_cli():
         lines.append("None.")
     bot_net_bps = [t["net"] / (t["entry_price"] * t["quantity"]) * 10000 for t in bot if t["entry_price"] and t["quantity"]]
     bt_net_bps = [t.pnl / t.notional * 10000 for t in bt_trades if t.notional]
-    lines += ["", "## Trade totals", "", "| Path | Trades | Net bps per trade (mean) | Total net PnL |", "|---|---:|---:|---:|",
-        f"| Bot | {len(bot)} | {sum(bot_net_bps)/len(bot_net_bps) if bot_net_bps else 0:+.5f} | {sum(t['net'] for t in bot):+.8f} |",
-        f"| Backtester | {len(bt_trades)} | {sum(bt_net_bps)/len(bt_net_bps) if bt_net_bps else 0:+.5f} | {sum(t.pnl for t in bt_trades):+.8f} |", "",
+    matched_bot = [d["bot_net"] / (d["bot_entry"] * d["bot_size"]) * 10000 for d in details if d["bot_entry"] and d["bot_size"]]
+    matched_bt = [d["bt_net"] / (d["bt_entry"] * d["bt_size"]) * 10000 for d in details if d["bt_entry"] and d["bt_size"]]
+    lines += ["", "All difference columns use bot minus Backtester. Exit-time residual subtracts the known +1 bar entry-stamp convention.", "", "## Trade totals", "", "| Path | Trades | All trades net bps/trade | Matched-only net bps/trade | Total net PnL |", "|---|---:|---:|---:|---:|",
+        f"| Bot | {len(bot)} | {sum(bot_net_bps)/len(bot_net_bps) if bot_net_bps else 0:+.5f} | {sum(matched_bot)/len(matched_bot) if matched_bot else 0:+.5f} | {sum(t['net'] for t in bot):+.8f} |",
+        f"| Backtester | {len(bt_trades)} | {sum(bt_net_bps)/len(bt_net_bps) if bt_net_bps else 0:+.5f} | {sum(matched_bt)/len(matched_bt) if matched_bt else 0:+.5f} | {sum(t.pnl for t in bt_trades):+.8f} |", "",
         "## Counts by side", "", "| Path | Long | Short | Total |", "|---|---:|---:|---:|",
         f"| Bot | {sides(bot,'long')} | {sides(bot,'short')} | {len(bot)} |",
         f"| Backtester | {sides(bt_trades,'long')} | {sides(bt_trades,'short')} | {len(bt_trades)} |",
