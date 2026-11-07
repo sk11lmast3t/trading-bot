@@ -77,7 +77,6 @@ def test_fresh_is_paper_only_and_skips_position_restore(monkeypatch):
     with pytest.raises(SystemExit, match="--fresh is available only in paper mode"):
         main.build_config_from_args(["live", "--fresh"], environ={"CONFIRM_LIVE": "YES"})
 
-    monkeypatch.setattr(main, "GRUPredictor", MagicMock())
     monkeypatch.setattr(main, "PaperExchange", MagicMock())
     cfg.scalping.scan_all_coins = False
     load_state = MagicMock()

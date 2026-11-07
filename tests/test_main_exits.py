@@ -9,8 +9,7 @@ class TestMainExits(unittest.TestCase):
     def setUp(self):
         self.config = BotConfig(mode='paper')
         self.config.scalping.scan_all_coins = False
-        with patch('main.GRUPredictor'):
-            self.bot = UnifiedCryptoBot(config=self.config)
+        self.bot = UnifiedCryptoBot(config=self.config)
         self.bot.exchange = MagicMock()
 
     def test_sl_hit_closes_position(self):
