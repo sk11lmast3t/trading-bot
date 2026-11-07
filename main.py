@@ -27,7 +27,6 @@ from core.strategies import get_strategy, Signal
 from core.exchange import ExchangeConnector, PaperExchange, OrderState
 from core.risk_manager import RiskManager
 from core import state
-from core.gru_predictor import GRUPredictor
 
 console = Console()
 os.makedirs('logs', exist_ok=True)
@@ -59,11 +58,14 @@ class UnifiedCryptoBot:
         self.clock = clock_source or datetime.now
         self.strategy = get_strategy(self.config)
         self.risk_manager = RiskManager(self.config, clock=clock_source)
-        self.gru_predictor = GRUPredictor(
-            model_path=self.config.strategy.gru_model_path,
-            scaler_path=self.config.strategy.gru_scaler_path,
-            lookback=self.config.strategy.gru_lookback
-        )
+        self.gru_predictor = None
+        if self.config.strategy.use_gru_filter:
+            from core.gru_predictor import GRUPredictor
+            self.gru_predictor = GRUPredictor(
+                model_path=self.config.strategy.gru_model_path,
+                scaler_path=self.config.strategy.gru_scaler_path,
+                lookback=self.config.strategy.gru_lookback
+            )
         self.running = False
         self.cycle_count = 0
         self.position_entry_cycle = {}
@@ -239,7 +241,7 @@ class UnifiedCryptoBot:
                 return
 
             # 4. Optional GRU Deep Learning Directional Filter
-            if self.config.strategy.use_gru_filter and self.gru_predictor.model is not None:
+            if self.config.strategy.use_gru_filter and self.gru_predictor is not None and self.gru_predictor.model is not None:
                 predicted_price = self.gru_predictor.predict_next_price(df)
                 if predicted_price is not None:
                     curr_price = df['close'].iloc[-1]
@@ -427,10 +429,12 @@ class UnifiedCryptoBot:
             )
             self.risk_manager.update_position_price(symbol, fill_price)
             self.position_entry_cycle[symbol] = self.cycle_count
+            signal_bar_open = pd.Timestamp(decision["ts"])
             self.position_targets[symbol] = {
                 'tp': setup.take_profit,
                 'sl': setup.stop_loss,
-                'strategy': setup.strategy_name
+                'strategy': setup.strategy_name,
+                'signal_bar_open': signal_bar_open.isoformat(),
             }
             active = getattr(self, "active_decisions", {})
             active[symbol] = {
@@ -452,7 +456,8 @@ class UnifiedCryptoBot:
             logger.error(f"Error processing {symbol}: {e}")
             finish_decision(f"skipped:error:{e}")
 
-    def _close_position(self, symbol, pos, price, reason):
+    def _close_position(self, symbol, pos, price, reason, reference_price=None):
+        reference_price = float(price if reference_price is None else reference_price)
         entry = float(pos.get('entryPrice', 0.0))
         contracts = float(pos.get('contracts', 0.0))
         side = pos.get('side', 'long')
@@ -461,9 +466,9 @@ class UnifiedCryptoBot:
         if decision_context and isinstance(decision_context.get("entry_time"), datetime):
             hold_minutes = max((getattr(self, "clock", datetime.now)() - decision_context["entry_time"]).total_seconds() / 60.0, 0.0)
         if side == 'long':
-            gross_pnl = (price - entry) * contracts
+            gross_pnl = (reference_price - entry) * contracts
         else:
-            gross_pnl = (entry - price) * contracts
+            gross_pnl = (entry - reference_price) * contracts
         pnl = gross_pnl
         if self.config.mode == "live":
             opp_side = 'sell' if side == 'long' else 'buy'
@@ -478,8 +483,8 @@ class UnifiedCryptoBot:
             self.exchange.close_position(symbol, price)
             audit(symbol, 'close', contracts, price, None, 'fill')
             meta = getattr(self, "paper_trade_meta", {}).pop(symbol, {})
-            exit_fee = price * contracts * self.config.backtest.taker_fee
-            exit_slippage = price * contracts * self.config.backtest.slippage
+            exit_fee = reference_price * contracts * self.config.backtest.taker_fee
+            exit_slippage = reference_price * contracts * self.config.backtest.slippage
             decision_fee = meta.get("entry_fee", 0.0) + exit_fee
             decision_slippage = meta.get("entry_slippage", 0.0) + exit_slippage
             pnl = (gross_pnl - meta.get("entry_fee", 0.0)
@@ -508,7 +513,17 @@ class UnifiedCryptoBot:
             if not pos:
                 return
 
-            df = self.exchange.fetch_ohlcv(symbol, self.config.scalping.timeframe, 5)
+            targets = self.position_targets.get(symbol, {})
+            signal_bar_open = targets.get('signal_bar_open')
+            limit = 5
+            if signal_bar_open:
+                try:
+                    elapsed = max((getattr(self, "clock", datetime.now)() -
+                                   pd.Timestamp(signal_bar_open).to_pydatetime()).total_seconds(), 0)
+                    limit = max(limit, int(elapsed // 300) + 3)
+                except (TypeError, ValueError):
+                    pass
+            df = self.exchange.fetch_ohlcv(symbol, self.config.scalping.timeframe, limit)
             if df is None or len(df) == 0:
                 return
 
@@ -516,29 +531,38 @@ class UnifiedCryptoBot:
             entry = float(pos.get('entryPrice', 0.0))
             side = pos.get('side', 'long')
             sc = self.config.scalping
-            targets = self.position_targets.get(symbol, {})
             tp_price = targets.get('tp')
             sl_price = targets.get('sl')
 
             self.risk_manager.update_position_price(symbol, price)
 
-            # 1. Hard SL (never skipped)
-            if side == 'long':
-                hit_sl = (price <= sl_price) if (sl_price and sl_price < entry) else (price <= entry * (1 - sc.stop_loss_pct))
-            else:
-                hit_sl = (price >= sl_price) if (sl_price and sl_price > entry) else (price >= entry * (1 + sc.stop_loss_pct))
-            if hit_sl:
-                self._close_position(symbol, pos, price, "STOP LOSS")
-                return
-
-            # 2. TP
-            if side == 'long':
-                hit_tp = (price >= tp_price) if (tp_price and tp_price > entry) else (price >= entry * (1 + sc.take_profit_pct))
-            else:
-                hit_tp = (price <= tp_price) if (tp_price and tp_price < entry) else (price <= entry * (1 - sc.take_profit_pct))
-            if hit_tp:
-                self._close_position(symbol, pos, price, "TAKE PROFIT")
-                return
+            # Check every post-signal candle, including the currently forming one.
+            fallback_sl = entry * (1 - sc.stop_loss_pct) if side == 'long' else entry * (1 + sc.stop_loss_pct)
+            fallback_tp = entry * (1 + sc.take_profit_pct) if side == 'long' else entry * (1 - sc.take_profit_pct)
+            sl_price = float(sl_price if sl_price is not None else fallback_sl)
+            tp_price = float(tp_price if tp_price is not None else fallback_tp)
+            candles = df
+            if signal_bar_open and isinstance(df.index, pd.DatetimeIndex):
+                candles = df.loc[df.index > pd.Timestamp(signal_bar_open)]
+            elif len(df) > 1:
+                # Compatibility with exchanges/tests that return no candle timestamps.
+                candles = df.iloc[1:]
+            for _, candle in candles.iterrows():
+                high = float(candle.get('high', candle['close']))
+                low = float(candle.get('low', candle['close']))
+                hit_sl = low <= sl_price if side == 'long' else high >= sl_price
+                hit_tp = high >= tp_price if side == 'long' else low <= tp_price
+                if hit_sl or hit_tp:
+                    is_sl = hit_sl  # adverse-first when both levels lie inside the bar
+                    level = sl_price if is_sl else tp_price
+                    fill = level
+                    if self.config.mode != "live":
+                        slip = float(self.config.backtest.slippage)
+                        fill = level * (1 - slip if side == 'long' else 1 + slip)
+                    self._close_position(symbol, pos, fill,
+                                         "STOP LOSS" if is_sl else "TAKE PROFIT",
+                                         reference_price=level if self.config.mode != "live" else fill)
+                    return
 
             # 3. Trailing / breakeven (isolated so failure can't skip SL above)
             try:
@@ -554,7 +578,11 @@ class UnifiedCryptoBot:
             entry_time = rm_pos.get('entry_time')
             if entry_time is not None:
                 hold_min = (getattr(self, "clock", datetime.now)() - entry_time).total_seconds() / 60.0
-                if hold_min > self.config.risk.max_hold_time_minutes:
+                signal_close = None
+                if signal_bar_open:
+                    signal_close = pd.Timestamp(signal_bar_open).to_pydatetime() + pd.Timedelta(minutes=5)
+                elapsed = (getattr(self, "clock", datetime.now)() - signal_close).total_seconds() / 60.0 if signal_close else hold_min
+                if elapsed >= self.config.risk.max_hold_time_minutes:
                     self._close_position(symbol, pos, price, "Time exit (wall-clock)")
                     return
             else:
