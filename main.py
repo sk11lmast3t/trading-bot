@@ -7,6 +7,7 @@ Integrates:
 - Takashi Kotegawa (BNF) 25-Period Disparity (Kairi-ritsu) panic buying
 - Deep learning GRU price trend validation
 """
+import argparse
 import time
 import logging
 import os
@@ -489,32 +490,31 @@ class UnifiedCryptoBot:
                 pass
 
 
-if __name__ == "__main__":
-    mode = "paper"
-    demo_flag = False
-    if len(sys.argv) > 1:
-        for arg in sys.argv[1:]:
-            if arg == "--demo":
-                demo_flag = True
-                continue
-            if arg.lower() in ("live", "paper"):
-                mode = arg.lower()
-                continue
-            if arg.lower().startswith("--mode="):
-                mode = arg.lower().split("=", 1)[1]
-                continue
+def build_config_from_args(argv=None, environ=None):
+    parser = argparse.ArgumentParser(description="Unified Crypto Scalper")
+    parser.add_argument("mode_arg", nargs="?", choices=("paper", "live"), default="paper")
+    parser.add_argument("--mode", dest="mode_option", choices=("paper", "live"))
+    parser.add_argument("--demo", action="store_true", help="Run in paper mode")
+    args = parser.parse_args(argv)
+
+    requested_mode = args.mode_option or args.mode_arg
+    if args.demo:
+        requested_mode = "paper"
+    elif requested_mode == "live":
+        live_arg = args.mode_arg == "live" or args.mode_option == "live"
+        env = os.environ if environ is None else environ
+        if not live_arg or env.get("CONFIRM_LIVE") != "YES":
+            raise SystemExit("Live mode requires the explicit 'live' argument and CONFIRM_LIVE=YES.")
 
     cfg = BotConfig()
-    if demo_flag:
-        cfg.exchange.demo = True
-        cfg.exchange.testnet = False
-        mode = "live"
-    cfg.mode = mode
-    if cfg.mode == "live":
-        if not cfg.exchange.api_key or not cfg.exchange.api_secret:
-            logger.error("API key or secret missing for live mode")
-            sys.exit(1)
-    bot = UnifiedCryptoBot(cfg)
+    cfg.mode = requested_mode
+    if cfg.mode == "live" and (not cfg.exchange.api_key or not cfg.exchange.api_secret):
+        raise SystemExit("API key or secret missing for live mode")
+    return cfg
+
+
+if __name__ == "__main__":
+    bot = UnifiedCryptoBot(build_config_from_args())
     bot.run()
 
 
