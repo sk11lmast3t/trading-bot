@@ -1,10 +1,11 @@
 """Compare main.py's paper execution path with the bar-based backtester.
 
 Replay timing follows candle opens: the clock is advanced to each bar's close,
-so that bar is complete and may drive a decision. ReplayExchange also appends a
-flat forming candle whose OHLC equals the latest completed close. process_symbol
-drops that final row before analysis; check_exits reads its close as the current
-mark. Its high/low are deliberately not used by main.py's exit checks.
+    so that bar is complete and may drive a decision. ReplayExchange also appends a
+flat forming candle whose OHLC equals the latest completed close. It is needed as
+the sentinel for process_symbol's unconditional final-row drop, and as the latest
+close mark read by check_exits. The duplicated close has no future OHLC information;
+main.py does not inspect high/low when checking exits.
 """
 from __future__ import annotations
 
@@ -51,8 +52,8 @@ class ReplayExchange:
         # A candle is complete only when its five-minute interval has ended.
         complete = self.frame[self.frame.index + pd.Timedelta(minutes=5) <= self.clock()]
         rows = complete.tail(max(0, limit - 2)).copy()
-        # This forming row is consumed only by main.check_exits as a close mark;
-        # process_symbol removes it before indicators/strategy analysis.
+        # process_symbol drops this sentinel so it can analyze the newest completed
+        # bar; check_exits reads its close as the mark. It is flat to avoid lookahead.
         if len(rows):
             mark = float(rows.iloc[-1]["close"])
             forming_ts = self.clock().replace(second=0, microsecond=0)
