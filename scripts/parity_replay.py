@@ -241,8 +241,7 @@ def compare(bot_trades, bt_trades, frame, bt_obj=None):
     for k in common:
         b, t = bot_map[k], bt_map[k]
         pnl_bps = (b["net"] - t.pnl) / t.notional * 10000 if t.notional else 0
-        reason_ok = (b["exit_reason"].lower().replace("take profit", "tp").replace("stop loss", "sl")
-                     == t.exit_reason.lower())
+        reason_ok = _normalize_reason(b["exit_reason"]) == _normalize_reason(t.exit_reason)
         row = {"side": k[0], "entry_time": str(k[1]),
             "entry_price_diff_bps": _bps_diff(b["entry_price"], t.entry_price),
             "sl_diff_bps": _bps_diff(b["sl"], t.sl),
@@ -255,6 +254,8 @@ def compare(bot_trades, bt_trades, frame, bt_obj=None):
             "exit_price_diff_bps": _bps_diff(b["exit_price"], t.exit_price),
             "entry_fee_diff": b["entry_fee"] - t.entry_fee,
             "exit_fee_diff": b["exit_fee"] - t.exit_fee,
+            "entry_slippage_diff": b["entry_slippage"] - t.entry_slip,
+            "exit_slippage_diff": b["exit_slippage"] - t.exit_slip,
             "slippage_diff": (b["entry_slippage"] + b["exit_slippage"] - t.entry_slip - t.exit_slip),
             "net_pnl_diff_bps": pnl_bps}
         matches.append(row)
@@ -272,13 +273,27 @@ def compare(bot_trades, bt_trades, frame, bt_obj=None):
                 causes.append("time-exit timing")
             else:
                 causes.append("other exit-reason mismatch")
-        if abs(row["exit_price_diff_bps"]) > 1e-9 and not intrabar_hit:
-            causes.append("time-exit timing" if "TIME" in (bt_reason, bot_reason) else "other exit-price mismatch")
+        if abs(row["exit_price_diff_bps"]) > 1e-9:
+            if intrabar_hit:
+                if "bot close vs backtester high/low" not in causes:
+                    causes.append("bot close vs backtester high/low")
+            else:
+                causes.append("time-exit timing" if "TIME" in (bt_reason, bot_reason) else "other exit-price mismatch")
         if abs(row["exit_time_diff_bars"]) > 1e-9 and "TIME" in (bt_reason, bot_reason):
             causes.append("time-exit timing")
         if abs(b["quantity"] - t.size) > max(1e-10, abs(t.size) * 1e-6):
             causes.append("sizing")
-        if abs(b["costs"] - t.costs) > max(1e-8, abs(t.costs) * 1e-6):
+        rate_diffs = (
+            _rate_diff(b["entry_fee"], b["entry_price"] * b["quantity"],
+                       t.entry_fee, t.entry_price * t.size),
+            _rate_diff(b["exit_fee"], b["exit_price"] * b["quantity"],
+                       t.exit_fee, t.exit_price * t.size),
+            _rate_diff(b["entry_slippage"], b["entry_price"] * b["quantity"],
+                       t.entry_slip, t.entry_price * t.size),
+            _rate_diff(b["exit_slippage"], b["exit_price"] * b["quantity"],
+                       t.exit_slip, t.exit_price * t.size),
+        )
+        if any(abs(diff) > 1e-10 for diff in rate_diffs):
             causes.append("slippage/fee formula")
         if abs(pnl_bps) > 1e-9 and not causes:
             causes.append("other pnl mismatch")
@@ -289,6 +304,12 @@ def compare(bot_trades, bt_trades, frame, bt_obj=None):
 
 def _bps_diff(bot_value, bt_value):
     return (float(bot_value) - float(bt_value)) / abs(float(bt_value)) * 10000 if bt_value else 0.0
+
+
+def _rate_diff(bot_cost, bot_notional, bt_cost, bt_notional):
+    bot_rate = float(bot_cost) / float(bot_notional) if bot_notional else 0.0
+    bt_rate = float(bt_cost) / float(bt_notional) if bt_notional else 0.0
+    return bot_rate - bt_rate
 
 
 def _normalize_reason(reason):
@@ -366,6 +387,8 @@ def main_cli():
         ("Exit price diff", "exit_price_diff_bps", "bps"),
         ("Entry fee diff", "entry_fee_diff", "quote"),
         ("Exit fee diff", "exit_fee_diff", "quote"),
+        ("Entry slippage diff", "entry_slippage_diff", "quote"),
+        ("Exit slippage diff", "exit_slippage_diff", "quote"),
         ("Slippage diff", "slippage_diff", "quote"),
         ("Net PnL diff", "net_pnl_diff_bps", "bps of BT notional"),
     ]
