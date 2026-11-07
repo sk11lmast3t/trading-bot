@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 import pytest
 import numpy as np
 import pandas as pd
@@ -78,7 +79,7 @@ def test_paper_exchange_sticks_to_one_candle_source_and_skips_on_error(monkeypat
     assert "skipping bar" in caplog.text
 
 
-def test_process_symbol_fetches_mtf_history_and_executes_synthetic_signal(monkeypatch):
+def test_process_symbol_fetches_mtf_history_and_executes_synthetic_signal(monkeypatch, tmp_path):
     cfg = BotConfig()
     cfg.strategy.active_strategy = "mtf_trend_pullback"
     cfg.scalping.scan_all_coins = False
@@ -129,6 +130,7 @@ def test_process_symbol_fetches_mtf_history_and_executes_synthetic_signal(monkey
     bot.position_targets = {}
     bot.entries_blocked = False
     bot.last_rejection_log = {}
+    bot.decision_log_path = str(tmp_path / "decisions.csv")
     seen_rows = []
 
     def synthetic_signal(window):
@@ -145,9 +147,12 @@ def test_process_symbol_fetches_mtf_history_and_executes_synthetic_signal(monkey
     meta = bot.paper_trade_meta["BTC/USDT"]
     assert meta["entry_fee"] == pytest.approx(110.0 * 0.1 * cfg.backtest.taker_fee)
     assert meta["entry_slippage"] == pytest.approx(110.0 * 0.1 * cfg.backtest.slippage)
+    rows = pd.read_csv(bot.decision_log_path)
+    assert rows.loc[0, "status"] == "entered"
+    assert rows.loc[0, "fill_price"] == pytest.approx(110.0)
 
 
-def test_process_symbol_enters_at_most_once_for_same_completed_bar(monkeypatch):
+def test_process_symbol_enters_at_most_once_for_same_completed_bar(monkeypatch, tmp_path):
     cfg = BotConfig()
     cfg.scalping.scan_all_coins = False
     cfg.execution.entry_mode = "market"
@@ -197,6 +202,7 @@ def test_process_symbol_enters_at_most_once_for_same_completed_bar(monkeypatch):
     bot.entries_blocked = False
     bot.last_rejection_log = {}
     bot.last_processed_bar = {}
+    bot.decision_log_path = str(tmp_path / "decisions.csv")
     monkeypatch.setattr(main.state, "save_position_at_entry", lambda *args, **kwargs: None)
 
     bot.process_symbol("BTC/USDT")
@@ -204,9 +210,50 @@ def test_process_symbol_enters_at_most_once_for_same_completed_bar(monkeypatch):
 
     assert bot.strategy.analyze.call_count == 1
     assert exchange.entries == ["BTC/USDT"]
+    rows = pd.read_csv(bot.decision_log_path)
+    assert len(rows) == 1
+    assert rows.loc[0, "status"] == "entered"
 
 
-def test_paper_close_applies_net_costs_once_to_risk_manager_balance(monkeypatch):
+def test_hold_signal_is_logged_as_a_skip(monkeypatch, tmp_path):
+    cfg = BotConfig()
+    idx = pd.date_range("2026-01-01", periods=302, freq="5min")
+    close = np.linspace(100.0, 105.0, len(idx))
+    bars = pd.DataFrame({
+        "open": close, "high": close + 1, "low": close - 1,
+        "close": close, "volume": 1000.0,
+    }, index=idx)
+
+    class FakeExchange:
+        def fetch_ohlcv(self, symbol, timeframe, limit):
+            return bars.iloc[-limit:]
+
+    bot = main.UnifiedCryptoBot.__new__(main.UnifiedCryptoBot)
+    bot.config = cfg
+    bot.strategy = MagicMock()
+    bot.strategy.lookback_bars = 300
+    bot.strategy.analyze.return_value = TradeSetup(Signal.HOLD)
+    bot.exchange = FakeExchange()
+    bot.risk_manager = MagicMock()
+    bot.risk_manager.current_balance = cfg.scalping.initial_capital
+    bot.entries_blocked = False
+    bot.last_processed_bar = {}
+    bot.decision_log_path = str(tmp_path / "decisions.csv")
+
+    bot.process_symbol("BTC/USDT")
+
+    rows = pd.read_csv(bot.decision_log_path)
+    assert list(rows.columns) == [
+        "ts", "symbol", "strategy", "signal", "intended_entry", "sl", "tp",
+        "status", "fill_price", "fee", "slippage", "exit_price", "exit_reason",
+        "hold_minutes", "net_pnl", "balance_after",
+    ]
+    assert len(rows) == 1
+    assert rows.loc[0, "signal"] == "HOLD"
+    assert rows.loc[0, "status"] == "skipped:hold"
+
+
+def test_paper_close_applies_net_costs_once_to_risk_manager_balance(monkeypatch, tmp_path):
     cfg = BotConfig()
     cfg.scalping.scan_all_coins = False
     risk_manager = RiskManager(cfg)
@@ -233,8 +280,22 @@ def test_paper_close_applies_net_costs_once_to_risk_manager_balance(monkeypatch)
     }
     bot.position_entry_cycle = {}
     bot.position_targets = {}
+    bot.decision_log_path = str(tmp_path / "decisions.csv")
+    bot.active_decisions = {
+        "BTC/USDT": {
+            "ts": "2026-01-01T00:00:00",
+            "symbol": "BTC/USDT",
+            "strategy": "test",
+            "entry_time": datetime.now() - timedelta(minutes=5),
+        }
+    }
     bot.persist_state = lambda: None
     monkeypatch.setattr(main.state, "record_trade", lambda *args, **kwargs: None)
+    bot._append_decision({
+        "ts": "2026-01-01T00:00:00", "symbol": "BTC/USDT", "strategy": "test",
+        "signal": "LONG", "intended_entry": 100.0, "sl": 90.0, "tp": 120.0,
+        "status": "entered", "fill_price": 100.0,
+    })
 
     bot._close_position("BTC/USDT", position, 110.0, "TAKE PROFIT")
 
@@ -245,3 +306,11 @@ def test_paper_close_applies_net_costs_once_to_risk_manager_balance(monkeypatch)
     assert risk_manager.trade_log[-1]["pnl"] == pytest.approx(net)
     assert risk_manager.current_balance == pytest.approx(cfg.scalping.initial_capital + net)
     assert exchange.balance == pytest.approx(risk_manager.current_balance)
+    rows = pd.read_csv(bot.decision_log_path)
+    assert len(rows) == 1
+    assert rows.loc[0, "exit_price"] == pytest.approx(110.0)
+    assert rows.loc[0, "exit_reason"] == "TAKE PROFIT"
+    assert rows.loc[0, "net_pnl"] == pytest.approx(net)
+    assert rows.loc[0, "fee"] == pytest.approx(100.0 * 2.0 * cfg.backtest.maker_fee + exit_fee)
+    assert rows.loc[0, "slippage"] == pytest.approx(exit_slippage)
+    assert rows.loc[0, "balance_after"] == pytest.approx(risk_manager.current_balance)

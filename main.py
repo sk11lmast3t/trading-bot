@@ -8,6 +8,7 @@ Integrates:
 - Deep learning GRU price trend validation
 """
 import argparse
+import csv
 import time
 import logging
 import os
@@ -68,6 +69,9 @@ class UnifiedCryptoBot:
         self.loaded_positions = []
         self.last_rejection_log = {}
         self.last_processed_bar = {}
+        self.active_decisions = {}
+        self.decision_log_path = os.path.join("logs", "decisions.csv")
+        self.decision_log_lock = threading.Lock()
         self.trade_lock = threading.Lock()
         self.last_symbol_refresh = 0
 
@@ -112,7 +116,77 @@ class UnifiedCryptoBot:
         console.print(f"Disparity Period: {self.config.strategy.disparity_period} (Panic Thresh: {self.config.strategy.disparity_panic_threshold}%)")
         console.print("[bold cyan]----------------------------------------------------[/bold cyan]")
 
+    def _append_decision(self, decision):
+        path = getattr(self, "decision_log_path", None)
+        if not path:
+            return
+        fields = [
+            "ts", "symbol", "strategy", "signal", "intended_entry", "sl", "tp",
+            "status", "fill_price", "fee", "slippage", "exit_price", "exit_reason",
+            "hold_minutes", "net_pnl", "balance_after",
+        ]
+        lock = getattr(self, "decision_log_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self.decision_log_lock = lock
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with lock:
+                write_header = not os.path.exists(path) or os.path.getsize(path) == 0
+                with open(path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=fields)
+                    if write_header:
+                        writer.writeheader()
+                    writer.writerow({field: decision.get(field, "") for field in fields})
+        except Exception as e:
+            logger.error("Could not append decision log %s: %s", path, e)
+
+    def _update_decision_exit(self, context, values):
+        path = getattr(self, "decision_log_path", None)
+        if not path or not os.path.exists(path):
+            return
+        fields = [
+            "ts", "symbol", "strategy", "signal", "intended_entry", "sl", "tp",
+            "status", "fill_price", "fee", "slippage", "exit_price", "exit_reason",
+            "hold_minutes", "net_pnl", "balance_after",
+        ]
+        lock = getattr(self, "decision_log_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self.decision_log_lock = lock
+        try:
+            with lock:
+                with open(path, newline="", encoding="utf-8") as f:
+                    rows = list(csv.DictReader(f))
+                for row in reversed(rows):
+                    if (row.get("ts") == context.get("ts")
+                            and row.get("symbol") == context.get("symbol")
+                            and row.get("strategy") == context.get("strategy")
+                            and row.get("status") == "entered"):
+                        row.update(values)
+                        break
+                else:
+                    return
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=fields)
+                    writer.writeheader()
+                    writer.writerows(rows)
+        except Exception as e:
+            logger.error("Could not update decision log %s: %s", path, e)
+
     def process_symbol(self, symbol: str):
+        decision = None
+        decision_written = False
+
+        def finish_decision(status, **values):
+            nonlocal decision_written
+            if decision is None or decision_written:
+                return
+            decision["status"] = status
+            decision.update(values)
+            self._append_decision(decision)
+            decision_written = True
+
         if getattr(self, "entries_blocked", False) and symbol not in getattr(self.risk_manager, "open_positions", {}):
             try:
                 self.check_exits(symbol)
@@ -143,7 +217,18 @@ class UnifiedCryptoBot:
 
             # 3. Strategy Evaluation
             setup = self.strategy.analyze(df)
+            decision = {
+                "ts": completed_bar.isoformat(),
+                "symbol": symbol,
+                "strategy": setup.strategy_name or getattr(self.strategy, "name", ""),
+                "signal": setup.signal.value,
+                "intended_entry": setup.entry_price,
+                "sl": setup.stop_loss,
+                "tp": setup.take_profit,
+                "balance_after": self.risk_manager.current_balance,
+            }
             if setup.signal == Signal.HOLD:
+                finish_decision("skipped:hold")
                 return
 
             # 4. Optional GRU Deep Learning Directional Filter
@@ -156,12 +241,14 @@ class UnifiedCryptoBot:
                         if time.time() - last_time > 300:
                             logger.info(f"[{symbol}] LONG signal filtered out by GRU forecast (${predicted_price:.2f} < ${curr_price:.2f})")
                             self.last_rejection_log[(symbol, "gru_long")] = time.time()
+                        finish_decision("skipped:gru_filter:long")
                         return
                     elif setup.signal == Signal.SHORT and predicted_price > curr_price:
                         last_time = self.last_rejection_log.get((symbol, "gru_short"), 0)
                         if time.time() - last_time > 300:
                             logger.info(f"[{symbol}] SHORT signal filtered out by GRU forecast (${predicted_price:.2f} > ${curr_price:.2f})")
                             self.last_rejection_log[(symbol, "gru_short")] = time.time()
+                        finish_decision("skipped:gru_filter:short")
                         return
 
             # 5. Risk Governor Verification
@@ -172,17 +259,20 @@ class UnifiedCryptoBot:
                 if time.time() - last_time > 300:  # Log at most once per 5 minutes per reason
                     logger.info(f"[{symbol}] {setup.signal.value} rejected by RiskManager: {reason}")
                     self.last_rejection_log[(symbol, reason)] = time.time()
+                finish_decision(f"skipped:risk:{reason}")
                 return
             else:
                 self.last_rejection_log.pop((symbol, reason), None)
 
             # 6. Check existing positions (No Averaging Down)
             if self.exchange.get_position(symbol):
+                finish_decision("skipped:position_open")
                 return
 
             # 6b. Max positions enforcement
             if len(self.risk_manager.open_positions) >= self.config.risk.max_open_positions:
                 logger.info(f"[{symbol}] {setup.signal.value} skipped: max open positions reached")
+                finish_decision("skipped:max_positions")
                 return
 
             # 7. Position Sizing
@@ -191,6 +281,7 @@ class UnifiedCryptoBot:
                 self.risk_manager.current_balance, setup.entry_price, setup.stop_loss, atr
             )
             if size <= 0:
+                finish_decision("skipped:zero_size")
                 return
 
             # 8. Portfolio Heat Check
@@ -198,6 +289,7 @@ class UnifiedCryptoBot:
             heat_ok, heat_reason = self.risk_manager.check_portfolio_heat(symbol, notional_value)
             if not heat_ok:
                 logger.info(f"[{symbol}] {setup.signal.value} rejected by Portfolio Heat: {heat_reason}")
+                finish_decision(f"skipped:portfolio_heat:{heat_reason}")
                 return
 
             side = 'buy' if setup.signal == Signal.LONG else 'sell'
@@ -226,9 +318,11 @@ class UnifiedCryptoBot:
                 audit(symbol, side, size, setup.entry_price, entry_id)
                 if entry_order is None:
                     logger.error(f"[{symbol}] Maker entry order rejected: None")
+                    finish_decision("skipped:maker_rejected")
                     return
                 if isinstance(entry_order, dict) and entry_order.get('status') == 'rejected':
                     logger.error(f"[{symbol}] Maker entry order rejected: {entry_order.get('reject_reason')}")
+                    finish_decision(f"skipped:maker_rejected:{entry_order.get('reject_reason', '')}")
                     return
                 # Track fill rate and cancel after timeout if unfilled.
                 filled = False
@@ -253,6 +347,7 @@ class UnifiedCryptoBot:
                         audit(symbol, 'cancel', size, setup.entry_price, entry_id, 'cancel')
                     except Exception:
                         pass
+                    finish_decision("skipped:maker_not_filled")
                     return
             elif self.config.mode == "live":
                 self.exchange.set_leverage(symbol, self.config.scalping.leverage)
@@ -260,6 +355,7 @@ class UnifiedCryptoBot:
                 audit(symbol, side, size, setup.entry_price, getattr(entry_order,'id',None) or getattr(entry_order,'order_id',None))
                 if entry_order is None or getattr(entry_order, 'state') != OrderState.FILLED:
                     logger.error(f"[{symbol}] Entry order not filled: state={getattr(entry_order,'state',None)}, error={getattr(entry_order,'last_error',None)}")
+                    finish_decision("skipped:entry_not_filled")
                     return
                 opp_side = 'sell' if side == 'buy' else 'buy'
                 sl_order = self.exchange.create_stop_loss(symbol, opp_side, size, setup.stop_loss)
@@ -277,15 +373,18 @@ class UnifiedCryptoBot:
                         self.exchange.cancel_all_orders(symbol)
                     except Exception:
                         pass
+                    finish_decision("skipped:stop_loss_rejected")
                     return
             else:
                 entry_order = self.exchange.create_market_order(symbol, side, size, {'price': setup.entry_price})
                 audit(symbol, side, size, setup.entry_price, getattr(entry_order,'id',None) or getattr(entry_order,'order_id',None) or (entry_order.get('id') if isinstance(entry_order,dict) else None))
                 if entry_order is None:
                     logger.error(f"[{symbol}] Entry order rejected: None")
+                    finish_decision("skipped:entry_rejected")
                     return
                 if isinstance(entry_order, dict) and entry_order.get('status') == 'rejected':
                     logger.error(f"[{symbol}] Entry order rejected: {entry_order.get('reject_reason')}")
+                    finish_decision(f"skipped:entry_rejected:{entry_order.get('reject_reason', '')}")
                     return
 
             # 10. Register actual fill size and track paper costs until the trade closes.
@@ -323,14 +422,34 @@ class UnifiedCryptoBot:
                 'sl': setup.stop_loss,
                 'strategy': setup.strategy_name
             }
+            active = getattr(self, "active_decisions", {})
+            active[symbol] = {
+                "ts": decision["ts"],
+                "symbol": symbol,
+                "strategy": decision["strategy"],
+                "entry_time": datetime.now(),
+            }
+            self.active_decisions = active
+            meta = getattr(self, "paper_trade_meta", {}).get(symbol, {})
+            finish_decision(
+                "entered", fill_price=fill_price,
+                fee=meta.get("entry_fee", ""),
+                slippage=meta.get("entry_slippage", ""),
+                balance_after=self.risk_manager.current_balance,
+            )
 
         except Exception as e:
             logger.error(f"Error processing {symbol}: {e}")
+            finish_decision(f"skipped:error:{e}")
 
     def _close_position(self, symbol, pos, price, reason):
         entry = float(pos.get('entryPrice', 0.0))
         contracts = float(pos.get('contracts', 0.0))
         side = pos.get('side', 'long')
+        decision_context = getattr(self, "active_decisions", {}).pop(symbol, None)
+        hold_minutes = ""
+        if decision_context and isinstance(decision_context.get("entry_time"), datetime):
+            hold_minutes = max((datetime.now() - decision_context["entry_time"]).total_seconds() / 60.0, 0.0)
         if side == 'long':
             gross_pnl = (price - entry) * contracts
         else:
@@ -351,11 +470,23 @@ class UnifiedCryptoBot:
             meta = getattr(self, "paper_trade_meta", {}).pop(symbol, {})
             exit_fee = price * contracts * self.config.backtest.taker_fee
             exit_slippage = price * contracts * self.config.backtest.slippage
+            decision_fee = meta.get("entry_fee", 0.0) + exit_fee
+            decision_slippage = meta.get("entry_slippage", 0.0) + exit_slippage
             pnl = (gross_pnl - meta.get("entry_fee", 0.0)
                    - meta.get("entry_slippage", 0.0) - exit_fee - exit_slippage)
         logger.info(f"[{symbol}] Closed {side.upper()} position: {reason} | PnL: ${pnl:.4f}")
         self.risk_manager.record_trade(pnl, symbol)
         state.record_trade(pnl, symbol, reason)
+        if decision_context:
+            self._update_decision_exit(decision_context, {
+                "exit_price": price,
+                "exit_reason": reason,
+                "hold_minutes": hold_minutes,
+                "net_pnl": pnl,
+                "balance_after": self.risk_manager.current_balance,
+                **({"fee": decision_fee, "slippage": decision_slippage}
+                   if self.config.mode != "live" else {}),
+            })
         self.risk_manager.release_position(symbol)
         self.position_entry_cycle.pop(symbol, None)
         self.position_targets.pop(symbol, None)
