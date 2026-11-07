@@ -351,7 +351,8 @@ class PaperExchange:
     def __init__(self, config):
         self.config = config
         self.exec_cfg = config.execution
-        self.balance = config.scalping.initial_capital
+        self._balance = config.scalping.initial_capital
+        self._balance_source = None
         self.positions = {}
         self.trade_history = []
         self.order_id = 0
@@ -363,6 +364,23 @@ class PaperExchange:
         self._public_exchanges = []
         self._current_public = None
         self._init_public_exchanges()
+
+    @property
+    def balance(self):
+        if self._balance_source is not None:
+            return float(self._balance_source.current_balance)
+        return self._balance
+
+    @balance.setter
+    def balance(self, value):
+        if self._balance_source is not None:
+            self._balance_source.current_balance = float(value)
+        else:
+            self._balance = float(value)
+
+    def bind_balance_source(self, source):
+        """Use the risk manager as the balance authority for bot-managed paper trades."""
+        self._balance_source = source
 
     def _init_public_exchanges(self):
         candidates = []
@@ -679,7 +697,8 @@ class PaperExchange:
         # Apply slippage on exit
         exit_price = self._simulate_slippage(exit_price, 'sell' if side == 'long' else 'buy')
         pnl = (exit_price - entry) * amt if side == 'long' else (entry - exit_price) * amt
-        self.balance += pnl
+        if self._balance_source is None:
+            self.balance += pnl
         return pnl
 
     def cancel_all_orders(self, symbol: str):

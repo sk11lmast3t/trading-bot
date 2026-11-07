@@ -5,6 +5,8 @@ from unittest.mock import MagicMock
 
 import main
 from config.settings import BotConfig
+from core.exchange import PaperExchange
+from core.risk_manager import RiskManager
 from core.strategies import MtfTrendPullbackStrategy, Signal, TradeSetup
 
 
@@ -92,6 +94,9 @@ def test_process_symbol_fetches_mtf_history_and_executes_synthetic_signal(monkey
     assert exchange.requested_limit >= 722
     assert seen_rows and max(seen_rows) >= 720
     assert exchange.entries == ["BTC/USDT"]
+    meta = bot.paper_trade_meta["BTC/USDT"]
+    assert meta["entry_fee"] == pytest.approx(110.0 * 0.1 * cfg.backtest.taker_fee)
+    assert meta["entry_slippage"] == pytest.approx(110.0 * 0.1 * cfg.backtest.slippage)
 
 
 def test_process_symbol_enters_at_most_once_for_same_completed_bar(monkeypatch):
@@ -151,3 +156,44 @@ def test_process_symbol_enters_at_most_once_for_same_completed_bar(monkeypatch):
 
     assert bot.strategy.analyze.call_count == 1
     assert exchange.entries == ["BTC/USDT"]
+
+
+def test_paper_close_applies_net_costs_once_to_risk_manager_balance(monkeypatch):
+    cfg = BotConfig()
+    cfg.scalping.scan_all_coins = False
+    risk_manager = RiskManager(cfg)
+    position = {
+        "symbol": "BTC/USDT", "side": "long", "contracts": 2.0,
+        "entryPrice": 100.0,
+    }
+    exchange = PaperExchange.__new__(PaperExchange)
+    exchange._balance = cfg.scalping.initial_capital
+    exchange._balance_source = risk_manager
+    exchange.latency_ms = 0
+    exchange.base_slippage_pct = 0.0
+    exchange.positions = {"BTC/USDT": dict(position)}
+
+    bot = main.UnifiedCryptoBot.__new__(main.UnifiedCryptoBot)
+    bot.config = cfg
+    bot.exchange = exchange
+    bot.risk_manager = risk_manager
+    bot.paper_trade_meta = {
+        "BTC/USDT": {
+            "entry_fee": 100.0 * 2.0 * cfg.backtest.maker_fee,
+            "entry_slippage": 0.0,
+        }
+    }
+    bot.position_entry_cycle = {}
+    bot.position_targets = {}
+    bot.persist_state = lambda: None
+    monkeypatch.setattr(main.state, "record_trade", lambda *args, **kwargs: None)
+
+    bot._close_position("BTC/USDT", position, 110.0, "TAKE PROFIT")
+
+    gross = (110.0 - 100.0) * 2.0
+    exit_fee = 110.0 * 2.0 * cfg.backtest.taker_fee
+    exit_slippage = 110.0 * 2.0 * cfg.backtest.slippage
+    net = gross - 100.0 * 2.0 * cfg.backtest.maker_fee - exit_fee - exit_slippage
+    assert risk_manager.trade_log[-1]["pnl"] == pytest.approx(net)
+    assert risk_manager.current_balance == pytest.approx(cfg.scalping.initial_capital + net)
+    assert exchange.balance == pytest.approx(risk_manager.current_balance)

@@ -75,6 +75,10 @@ class UnifiedCryptoBot:
             self.exchange = ExchangeConnector(self.config).connect()
         else:
             self.exchange = PaperExchange(self.config)
+            self.exchange.bind_balance_source(self.risk_manager)
+            # Paper accounting charges fixed slippage separately, as the backtester does.
+            self.exchange.base_slippage_pct = 0.0
+        self.paper_trade_meta = {}
 
         if self.config.scalping.scan_all_coins:
             self.refresh_symbols()
@@ -280,10 +284,35 @@ class UnifiedCryptoBot:
                     logger.error(f"[{symbol}] Entry order rejected: {entry_order.get('reject_reason')}")
                     return
 
-            # 10. Register position for heat & trailing stop tracking
+            # 10. Register actual fill size and track paper costs until the trade closes.
+            filled_amount = float(
+                entry_order.get("filled", size) if isinstance(entry_order, dict)
+                else getattr(entry_order, "filled", None) or size
+            )
+            fill_price = float(
+                (entry_order.get("price") or setup.entry_price) if isinstance(entry_order, dict)
+                else getattr(entry_order, "price", None) or setup.entry_price
+            )
+            notional_value = fill_price * filled_amount
+            if self.config.mode != "live":
+                fee_rate = (self.config.backtest.maker_fee if entry_mode == "maker"
+                            else self.config.backtest.taker_fee)
+                slip_rate = 0.0 if entry_mode == "maker" else self.config.backtest.slippage
+                meta = getattr(self, "paper_trade_meta", {})
+                meta[symbol] = {
+                    "entry_price": fill_price,
+                    "quantity": filled_amount,
+                    "entry_fee": fill_price * filled_amount * fee_rate,
+                    "entry_slippage": fill_price * filled_amount * slip_rate,
+                    "entry_time": datetime.now(),
+                    "strategy": setup.strategy_name,
+                    "signal": setup.signal.value,
+                }
+                self.paper_trade_meta = meta
+
             self.risk_manager.register_position(symbol, notional_value, side)
-            state.save_position_at_entry(symbol, side, size, setup.entry_price, setup.take_profit, setup.stop_loss, setup.strategy_name)
-            self.risk_manager.update_position_price(symbol, setup.entry_price)
+            state.save_position_at_entry(symbol, side, filled_amount, fill_price, setup.take_profit, setup.stop_loss, setup.strategy_name)
+            self.risk_manager.update_position_price(symbol, fill_price)
             self.position_entry_cycle[symbol] = self.cycle_count
             self.position_targets[symbol] = {
                 'tp': setup.take_profit,
@@ -299,10 +328,10 @@ class UnifiedCryptoBot:
         contracts = float(pos.get('contracts', 0.0))
         side = pos.get('side', 'long')
         if side == 'long':
-            pnl = (price - entry) * contracts
+            gross_pnl = (price - entry) * contracts
         else:
-            pnl = (entry - price) * contracts
-        logger.info(f"[{symbol}] Closed {side.upper()} position: {reason} | PnL: ${pnl:.4f}")
+            gross_pnl = (entry - price) * contracts
+        pnl = gross_pnl
         if self.config.mode == "live":
             opp_side = 'sell' if side == 'long' else 'buy'
             co = self.exchange.create_market_order(symbol, opp_side, contracts)
@@ -315,6 +344,12 @@ class UnifiedCryptoBot:
         else:
             self.exchange.close_position(symbol, price)
             audit(symbol, 'close', contracts, price, None, 'fill')
+            meta = getattr(self, "paper_trade_meta", {}).pop(symbol, {})
+            exit_fee = price * contracts * self.config.backtest.taker_fee
+            exit_slippage = price * contracts * self.config.backtest.slippage
+            pnl = (gross_pnl - meta.get("entry_fee", 0.0)
+                   - meta.get("entry_slippage", 0.0) - exit_fee - exit_slippage)
+        logger.info(f"[{symbol}] Closed {side.upper()} position: {reason} | PnL: ${pnl:.4f}")
         self.risk_manager.record_trade(pnl, symbol)
         state.record_trade(pnl, symbol, reason)
         self.risk_manager.release_position(symbol)
