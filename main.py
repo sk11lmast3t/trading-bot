@@ -124,7 +124,11 @@ class UnifiedCryptoBot:
             lookback = int(getattr(self.strategy, "lookback_bars", 300))
             fetch_limit = max(201, lookback + 2)
             df = self.exchange.fetch_ohlcv(symbol, self.config.scalping.timeframe, fetch_limit)
-            if df is None or len(df) < 30:
+            if df is None:
+                logger.error("[%s] Candle fetch failed; skipping this bar", symbol)
+                return
+            if len(df) < 30:
+                logger.info("[%s] Only %s candles available; skipping this bar", symbol, len(df))
                 return
             df = df.iloc[:-1]
             completed_bar = df.index[-1]
@@ -539,11 +543,18 @@ def build_config_from_args(argv=None, environ=None):
     parser.add_argument("mode_arg", nargs="?", choices=("paper", "live"), default="paper")
     parser.add_argument("--mode", dest="mode_option", choices=("paper", "live"))
     parser.add_argument("--demo", action="store_true", help="Run in paper mode")
+    parser.add_argument("--parity", action="store_true", help="Use deterministic paper/backtest parity settings")
+    parser.add_argument("--symbols", help="Comma-separated fixed symbol list")
+    parser.add_argument("--hold-minutes", type=float, default=30.0)
+    parser.add_argument("--capital", type=float, default=100.0)
+    parser.add_argument("--exchange", help="Pin candle data to this CCXT exchange")
     args = parser.parse_args(argv)
 
     requested_mode = args.mode_option or args.mode_arg
     if args.demo:
         requested_mode = "paper"
+    if args.parity and requested_mode != "paper":
+        raise SystemExit("--parity is available only in paper mode.")
     elif requested_mode == "live":
         live_arg = args.mode_arg == "live" or args.mode_option == "live"
         env = os.environ if environ is None else environ
@@ -552,6 +563,23 @@ def build_config_from_args(argv=None, environ=None):
 
     cfg = BotConfig()
     cfg.mode = requested_mode
+    if args.exchange:
+        cfg.exchange.name = args.exchange.lower()
+    if args.symbols:
+        cfg.scalping.symbols = [symbol.strip() for symbol in args.symbols.split(",") if symbol.strip()]
+    if args.parity:
+        if args.capital <= 0 or args.hold_minutes <= 0:
+            raise SystemExit("--capital and --hold-minutes must be greater than zero in parity mode.")
+        cfg.parity = True
+        cfg.risk.trailing_stop_enabled = False
+        cfg.risk.breakeven_activation_pct = 0.0
+        cfg.risk.trailing_stop_activation_pct = 0.0
+        cfg.scalping.scan_all_coins = False
+        cfg.scalping.symbols = list(cfg.scalping.symbols)
+        cfg.risk.max_hold_time_minutes = args.hold_minutes
+        cfg.execution.paper_partial_fill_chance = 0.0
+        cfg.execution.paper_reject_chance = 0.0
+        cfg.scalping.initial_capital = args.capital
     if cfg.mode == "live" and (not cfg.exchange.api_key or not cfg.exchange.api_secret):
         raise SystemExit("API key or secret missing for live mode")
     return cfg

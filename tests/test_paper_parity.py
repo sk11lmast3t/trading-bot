@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import main
 from config.settings import BotConfig
+from core import exchange as exchange_module
 from core.exchange import PaperExchange
 from core.risk_manager import RiskManager
 from core.strategies import MtfTrendPullbackStrategy, Signal, TradeSetup
@@ -28,6 +29,53 @@ def test_live_requires_live_argument_even_with_confirmation(monkeypatch):
 
     assert main.build_config_from_args([], environ={"CONFIRM_LIVE": "YES"}).mode == "paper"
     assert main.build_config_from_args(["live"], environ={"CONFIRM_LIVE": "YES"}).mode == "live"
+
+
+def test_parity_profile_applies_requested_settings():
+    cfg = main.build_config_from_args([
+        "--parity", "--symbols", "BTC/USDT,SOL/USDT", "--exchange", "kraken",
+        "--hold-minutes", "45", "--capital", "250",
+    ], environ={})
+
+    assert cfg.mode == "paper"
+    assert cfg.parity is True
+    assert cfg.exchange.name == "kraken"
+    assert cfg.scalping.symbols == ["BTC/USDT", "SOL/USDT"]
+    assert cfg.scalping.scan_all_coins is False
+    assert cfg.risk.max_hold_time_minutes == 45
+    assert cfg.risk.trailing_stop_enabled is False
+    assert cfg.risk.breakeven_activation_pct == 0
+    assert cfg.risk.trailing_stop_activation_pct == 0
+    assert cfg.execution.paper_partial_fill_chance == 0
+    assert cfg.execution.paper_reject_chance == 0
+    assert cfg.scalping.initial_capital == 250
+
+
+def test_parity_rejects_live_mode():
+    with pytest.raises(SystemExit, match="--parity is available only in paper mode"):
+        main.build_config_from_args(["live", "--parity"], environ={"CONFIRM_LIVE": "YES"})
+
+
+def test_paper_exchange_sticks_to_one_candle_source_and_skips_on_error(monkeypatch, caplog):
+    calls = []
+
+    class FakeExchange:
+        id = "kraken"
+
+        def fetch_ohlcv(self, symbol, timeframe, limit):
+            calls.append((symbol, timeframe, limit))
+            raise RuntimeError("offline")
+
+    fake_exchange = FakeExchange()
+    monkeypatch.setattr(exchange_module.ccxt, "kraken", lambda config: fake_exchange)
+    cfg = BotConfig()
+    cfg.exchange.name = "kraken"
+    exchange = PaperExchange(cfg)
+
+    assert exchange._public_exchanges == [fake_exchange]
+    assert exchange.fetch_ohlcv("BTC/USDT", "5m", 722) is None
+    assert calls == [("BTC/USDT", "5m", 722)]
+    assert "skipping bar" in caplog.text
 
 
 def test_process_symbol_fetches_mtf_history_and_executes_synthetic_signal(monkeypatch):
