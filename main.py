@@ -54,6 +54,7 @@ def audit(symbol, side, qty, price, order_id, action='send'):
 class UnifiedCryptoBot:
     def __init__(self, config=None, clock=None):
         self.config = config or BotConfig()
+        state.set_mode(self.config.mode)
         clock_source = clock or getattr(self.config, "clock", None)
         self.clock = clock_source or datetime.now
         self.strategy = get_strategy(self.config)
