@@ -48,7 +48,7 @@ def make_bot_live():
     return bot
 
 
-def test_entry_filled_stop_placed():
+def test_entry_filled_stop_placed(monkeypatch):
     bot = make_bot_live()
     df_mock = MagicMock()
     df_mock.__len__.return_value = 100
@@ -64,7 +64,7 @@ def test_entry_filled_stop_placed():
     bot.exchange.fetch_ohlcv.return_value = df
     from core import indicators
     from core.indicators import Indicators
-    Indicators.calculate_all = MagicMock(return_value=df)
+    monkeypatch.setattr(Indicators, "calculate_all", MagicMock(return_value=df))
     entry = OrderRecord(id='1', symbol='BTC/USDT', side='buy', type='market', amount=0.01, price=None)
     entry.state = OrderState.FILLED
     sl = OrderRecord(id='2', symbol='BTC/USDT', side='sell', type='stop_market', amount=0.01, price=None)
@@ -76,7 +76,7 @@ def test_entry_filled_stop_placed():
     bot.exchange.create_stop_loss.assert_called_once()
 
 
-def test_stop_rejected_flattens():
+def test_stop_rejected_flattens(monkeypatch):
     bot = make_bot_live()
     import pandas as pd
     dates = pd.date_range('2023-01-01', periods=50, freq='1min')
@@ -85,7 +85,7 @@ def test_stop_rejected_flattens():
     }, index=dates)
     bot.exchange.fetch_ohlcv = MagicMock(return_value=df)
     from core.indicators import Indicators
-    Indicators.calculate_all = MagicMock(return_value=df)
+    monkeypatch.setattr(Indicators, "calculate_all", MagicMock(return_value=df))
     entry = OrderRecord(id='1', symbol='BTC/USDT', side='buy', type='market', amount=0.01, price=None)
     entry.state = OrderState.FILLED
     sl = OrderRecord(id='2', symbol='BTC/USDT', side='sell', type='stop_market', amount=0.01, price=None)
@@ -99,7 +99,7 @@ def test_stop_rejected_flattens():
     bot.exchange.close_position.assert_called()
 
 
-def test_entry_none_or_rejected_nothing_registered():
+def test_entry_none_or_rejected_nothing_registered(monkeypatch):
     bot = make_bot_live()
     import pandas as pd
     dates = pd.date_range('2023-01-01', periods=50, freq='1min')
@@ -108,7 +108,7 @@ def test_entry_none_or_rejected_nothing_registered():
     }, index=dates)
     bot.exchange.fetch_ohlcv = MagicMock(return_value=df)
     from core.indicators import Indicators
-    Indicators.calculate_all = MagicMock(return_value=df)
+    monkeypatch.setattr(Indicators, "calculate_all", MagicMock(return_value=df))
     bot.exchange.create_market_order = MagicMock(return_value=None)
     bot.process_symbol('BTC/USDT')
     bot.risk_manager.register_position.assert_not_called()
