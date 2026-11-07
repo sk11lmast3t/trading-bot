@@ -92,3 +92,62 @@ def test_process_symbol_fetches_mtf_history_and_executes_synthetic_signal(monkey
     assert exchange.requested_limit >= 722
     assert seen_rows and max(seen_rows) >= 720
     assert exchange.entries == ["BTC/USDT"]
+
+
+def test_process_symbol_enters_at_most_once_for_same_completed_bar(monkeypatch):
+    cfg = BotConfig()
+    cfg.scalping.scan_all_coins = False
+    cfg.execution.entry_mode = "market"
+    idx = pd.date_range("2026-01-01", periods=302, freq="5min")
+    close = np.linspace(100.0, 105.0, len(idx))
+    bars = pd.DataFrame({
+        "open": close, "high": close + 1, "low": close - 1,
+        "close": close, "volume": 1000.0,
+    }, index=idx)
+
+    class FakeExchange:
+        def __init__(self):
+            self.positions = {}
+            self.entries = []
+
+        def fetch_ohlcv(self, symbol, timeframe, limit):
+            return bars.iloc[-limit:]
+
+        def get_position(self, symbol):
+            return self.positions.get(symbol)
+
+        def create_market_order(self, symbol, side, amount, params=None):
+            price = params["price"]
+            self.positions[symbol] = {
+                "symbol": symbol, "side": "long", "contracts": amount,
+                "entryPrice": price,
+            }
+            self.entries.append(symbol)
+            return {"status": "closed", "filled": amount, "price": price}
+
+    bot = main.UnifiedCryptoBot.__new__(main.UnifiedCryptoBot)
+    bot.config = cfg
+    bot.strategy = MagicMock()
+    bot.strategy.lookback_bars = 300
+    bot.strategy.analyze.return_value = TradeSetup(Signal.LONG, 105.0, 103.0, 109.0, 0.7, "test")
+    exchange = FakeExchange()
+    bot.exchange = exchange
+    bot.risk_manager = MagicMock()
+    bot.risk_manager.open_positions = {}
+    bot.risk_manager.current_balance = cfg.scalping.initial_capital
+    bot.risk_manager.can_trade.return_value = (True, "OK")
+    bot.risk_manager.calculate_position_size.return_value = 0.1
+    bot.risk_manager.check_portfolio_heat.return_value = (True, "OK")
+    bot.cycle_count = 1
+    bot.position_entry_cycle = {}
+    bot.position_targets = {}
+    bot.entries_blocked = False
+    bot.last_rejection_log = {}
+    bot.last_processed_bar = {}
+    monkeypatch.setattr(main.state, "save_position_at_entry", lambda *args, **kwargs: None)
+
+    bot.process_symbol("BTC/USDT")
+    bot.process_symbol("BTC/USDT")
+
+    assert bot.strategy.analyze.call_count == 1
+    assert exchange.entries == ["BTC/USDT"]

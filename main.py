@@ -67,6 +67,7 @@ class UnifiedCryptoBot:
         self.entries_blocked = False
         self.loaded_positions = []
         self.last_rejection_log = {}
+        self.last_processed_bar = {}
         self.trade_lock = threading.Lock()
         self.last_symbol_refresh = 0
 
@@ -122,6 +123,12 @@ class UnifiedCryptoBot:
             if df is None or len(df) < 30:
                 return
             df = df.iloc[:-1]
+            completed_bar = df.index[-1]
+            last_processed = getattr(self, "last_processed_bar", {})
+            if last_processed.get(symbol) == completed_bar:
+                return
+            last_processed[symbol] = completed_bar
+            self.last_processed_bar = last_processed
 
             # 2. Vectorized Indicators & Disparity
             df = Indicators.calculate_all(df, self.config)
