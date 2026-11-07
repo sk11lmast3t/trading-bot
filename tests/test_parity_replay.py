@@ -120,3 +120,24 @@ def test_replay_runner_returns_the_known_bot_and_backtester_trades(monkeypatch):
     assert details[0]["entry_price_diff_bps"] == 0.0
     assert details[0]["exit_time_diff_bars"] == 1.0
     assert details[0]["exit_price_diff_bps"] > 0
+
+
+def test_compare_keeps_nearest_pair_outside_five_minutes_unmatched():
+    signal_bar = pd.Timestamp("2024-02-01 00:00:00")
+    bot = replay.TradeRun([{
+        "side": "long", "entry_time": (signal_bar + pd.Timedelta(minutes=10)).to_pydatetime(),
+        "signal_bar_open": signal_bar + pd.Timedelta(minutes=5),
+    }])
+    bt_trade = type("Trade", (), {"side": "long", "entry_time": signal_bar})()
+    frame = pd.DataFrame({"open": [100], "high": [101], "low": [99],
+                          "close": [100]}, index=[signal_bar])
+
+    matched, only_bot, only_bt, _, mismatches, histogram, exceptions = replay.compare(
+        bot, [bt_trade], frame)
+
+    assert matched == []
+    assert len(only_bot) == len(only_bt) == 1
+    assert histogram == {"+10 min": 1}
+    assert len(exceptions) == 1
+    assert exceptions[0][2] == 10.0
+    assert any(row["cause"] == "entry timing offset" for row in mismatches)
