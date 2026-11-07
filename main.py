@@ -116,7 +116,9 @@ class UnifiedCryptoBot:
             return
         try:
             # 1. Fetch OHLCV
-            df = self.exchange.fetch_ohlcv(symbol, self.config.scalping.timeframe, 201)
+            lookback = int(getattr(self.strategy, "lookback_bars", 300))
+            fetch_limit = max(201, lookback + 2)
+            df = self.exchange.fetch_ohlcv(symbol, self.config.scalping.timeframe, fetch_limit)
             if df is None or len(df) < 30:
                 return
             df = df.iloc[:-1]

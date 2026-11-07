@@ -1,7 +1,11 @@
 import pytest
+import numpy as np
+import pandas as pd
+from unittest.mock import MagicMock
 
 import main
 from config.settings import BotConfig
+from core.strategies import MtfTrendPullbackStrategy, Signal, TradeSetup
 
 
 def test_demo_always_selects_paper_mode():
@@ -22,3 +26,69 @@ def test_live_requires_live_argument_even_with_confirmation(monkeypatch):
 
     assert main.build_config_from_args([], environ={"CONFIRM_LIVE": "YES"}).mode == "paper"
     assert main.build_config_from_args(["live"], environ={"CONFIRM_LIVE": "YES"}).mode == "live"
+
+
+def test_process_symbol_fetches_mtf_history_and_executes_synthetic_signal(monkeypatch):
+    cfg = BotConfig()
+    cfg.strategy.active_strategy = "mtf_trend_pullback"
+    cfg.scalping.scan_all_coins = False
+    cfg.execution.entry_mode = "market"
+
+    idx = pd.date_range("2026-01-01", periods=724, freq="5min")
+    close = np.linspace(100.0, 110.0, len(idx))
+    bars = pd.DataFrame({
+        "open": close, "high": close + 1, "low": close - 1,
+        "close": close, "volume": 1000.0,
+    }, index=idx)
+
+    class FakeExchange:
+        def __init__(self):
+            self.requested_limit = None
+            self.positions = {}
+            self.entries = []
+
+        def fetch_ohlcv(self, symbol, timeframe, limit):
+            self.requested_limit = limit
+            return bars.iloc[-limit:]
+
+        def get_position(self, symbol):
+            return self.positions.get(symbol)
+
+        def create_market_order(self, symbol, side, amount, params=None):
+            price = params["price"]
+            self.positions[symbol] = {
+                "symbol": symbol, "side": "long", "contracts": amount,
+                "entryPrice": price,
+            }
+            self.entries.append(symbol)
+            return {"status": "closed", "filled": amount, "price": price}
+
+    bot = main.UnifiedCryptoBot.__new__(main.UnifiedCryptoBot)
+    bot.config = cfg
+    bot.strategy = MtfTrendPullbackStrategy(cfg)
+    exchange = FakeExchange()
+    bot.exchange = exchange
+    bot.risk_manager = MagicMock()
+    bot.risk_manager.open_positions = {}
+    bot.risk_manager.current_balance = cfg.scalping.initial_capital
+    bot.risk_manager.can_trade.return_value = (True, "OK")
+    bot.risk_manager.calculate_position_size.return_value = 0.1
+    bot.risk_manager.check_portfolio_heat.return_value = (True, "OK")
+    bot.cycle_count = 1
+    bot.position_entry_cycle = {}
+    bot.position_targets = {}
+    bot.entries_blocked = False
+    bot.last_rejection_log = {}
+    seen_rows = []
+
+    def synthetic_signal(window):
+        seen_rows.append(len(window))
+        return TradeSetup(Signal.LONG, 110.0, 108.0, 114.0, 0.7, "mtf_trend_pullback")
+
+    monkeypatch.setattr(bot.strategy, "analyze", synthetic_signal)
+    monkeypatch.setattr(main.state, "save_position_at_entry", lambda *args, **kwargs: None)
+    bot.process_symbol("BTC/USDT")
+
+    assert exchange.requested_limit >= 722
+    assert seen_rows and max(seen_rows) >= 720
+    assert exchange.entries == ["BTC/USDT"]
