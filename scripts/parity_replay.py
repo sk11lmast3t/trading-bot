@@ -177,6 +177,9 @@ def compare(bot_trades, bt_trades, frame):
         if near and abs((pd.Timestamp(near.entry_time) - k[1]).total_seconds()) <= 300:
             cause = "entry timing: bot enters at signal-bar close"
             evidence += f"; nearest backtester entry={near.entry_time}, bot entry={k[1]} (<=5m offset)"
+        elif near:
+            evidence += f"; nearest backtester entry={near.entry_time}, offset={(pd.Timestamp(near.entry_time) - k[1]).total_seconds()/60:.1f}m (>5m)"
+            cause = "other: no nearby backtester entry"
         mismatch_rows.append({"side": k[0], "entry_time": str(k[1]), "cause": cause, "evidence": evidence})
     for k in only_bt:
         near = min((t for t in bot_trades if t["side"] == k[0]),
@@ -186,6 +189,9 @@ def compare(bot_trades, bt_trades, frame):
         if near and abs((pd.Timestamp(near["entry_time"]) - k[1]).total_seconds()) <= 300:
             cause = "entry timing: backtester timestamps signal bar"
             evidence += f"; nearest bot entry={near['entry_time']}, backtester entry={k[1]} (<=5m offset)"
+        elif near:
+            evidence += f"; nearest bot entry={near['entry_time']}, offset={(pd.Timestamp(near['entry_time']) - k[1]).total_seconds()/60:.1f}m (>5m)"
+            cause = "other: no nearby bot entry"
         mismatch_rows.append({"side": k[0], "entry_time": str(k[1]), "cause": cause, "evidence": evidence})
     matches = []
     for k in common:
@@ -254,6 +260,10 @@ def main_cli():
     for m in mismatches:
         for cause in m["cause"].split("; "):
             causes[cause] = causes.get(cause, 0) + 1
+    for cause in ("bot close vs backtester high/low", "fees/slippage formula",
+                  "position sizing", "other: no nearby bot entry",
+                  "other: no nearby backtester entry"):
+        causes.setdefault(cause, 0)
     with open(os.path.join(a.out, stem + "_mismatches.csv"), "w", newline="", encoding="utf-8") as f:
         cols = ["side", "entry_time", "cause", "evidence"]
         w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(mismatches)
@@ -271,10 +281,10 @@ def main_cli():
         lines.append(f"| {d['side']} | {d['entry_time']} | {d['entry_diff']:.8g} | {d['sl_diff']} | {d['tp_diff']} | {d['exit_reason_agrees']} | {d['exit_time_diff_minutes']:.2f} | {d['net_pnl_diff_bps']:.3f} |")
     lines += ["", "## Mismatch causes", "", "| Cause | Count |", "|---|---:|"]
     lines.extend(f"| {cause} | {count} |" for cause, count in sorted(causes.items()))
-    lines += ["", f"Mismatch detail CSV: `{stem}_mismatches.csv`.", "", "Classification is evidence-based for exact entry-key mismatches and matched exits. Unmatched entries are classified as timing/entry disagreement; net differences with matched reference entries can reflect the fee/slippage formula or size and need the row evidence for attribution."]
+    lines += ["", f"Mismatch detail CSV: `{stem}_mismatches.csv`.", "", "Exact `(side, entry_time)` pairs are compared directly. Where no exact pair exists, the mismatch CSV records the nearest same-side entry and its timestamp offset; offsets up to five minutes are classified as entry timing (bot signal-bar close versus backtester signal-bar timestamp). Close-vs-high/low exits, fees/slippage, and sizing can only be isolated for exact-key matched trades."]
     with open(os.path.join(a.out, stem + ".md"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-    print("\n".join(lines[:21]))
+    print("\n".join(lines[:21]).encode("ascii", "replace").decode("ascii"))
 
 
 if __name__ == "__main__":
