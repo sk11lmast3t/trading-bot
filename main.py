@@ -89,7 +89,11 @@ class UnifiedCryptoBot:
         if self.config.scalping.scan_all_coins:
             self.refresh_symbols()
 
-        self.load_state()
+        if getattr(self.config, "fresh", False) and self.config.mode == "paper":
+            self.loaded_positions = []
+            logger.info("Fresh paper session: skipping persisted position restore")
+        else:
+            self.load_state()
 
     def refresh_symbols(self):
         try:
@@ -617,7 +621,7 @@ class UnifiedCryptoBot:
             loaded_syms = set(p.get('symbol') for p in self.loaded_positions if p.get('symbol'))
             ex_syms = set(ex_positions.keys()) if isinstance(ex_positions, dict) else set()
             if loaded_syms != ex_syms:
-                self.entries_blocked = True
+                self.entries_blocked = self.config.mode == "live"
                 logger.warning(f"Restart reconcile mismatch: loaded={loaded_syms} exchange={ex_syms}")
                 return
             rm = self.risk_manager
@@ -682,6 +686,7 @@ def build_config_from_args(argv=None, environ=None):
     parser.add_argument("--parity", action="store_true", help="Use deterministic paper/backtest parity settings")
     parser.add_argument("--strategy", help="Select the strategy by registered name")
     parser.add_argument("--symbols", nargs="+", help="Fixed symbols separated by spaces or commas")
+    parser.add_argument("--fresh", action="store_true", help="Start paper mode without restoring persisted positions")
     parser.add_argument("--hold-minutes", type=float, default=30.0)
     parser.add_argument("--capital", type=float, default=100.0)
     parser.add_argument("--exchange", help="Pin candle data to this CCXT exchange")
@@ -690,6 +695,8 @@ def build_config_from_args(argv=None, environ=None):
     requested_mode = args.mode_option or args.mode_arg
     if args.demo:
         requested_mode = "paper"
+    if args.fresh and requested_mode != "paper":
+        raise SystemExit("--fresh is available only in paper mode.")
     if args.parity and requested_mode != "paper":
         raise SystemExit("--parity is available only in paper mode.")
     elif requested_mode == "live":
@@ -700,6 +707,7 @@ def build_config_from_args(argv=None, environ=None):
 
     cfg = BotConfig()
     cfg.mode = requested_mode
+    cfg.fresh = args.fresh
     if args.strategy:
         cfg.strategy.active_strategy = args.strategy
     if args.exchange:

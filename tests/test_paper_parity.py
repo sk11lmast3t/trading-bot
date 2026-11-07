@@ -70,6 +70,39 @@ def test_symbols_cli_accepts_space_and_comma_separators():
     assert cfg.scalping.symbols == ["BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT"]
 
 
+def test_fresh_is_paper_only_and_skips_position_restore(monkeypatch):
+    cfg = main.build_config_from_args(["--fresh"], environ={})
+    assert cfg.mode == "paper"
+    assert cfg.fresh is True
+    with pytest.raises(SystemExit, match="--fresh is available only in paper mode"):
+        main.build_config_from_args(["live", "--fresh"], environ={"CONFIRM_LIVE": "YES"})
+
+    monkeypatch.setattr(main, "GRUPredictor", MagicMock())
+    monkeypatch.setattr(main, "PaperExchange", MagicMock())
+    cfg.scalping.scan_all_coins = False
+    load_state = MagicMock()
+    monkeypatch.setattr(main.UnifiedCryptoBot, "load_state", load_state)
+    bot = main.UnifiedCryptoBot(config=cfg)
+    load_state.assert_not_called()
+    assert bot.loaded_positions == []
+
+
+@pytest.mark.parametrize("mode,expected_block", [("paper", False), ("live", True)])
+def test_reconcile_mismatch_blocks_only_live_entries(monkeypatch, mode, expected_block):
+    bot = main.UnifiedCryptoBot.__new__(main.UnifiedCryptoBot)
+    bot.config = BotConfig(mode=mode)
+    bot.entries_blocked = not expected_block
+    bot.loaded_positions = []
+    bot.exchange = MagicMock()
+    bot.exchange.get_positions.return_value = {}
+    bot.risk_manager = MagicMock()
+    monkeypatch.setattr("core.state.load_open_positions", lambda: [{"symbol": "BTC/USDT"}])
+
+    bot.load_state()
+
+    assert bot.entries_blocked is expected_block
+
+
 def test_paper_exchange_sticks_to_one_candle_source_and_skips_on_error(monkeypatch, caplog):
     calls = []
 
