@@ -52,6 +52,23 @@ def test_parity_profile_applies_requested_settings():
     assert cfg.scalping.initial_capital == 250
 
 
+def test_cost_flags_configure_paper_and_parity_runs():
+    args = ["--maker-fee", "0.0002", "--taker-fee", "0.0005", "--slippage", "0.0003"]
+    cfg = main.build_config_from_args(args, environ={})
+    assert (cfg.backtest.maker_fee, cfg.backtest.taker_fee, cfg.backtest.slippage) == (
+        0.0002, 0.0005, 0.0003,
+    )
+    parity = main.build_config_from_args(["--parity", *args], environ={})
+    assert (parity.backtest.maker_fee, parity.backtest.taker_fee, parity.backtest.slippage) == (
+        0.0002, 0.0005, 0.0003,
+    )
+
+
+def test_cost_flags_reject_negative_values():
+    with pytest.raises(SystemExit, match="--maker-fee must be non-negative"):
+        main.build_config_from_args(["--maker-fee", "-0.1"], environ={})
+
+
 def test_parity_rejects_live_mode():
     with pytest.raises(SystemExit, match="--parity is available only in paper mode"):
         main.build_config_from_args(["live", "--parity"], environ={"CONFIRM_LIVE": "YES"})
@@ -124,11 +141,18 @@ def test_paper_exchange_sticks_to_one_candle_source_and_skips_on_error(monkeypat
     assert "skipping bar" in caplog.text
 
 
-def test_process_symbol_fetches_mtf_history_and_executes_synthetic_signal(monkeypatch, tmp_path):
+@pytest.mark.parametrize("signal,long_only,expected_entries,expected_status", [
+    (Signal.LONG, True, ["BTC/USDT"], "entered"),
+    (Signal.SHORT, True, [], "skipped:long_only"),
+])
+def test_process_symbol_fetches_mtf_history_and_applies_long_only(
+    monkeypatch, tmp_path, signal, long_only, expected_entries, expected_status,
+):
     cfg = BotConfig()
     cfg.strategy.active_strategy = "mtf_trend_pullback"
     cfg.scalping.scan_all_coins = False
     cfg.execution.entry_mode = "market"
+    cfg.long_only = long_only
 
     idx = pd.date_range("2026-01-01", periods=724, freq="5min")
     close = np.linspace(100.0, 110.0, len(idx))
@@ -180,7 +204,7 @@ def test_process_symbol_fetches_mtf_history_and_executes_synthetic_signal(monkey
 
     def synthetic_signal(window):
         seen_rows.append(len(window))
-        return TradeSetup(Signal.LONG, 110.0, 108.0, 114.0, 0.7, "mtf_trend_pullback")
+        return TradeSetup(signal, 110.0, 108.0, 114.0, 0.7, "mtf_trend_pullback")
 
     monkeypatch.setattr(bot.strategy, "analyze", synthetic_signal)
     monkeypatch.setattr(main.state, "save_position_at_entry", lambda *args, **kwargs: None)
@@ -188,13 +212,42 @@ def test_process_symbol_fetches_mtf_history_and_executes_synthetic_signal(monkey
 
     assert exchange.requested_limit >= 722
     assert seen_rows and max(seen_rows) >= 720
-    assert exchange.entries == ["BTC/USDT"]
+    assert exchange.entries == expected_entries
+    rows = pd.read_csv(bot.decision_log_path)
+    assert rows.loc[0, "status"] == expected_status
+    if signal == Signal.SHORT:
+        assert bot.risk_manager.register_position.call_count == 0
+        return
     meta = bot.paper_trade_meta["BTC/USDT"]
     assert meta["entry_fee"] == pytest.approx(110.0 * 0.1 * cfg.backtest.taker_fee)
     assert meta["entry_slippage"] == pytest.approx(110.0 * 0.1 * cfg.backtest.slippage)
-    rows = pd.read_csv(bot.decision_log_path)
-    assert rows.loc[0, "status"] == "entered"
     assert rows.loc[0, "fill_price"] == pytest.approx(110.0)
+
+
+def test_run_metadata_records_effective_costs_and_context(monkeypatch, tmp_path):
+    cfg = BotConfig()
+    cfg.exchange.name = "kucoin"
+    cfg.scalping.symbols = ["BTC/USDT"]
+    cfg.strategy.active_strategy = "ema_rsi_atr"
+    cfg.backtest.maker_fee = 0.0002
+    cfg.backtest.taker_fee = 0.0005
+    cfg.backtest.slippage = 0.0003
+    bot = main.UnifiedCryptoBot.__new__(main.UnifiedCryptoBot)
+    bot.config = cfg
+    monkeypatch.chdir(tmp_path)
+
+    bot.write_run_metadata()
+
+    metadata = __import__("json").loads((tmp_path / "logs" / "run_meta.json").read_text())
+    assert metadata["exchange"] == "kucoin"
+    assert metadata["symbols"] == ["BTC/USDT"]
+    assert metadata["strategy"] == "ema_rsi_atr"
+    assert metadata["maker_fee"] == 0.0002
+    assert metadata["taker_fee"] == 0.0005
+    assert metadata["slippage"] == 0.0003
+    assert metadata["hold_minutes"] == cfg.risk.max_hold_time_minutes
+    assert metadata["git_commit"]
+    assert metadata["start_time"]
 
 
 def test_process_symbol_enters_at_most_once_for_same_completed_bar(monkeypatch, tmp_path):

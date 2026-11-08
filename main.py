@@ -15,6 +15,7 @@ import os
 import json
 import sys
 import threading
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import pandas as pd
@@ -238,6 +239,9 @@ class UnifiedCryptoBot:
             }
             if setup.signal == Signal.HOLD:
                 finish_decision("skipped:hold")
+                return
+            if getattr(self.config, "long_only", False) and setup.signal == Signal.SHORT:
+                finish_decision("skipped:long_only")
                 return
 
             # 4. Optional GRU Deep Learning Directional Filter
@@ -681,6 +685,7 @@ class UnifiedCryptoBot:
             logger.error(f"reconcile failed: {e}")
 
     def run(self):
+        self.write_run_metadata()
         self.show_banner()
         self.running = True
         logger.info("Bot execution cycle initialized!")
@@ -706,6 +711,35 @@ class UnifiedCryptoBot:
             except Exception:
                 pass
 
+    def write_run_metadata(self):
+        """Record the resolved run settings before trading starts."""
+        try:
+            commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                check=True, timeout=2,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            commit = "unknown"
+        metadata = {
+            "exchange": self.config.exchange.name,
+            "symbols": list(self.config.scalping.symbols),
+            "strategy": self.config.strategy.active_strategy,
+            "maker_fee": self.config.backtest.maker_fee,
+            "taker_fee": self.config.backtest.taker_fee,
+            "slippage": self.config.backtest.slippage,
+            "hold_minutes": self.config.risk.max_hold_time_minutes,
+            "git_commit": commit,
+            "start_time": getattr(self, "clock", datetime.now)().isoformat(),
+        }
+        os.makedirs("logs", exist_ok=True)
+        with open(os.path.join("logs", "run_meta.json"), "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+            f.write("\n")
+        logger.info(
+            "Run costs: maker_fee=%.6f taker_fee=%.6f slippage=%.6f",
+            metadata["maker_fee"], metadata["taker_fee"], metadata["slippage"],
+        )
+
 
 def build_config_from_args(argv=None, environ=None):
     parser = argparse.ArgumentParser(description="Unified Crypto Scalper")
@@ -717,6 +751,13 @@ def build_config_from_args(argv=None, environ=None):
     parser.add_argument("--symbols", nargs="+", help="Fixed symbols separated by spaces or commas")
     parser.add_argument("--fresh", action="store_true", help="Start paper mode without restoring persisted positions")
     parser.add_argument("--hold-minutes", type=float, default=30.0)
+    parser.add_argument("--maker-fee", type=float, default=0.0002,
+                        help="Maker fee as a fraction of notional (default: 0.0002)")
+    parser.add_argument("--taker-fee", type=float, default=0.0005,
+                        help="Taker fee as a fraction of notional (default: 0.0005)")
+    parser.add_argument("--slippage", type=float, default=0.0003,
+                        help="Slippage as a fraction of notional (default: 0.0003)")
+    parser.add_argument("--long-only", action="store_true", help="Skip SHORT signals")
     parser.add_argument("--capital", type=float, default=100.0)
     parser.add_argument("--exchange", help="Pin candle data to this CCXT exchange")
     args = parser.parse_args(argv)
@@ -737,6 +778,12 @@ def build_config_from_args(argv=None, environ=None):
     cfg = BotConfig()
     cfg.mode = requested_mode
     cfg.fresh = args.fresh
+    for name in ("maker_fee", "taker_fee", "slippage"):
+        value = getattr(args, name)
+        if value < 0:
+            raise SystemExit(f"--{name.replace('_', '-')} must be non-negative.")
+        setattr(cfg.backtest, name, value)
+    cfg.long_only = args.long_only
     if args.strategy:
         cfg.strategy.active_strategy = args.strategy
     if args.exchange:
