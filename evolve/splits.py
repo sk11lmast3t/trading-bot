@@ -60,10 +60,14 @@ def discover_splits(data_dir="data"):
     for path in paths:
         windows = month_windows(_timestamps(path))
         if len(windows) < 14:
-            raise ValueError(f"{path} has {len(windows)} fully covered months; 14 are required")
+            # Partial-history symbols cannot support all three prescribed
+            # partitions and are excluded from the experiment.
+            continue
         splits[_symbol(path)] = DataSplit(
             _symbol(path), path, tuple(windows[:10]), tuple(windows[10:12]), tuple(windows[-2:]),
         )
+    if not splits:
+        raise ValueError(f"No *_5m.csv files in {data_dir} have 14 fully covered months")
     return splits
 
 
@@ -85,18 +89,23 @@ def load_partition(split: DataSplit, partition: str, warmup_bars=300):
         last = windows[-1][1]
     else:
         first, last = windows[0][0], windows[-1][1]
-    # Timestamp discovery above never loads holdout prices. This read filters
-    # immediately to the requested segment and its bounded warmup.
-    frame = pd.read_csv(split.path, index_col="timestamp", parse_dates=True).sort_index()
-    frame = frame[~frame.index.duplicated(keep="last")]
-    end_index = frame.index.searchsorted(first)
+    timestamps = _timestamps(split.path)
+    end_index = timestamps.searchsorted(first)
     start_index = max(0, end_index - int(warmup_bars))
-    stop_index = frame.index.searchsorted(last)
+    stop_index = timestamps.searchsorted(last)
     if partition != "holdout":
         # Search/validation callers never receive holdout rows.
         hold_start = split.holdout[0][0]
-        stop_index = min(stop_index, frame.index.searchsorted(hold_start))
-    return frame.iloc[start_index:stop_index].copy()
+        stop_index = min(stop_index, timestamps.searchsorted(hold_start))
+    # pandas skips all OHLCV fields outside the allowed row interval; timestamp
+    # discovery above reads only the index column, never held-out price values.
+    data_start, data_stop = start_index, max(start_index, stop_index)
+    frame = pd.read_csv(
+        split.path, index_col="timestamp", parse_dates=True,
+        skiprows=lambda line: line != 0 and not (data_start < line <= data_stop),
+        nrows=max(0, data_stop - data_start),
+    ).sort_index()
+    return frame[~frame.index.duplicated(keep="last")].copy()
 
 
 def partition_month_labels(split, partition):
