@@ -51,12 +51,70 @@ def audit(symbol, side, qty, price, order_id, action='send'):
     audit_logger.info(f"{action} symbol={symbol} side={side} qty={qty} price={price} order_id={order_id}")
 
 
+DECISION_FIELDS = [
+    "ts", "symbol", "strategy", "signal", "intended_entry", "sl", "tp",
+    "status", "fill_price", "fee", "slippage", "exit_price", "exit_reason",
+    "hold_minutes", "net_pnl", "balance_after", "quantity", "notional",
+    "atr_1h_pct", "ema20_1h_slope_sign", "ema20_1h_slope_pct", "trend_30m",
+    "rsi_5m", "ema_distance_atr_5m", "hour_utc", "day_of_week_utc",
+    "rv_24h_bucket", "mfe_bps", "mae_bps", "bars_held", "planned_sl_bps",
+    "planned_tp_bps", "r_multiple", "entry_fill_diff_bps",
+    "intended_exit", "exit_fill_diff_bps", "fee_bps", "slippage_bps", "close_source",
+]
+
+
+def _utc_datetime_index(frame):
+    if frame is None or not isinstance(frame.index, pd.DatetimeIndex):
+        return None
+    idx = pd.to_datetime(frame.index, utc=True, errors="coerce")
+    if idx.isna().any():
+        return None
+    return idx
+
+
+def _completed_bars(frame, minutes, asof):
+    idx = _utc_datetime_index(frame)
+    if idx is None:
+        return frame.iloc[0:0] if frame is not None else pd.DataFrame()
+    out = frame.copy()
+    out.index = idx
+    asof = pd.Timestamp(asof)
+    asof = asof.tz_localize("UTC") if asof.tzinfo is None else asof.tz_convert("UTC")
+    return out.loc[out.index + pd.Timedelta(minutes=minutes) <= asof]
+
+
+def _number_or_none(value):
+    try:
+        number = float(value)
+        return number if pd.notna(number) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _order_fill_price(order, fallback):
+    if isinstance(order, dict):
+        value = order.get("average") or order.get("average_price") or order.get("price")
+    else:
+        value = getattr(order, "average_price", None) or getattr(order, "price", None)
+    number = _number_or_none(value)
+    return float(number if number else fallback)
+
+
+def _order_fee(order):
+    raw = order.get("fee") if isinstance(order, dict) else getattr(order, "fee", None)
+    if isinstance(raw, dict):
+        raw = raw.get("cost")
+    number = _number_or_none(raw)
+    return float(number or 0.0)
+
+
 class UnifiedCryptoBot:
     def __init__(self, config=None, clock=None):
         self.config = config or BotConfig()
         state.set_mode(self.config.mode)
         clock_source = clock or getattr(self.config, "clock", None)
         self.clock = clock_source or datetime.now
+        self._clock_uses_local_timezone = clock_source is None
         self.strategy = get_strategy(self.config)
         self.risk_manager = RiskManager(self.config, clock=clock_source)
         self.gru_predictor = None
@@ -130,11 +188,7 @@ class UnifiedCryptoBot:
         path = getattr(self, "decision_log_path", None)
         if not path:
             return
-        fields = [
-            "ts", "symbol", "strategy", "signal", "intended_entry", "sl", "tp",
-            "status", "fill_price", "fee", "slippage", "exit_price", "exit_reason",
-            "hold_minutes", "net_pnl", "balance_after",
-        ]
+        fields = DECISION_FIELDS
         lock = getattr(self, "decision_log_lock", None)
         if lock is None:
             lock = threading.Lock()
@@ -143,6 +197,17 @@ class UnifiedCryptoBot:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             with lock:
                 write_header = not os.path.exists(path) or os.path.getsize(path) == 0
+                if not write_header:
+                    with open(path, newline="", encoding="utf-8") as existing:
+                        reader = csv.DictReader(existing)
+                        old_fields = reader.fieldnames
+                        old_rows = list(reader)
+                    if old_fields != fields:
+                        with open(path, "w", newline="", encoding="utf-8") as upgraded:
+                            writer = csv.DictWriter(upgraded, fieldnames=fields)
+                            writer.writeheader()
+                            writer.writerows({field: row.get(field, "") for field in fields}
+                                             for row in old_rows)
                 with open(path, "a", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=fields)
                     if write_header:
@@ -155,11 +220,7 @@ class UnifiedCryptoBot:
         path = getattr(self, "decision_log_path", None)
         if not path or not os.path.exists(path):
             return
-        fields = [
-            "ts", "symbol", "strategy", "signal", "intended_entry", "sl", "tp",
-            "status", "fill_price", "fee", "slippage", "exit_price", "exit_reason",
-            "hold_minutes", "net_pnl", "balance_after",
-        ]
+        fields = DECISION_FIELDS
         lock = getattr(self, "decision_log_lock", None)
         if lock is None:
             lock = threading.Lock()
@@ -180,9 +241,86 @@ class UnifiedCryptoBot:
                 with open(path, "w", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=fields)
                     writer.writeheader()
-                    writer.writerows(rows)
+                    writer.writerows({field: row.get(field, "") for field in fields} for row in rows)
         except Exception as e:
             logger.error("Could not update decision log %s: %s", path, e)
+
+    def _decision_context(self, symbol, signal_bar_open, five_minute_bars):
+        """Build observation fields from candles that had closed by signal time."""
+        context = {
+            "atr_1h_pct": "", "ema20_1h_slope_sign": "",
+            "ema20_1h_slope_pct": "", "trend_30m": "",
+            "rsi_5m": "", "ema_distance_atr_5m": "",
+            "hour_utc": "", "day_of_week_utc": "", "rv_24h_bucket": "",
+        }
+        try:
+            signal_ts = pd.Timestamp(signal_bar_open)
+            signal_ts = signal_ts.tz_localize("UTC") if signal_ts.tzinfo is None else signal_ts.tz_convert("UTC")
+        except (TypeError, ValueError):
+            return context
+        asof = signal_ts + pd.Timedelta(minutes=5)
+
+        try:
+            hourly_raw = self.exchange.fetch_ohlcv(symbol, "1h", 100)
+            hourly = _completed_bars(hourly_raw, 60, asof)
+            if len(hourly) >= 21:
+                close = hourly["close"].astype(float)
+                ema20 = Indicators.ema(close, 20)
+                atr = Indicators.atr(hourly["high"].astype(float), hourly["low"].astype(float), close, 14)
+                context["atr_1h_pct"] = float(atr.iloc[-1] / close.iloc[-1] * 100.0)
+                slope = float((ema20.iloc[-1] - ema20.iloc[-2]) / ema20.iloc[-2] * 100.0)
+                context["ema20_1h_slope_sign"] = "up" if slope > 0 else "down" if slope < 0 else "flat"
+                context["ema20_1h_slope_pct"] = slope
+        except Exception:
+            pass
+
+        try:
+            half_hour_raw = self.exchange.fetch_ohlcv(symbol, "30m", 100)
+            half_hour = _completed_bars(half_hour_raw, 30, asof)
+            if len(half_hour) >= 21:
+                close = half_hour["close"].astype(float)
+                ema20 = Indicators.ema(close, 20)
+                slope = ema20.iloc[-1] - ema20.iloc[-2]
+                if close.iloc[-1] > ema20.iloc[-1] and slope > 0:
+                    context["trend_30m"] = "up"
+                elif close.iloc[-1] < ema20.iloc[-1] and slope < 0:
+                    context["trend_30m"] = "down"
+                else:
+                    context["trend_30m"] = "sideways"
+        except Exception:
+            pass
+
+        try:
+            five = _completed_bars(five_minute_bars, 5, asof)
+            if len(five) >= 20:
+                close = five["close"].astype(float)
+                ema20 = Indicators.ema(close, 20)
+                rsi = Indicators.rsi(close, 14)
+                atr = Indicators.atr(five["high"].astype(float), five["low"].astype(float), close, 14)
+                if pd.notna(rsi.iloc[-1]):
+                    context["rsi_5m"] = float(rsi.iloc[-1])
+                if pd.notna(atr.iloc[-1]) and atr.iloc[-1] != 0:
+                    context["ema_distance_atr_5m"] = float((close.iloc[-1] - ema20.iloc[-1]) / atr.iloc[-1])
+            if len(five) >= 13:
+                returns = five["close"].astype(float).pct_change().dropna().tail(288)
+                if len(returns) >= 12:
+                    rv_24h_pct = float(returns.std(ddof=0) * (len(returns) ** 0.5) * 100.0)
+                    context["rv_24h_bucket"] = "low" if rv_24h_pct < 2 else "medium" if rv_24h_pct < 5 else "high"
+        except Exception:
+            pass
+
+        context["hour_utc"] = int(asof.hour)
+        context["day_of_week_utc"] = int(asof.day_of_week)
+        return context
+
+    def _clock_utc(self):
+        now = pd.Timestamp(getattr(self, "clock", datetime.now)())
+        if now.tzinfo is not None:
+            return now.tz_convert("UTC")
+        if getattr(self, "_clock_uses_local_timezone", False):
+            local_zone = datetime.now().astimezone().tzinfo
+            return now.tz_localize(local_zone).tz_convert("UTC")
+        return now.tz_localize("UTC")
 
     def process_symbol(self, symbol: str):
         decision = None
@@ -237,6 +375,12 @@ class UnifiedCryptoBot:
                 "tp": setup.take_profit,
                 "balance_after": self.risk_manager.current_balance,
             }
+            decision.update(self._decision_context(symbol, completed_bar, df))
+            entry_reference = float(setup.entry_price or 0.0)
+            decision["planned_sl_bps"] = (abs(entry_reference - float(setup.stop_loss)) / entry_reference * 10000.0
+                                           if entry_reference else "")
+            decision["planned_tp_bps"] = (abs(entry_reference - float(setup.take_profit)) / entry_reference * 10000.0
+                                           if entry_reference else "")
             if setup.signal == Signal.HOLD:
                 finish_decision("skipped:hold")
                 return
@@ -409,7 +553,12 @@ class UnifiedCryptoBot:
                 (entry_order.get("price") or setup.entry_price) if isinstance(entry_order, dict)
                 else getattr(entry_order, "price", None) or setup.entry_price
             )
+            observed_entry_fill = float(
+                _order_fill_price(entry_order, fill_price)
+            )
+            observed_entry_fee = _order_fee(entry_order)
             notional_value = fill_price * filled_amount
+            journal_notional = observed_entry_fill * filled_amount
             if self.config.mode != "live":
                 fee_rate = (self.config.backtest.maker_fee if entry_mode == "maker"
                             else self.config.backtest.taker_fee)
@@ -439,26 +588,125 @@ class UnifiedCryptoBot:
                 'sl': setup.stop_loss,
                 'strategy': setup.strategy_name,
                 'signal_bar_open': signal_bar_open.isoformat(),
+                'journal_entry': dict(decision),
             }
             active = getattr(self, "active_decisions", {})
             active[symbol] = {
-                "ts": decision["ts"],
-                "symbol": symbol,
-                "strategy": decision["strategy"],
+                **decision,
                 "entry_time": getattr(self, "clock", datetime.now)(),
+                "entry_fill_price": observed_entry_fill,
+                "quantity": filled_amount,
+                "notional": journal_notional,
+                "entry_live_fee": observed_entry_fee,
             }
             self.active_decisions = active
             meta = getattr(self, "paper_trade_meta", {}).get(symbol, {})
             finish_decision(
-                "entered", fill_price=fill_price,
+                "entered", fill_price=observed_entry_fill,
                 fee=meta.get("entry_fee", ""),
                 slippage=meta.get("entry_slippage", ""),
+                quantity=filled_amount,
+                notional=journal_notional,
+                entry_fill_diff_bps=((observed_entry_fill - float(setup.entry_price)) / float(setup.entry_price) * 10000.0
+                                     if setup.entry_price else ""),
                 balance_after=self.risk_manager.current_balance,
             )
+            self.position_targets[symbol]['journal_entry'].update(decision)
+            self.position_targets[symbol]['journal_entry'].update({
+                "fill_price": observed_entry_fill, "quantity": filled_amount, "notional": journal_notional,
+                "entry_time": getattr(self, "clock", datetime.now)().isoformat(),
+                "entry_live_fee": observed_entry_fee,
+            })
+            self.active_decisions[symbol].update({
+                "fill_price": observed_entry_fill, "quantity": filled_amount, "notional": journal_notional,
+                "entry_fill_diff_bps": decision.get("entry_fill_diff_bps", ""),
+            })
 
         except Exception as e:
             logger.error(f"Error processing {symbol}: {e}")
             finish_decision(f"skipped:error:{e}")
+
+    def _exit_excursions(self, symbol, pos, frame, context):
+        targets = getattr(self, "position_targets", {}).get(symbol, {})
+        signal_open = targets.get("signal_bar_open") or context.get("ts")
+        if not signal_open or frame is None:
+            return {"mfe_bps": "", "mae_bps": "", "bars_held": ""}
+        try:
+            idx = _utc_datetime_index(frame)
+            if idx is None:
+                return {"mfe_bps": "", "mae_bps": "", "bars_held": ""}
+            observed = frame.copy()
+            observed.index = idx
+            signal_ts = pd.Timestamp(signal_open)
+            signal_ts = signal_ts.tz_localize("UTC") if signal_ts.tzinfo is None else signal_ts.tz_convert("UTC")
+            observed = observed.loc[(observed.index > signal_ts) & (observed.index <= self._clock_utc())]
+            if observed.empty:
+                return {"mfe_bps": "", "mae_bps": "", "bars_held": 0}
+            entry = float(context.get("fill_price") or context.get("entry_fill_price") or pos.get("entryPrice", 0.0))
+            if entry <= 0:
+                return {"mfe_bps": "", "mae_bps": "", "bars_held": len(observed)}
+            side = pos.get("side", "long")
+            high = observed["high"].astype(float).max()
+            low = observed["low"].astype(float).min()
+            if side == "long":
+                mfe = max((high - entry) / entry * 10000.0, 0.0)
+                mae = max((entry - low) / entry * 10000.0, 0.0)
+            else:
+                mfe = max((entry - low) / entry * 10000.0, 0.0)
+                mae = max((high - entry) / entry * 10000.0, 0.0)
+            return {"mfe_bps": float(mfe), "mae_bps": float(mae), "bars_held": int(len(observed))}
+        except Exception:
+            return {"mfe_bps": "", "mae_bps": "", "bars_held": ""}
+
+    def _prepare_poll_close(self, symbol, pos, frame, intended_exit):
+        targets = getattr(self, "position_targets", {}).get(symbol, {})
+        context = getattr(self, "active_decisions", {}).get(symbol) or targets.get("journal_entry")
+        if context is None:
+            return
+        try:
+            context.update(self._exit_excursions(symbol, pos, frame, context))
+            context["close_source"] = "poll"
+            context["intended_exit"] = intended_exit
+        except Exception as exc:
+            logger.debug("Could not record exit observations for %s: %s", symbol, exc)
+
+    def _record_exchange_stop_flat(self, symbol):
+        if getattr(self.config, "mode", "paper") != "live":
+            return
+        targets = getattr(self, "position_targets", {}).get(symbol, {})
+        context = getattr(self, "active_decisions", {}).get(symbol) or targets.get("journal_entry")
+        if not context:
+            return
+        signal_open = targets.get("signal_bar_open") or context.get("ts")
+        candles = None
+        try:
+            candles = self.exchange.fetch_ohlcv(symbol, self.config.scalping.timeframe, 300)
+        except Exception:
+            pass
+        position = {
+            "entryPrice": context.get("fill_price", context.get("entry_fill_price", 0)),
+            "contracts": context.get("quantity", 0),
+            "side": "short" if context.get("signal") == "SHORT" else "long",
+        }
+        observed = self._exit_excursions(symbol, position, candles, context)
+        hold_minutes = ""
+        entry_time = context.get("entry_time")
+        if isinstance(entry_time, datetime):
+            hold_minutes = max((getattr(self, "clock", datetime.now)() - entry_time).total_seconds() / 60.0, 0.0)
+        elif context.get("entry_time"):
+            try:
+                entered = datetime.fromisoformat(context["entry_time"])
+                hold_minutes = max((getattr(self, "clock", datetime.now)() - entered).total_seconds() / 60.0, 0.0)
+            except (TypeError, ValueError):
+                pass
+        self._update_decision_exit(context, {
+            "status": "closed", "exit_price": "", "exit_reason": "exchange_stop_or_external_close",
+            "intended_exit": targets.get("sl", ""),
+            "hold_minutes": hold_minutes, "close_source": "exchange_stop_inferred",
+            "exit_fill_diff_bps": "", "fee_bps": "", "slippage_bps": "",
+            "r_multiple": "", **observed,
+        })
+        getattr(self, "active_decisions", {}).pop(symbol, None)
 
     def _close_position(self, symbol, pos, price, reason, reference_price=None):
         reference_price = float(price if reference_price is None else reference_price)
@@ -466,6 +714,9 @@ class UnifiedCryptoBot:
         contracts = float(pos.get('contracts', 0.0))
         side = pos.get('side', 'long')
         decision_context = getattr(self, "active_decisions", {}).pop(symbol, None)
+        targets = getattr(self, "position_targets", {}).get(symbol, {})
+        if decision_context is None:
+            decision_context = targets.get("journal_entry")
         hold_minutes = ""
         if decision_context and isinstance(decision_context.get("entry_time"), datetime):
             hold_minutes = max((getattr(self, "clock", datetime.now)() - decision_context["entry_time"]).total_seconds() / 60.0, 0.0)
@@ -474,10 +725,15 @@ class UnifiedCryptoBot:
         else:
             gross_pnl = (entry - reference_price) * contracts
         pnl = gross_pnl
+        journal_exit_fill = float(price)
+        live_exit_fee = None
         if self.config.mode == "live":
             opp_side = 'sell' if side == 'long' else 'buy'
             co = self.exchange.create_market_order(symbol, opp_side, contracts)
             audit(symbol, opp_side, contracts, price, getattr(co,'id',None) or getattr(co,'order_id',None))
+            if co is not None:
+                journal_exit_fill = _order_fill_price(co, price)
+                live_exit_fee = _order_fee(co)
             try:
                 self.exchange.cancel_all_orders(symbol)
                 audit(symbol, 'cancel', contracts, price, None, 'cancel')
@@ -497,12 +753,40 @@ class UnifiedCryptoBot:
         self.risk_manager.record_trade(pnl, symbol)
         state.record_trade(pnl, symbol, reason)
         if decision_context:
+            entry_fill = float(decision_context.get("fill_price") or decision_context.get("entry_fill_price") or entry or 0.0)
+            notional = float(decision_context.get("notional") or entry_fill * contracts)
+            planned_risk = abs(entry_fill - float(targets.get("sl", decision_context.get("sl", 0.0)) or 0.0)) * contracts
+            journal_intended_exit = float(decision_context.get("intended_exit", reference_price) or reference_price)
+            if self.config.mode != "live":
+                fee_bps = decision_fee / notional * 10000.0 if notional else ""
+            else:
+                entry_fee = _number_or_none(decision_context.get("entry_live_fee"))
+                fee_bps = ((entry_fee + live_exit_fee) / notional * 10000.0
+                           if entry_fee is not None and live_exit_fee is not None and notional else "")
+            if self.config.mode != "live" and notional:
+                slip_bps = decision_slippage / notional * 10000.0
+            else:
+                entry_diff = float(decision_context.get("entry_fill_diff_bps") or 0.0)
+                exit_diff = ((journal_exit_fill - journal_intended_exit) / journal_intended_exit * 10000.0
+                             if journal_intended_exit else 0.0)
+                slip_bps = abs(entry_diff) + abs(exit_diff)
             self._update_decision_exit(decision_context, {
-                "exit_price": price,
+                "status": "closed",
+                "exit_price": journal_exit_fill,
                 "exit_reason": reason,
+                "intended_exit": journal_intended_exit,
                 "hold_minutes": hold_minutes,
                 "net_pnl": pnl,
                 "balance_after": self.risk_manager.current_balance,
+                "mfe_bps": decision_context.get("mfe_bps", ""),
+                "mae_bps": decision_context.get("mae_bps", ""),
+                "bars_held": decision_context.get("bars_held", ""),
+                "exit_fill_diff_bps": ((journal_exit_fill - journal_intended_exit) / journal_intended_exit * 10000.0
+                                        if journal_intended_exit else ""),
+                "fee_bps": fee_bps,
+                "slippage_bps": slip_bps,
+                "r_multiple": pnl / planned_risk if planned_risk else "",
+                "close_source": decision_context.get("close_source", "poll"),
                 **({"fee": decision_fee, "slippage": decision_slippage}
                    if self.config.mode != "live" else {}),
             })
@@ -515,6 +799,7 @@ class UnifiedCryptoBot:
         try:
             pos = self.exchange.get_position(symbol)
             if not pos:
+                self._record_exchange_stop_flat(symbol)
                 return
 
             targets = self.position_targets.get(symbol, {})
@@ -563,6 +848,7 @@ class UnifiedCryptoBot:
                     if self.config.mode != "live":
                         slip = float(self.config.backtest.slippage)
                         fill = level * (1 - slip if side == 'long' else 1 + slip)
+                    self._prepare_poll_close(symbol, pos, df, level)
                     self._close_position(symbol, pos, fill,
                                          "STOP LOSS" if is_sl else "TAKE PROFIT",
                                          reference_price=level if self.config.mode != "live" else fill)
@@ -572,6 +858,7 @@ class UnifiedCryptoBot:
             try:
                 trail_hit, trail_reason = self.risk_manager.check_trailing_stop(symbol, price)
                 if trail_hit:
+                    self._prepare_poll_close(symbol, pos, df, price)
                     self._close_position(symbol, pos, price, f"TRAILING STOP: {trail_reason}")
                     return
             except Exception as e:
@@ -587,12 +874,14 @@ class UnifiedCryptoBot:
                     signal_close = pd.Timestamp(signal_bar_open).to_pydatetime() + pd.Timedelta(minutes=5)
                 elapsed = (getattr(self, "clock", datetime.now)() - signal_close).total_seconds() / 60.0 if signal_close else hold_min
                 if elapsed >= self.config.risk.max_hold_time_minutes:
+                    self._prepare_poll_close(symbol, pos, df, price)
                     self._close_position(symbol, pos, price, "Time exit (wall-clock)")
                     return
             else:
                 entry_cycle = self.position_entry_cycle.get(symbol, self.cycle_count)
                 max_hold = getattr(sc, 'max_hold_cycles', 60)
                 if self.cycle_count - entry_cycle > max_hold:
+                    self._prepare_poll_close(symbol, pos, df, price)
                     self._close_position(symbol, pos, price, "TIME EXIT")
                     return
 

@@ -163,12 +163,12 @@ def test_process_symbol_fetches_mtf_history_and_applies_long_only(
 
     class FakeExchange:
         def __init__(self):
-            self.requested_limit = None
+            self.requested_limits = {}
             self.positions = {}
             self.entries = []
 
         def fetch_ohlcv(self, symbol, timeframe, limit):
-            self.requested_limit = limit
+            self.requested_limits[timeframe] = limit
             return bars.iloc[-limit:]
 
         def get_position(self, symbol):
@@ -210,7 +210,7 @@ def test_process_symbol_fetches_mtf_history_and_applies_long_only(
     monkeypatch.setattr(main.state, "save_position_at_entry", lambda *args, **kwargs: None)
     bot.process_symbol("BTC/USDT")
 
-    assert exchange.requested_limit >= 722
+    assert exchange.requested_limits["5m"] >= 722
     assert seen_rows and max(seen_rows) >= 720
     assert exchange.entries == expected_entries
     rows = pd.read_csv(bot.decision_log_path)
@@ -341,11 +341,7 @@ def test_hold_signal_is_logged_as_a_skip(monkeypatch, tmp_path):
     bot.process_symbol("BTC/USDT")
 
     rows = pd.read_csv(bot.decision_log_path)
-    assert list(rows.columns) == [
-        "ts", "symbol", "strategy", "signal", "intended_entry", "sl", "tp",
-        "status", "fill_price", "fee", "slippage", "exit_price", "exit_reason",
-        "hold_minutes", "net_pnl", "balance_after",
-    ]
+    assert list(rows.columns) == main.DECISION_FIELDS
     assert len(rows) == 1
     assert rows.loc[0, "signal"] == "HOLD"
     assert rows.loc[0, "status"] == "skipped:hold"
