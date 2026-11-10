@@ -32,6 +32,16 @@ def test_stop_already_filled_sends_zero_orders():
     bot.risk_manager.release_position.assert_called_once_with("BTC/USDT")
 
 
+def test_exchange_closed_without_journal_context_is_still_recorded():
+    bot = _bot()
+    bot.risk_manager.open_positions = {"BTC/USDT": {"entryPrice": 100, "contracts": 1, "side": "long"}}
+    bot._append_decision = MagicMock()
+    bot._record_exchange_stop_flat("BTC/USDT")
+    row = bot._append_decision.call_args.args[0]
+    assert row["status"] == "closed"
+    assert row["close_source"] == "exchange_stop_inferred"
+
+
 def test_close_uses_fresh_contract_size_and_reduce_only():
     bot = _bot()
     bot.exchange.get_position.return_value = {"entryPrice": "100", "contracts": "1.25", "side": "short"}

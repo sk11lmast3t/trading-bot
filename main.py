@@ -684,7 +684,15 @@ class UnifiedCryptoBot:
         targets = getattr(self, "position_targets", {}).get(symbol, {})
         context = getattr(self, "active_decisions", {}).get(symbol) or targets.get("journal_entry")
         if not context:
-            return
+            position = getattr(self.risk_manager, "open_positions", {}).get(symbol, {})
+            context = {
+                "ts": position.get("entry_time", ""), "symbol": symbol,
+                "strategy": position.get("strategy", ""),
+                "signal": "SHORT" if position.get("side") == "short" else "LONG",
+                "fill_price": position.get("entryPrice", position.get("entry_price", "")),
+                "quantity": position.get("contracts", position.get("size", "")),
+                "entry_time": position.get("entry_time", ""),
+            }
         signal_open = targets.get("signal_bar_open") or context.get("ts")
         candles = None
         try:
@@ -707,13 +715,18 @@ class UnifiedCryptoBot:
                 hold_minutes = max((getattr(self, "clock", datetime.now)() - entered).total_seconds() / 60.0, 0.0)
             except (TypeError, ValueError):
                 pass
-        self._update_decision_exit(context, {
+        values = {
             "status": "closed", "exit_price": "", "exit_reason": "exchange_stop_or_external_close",
             "intended_exit": targets.get("sl", ""),
             "hold_minutes": hold_minutes, "close_source": "exchange_stop_inferred",
             "exit_fill_diff_bps": "", "fee_bps": "", "slippage_bps": "",
             "r_multiple": "", **observed,
-        })
+        }
+        if context.get("ts") and context.get("strategy"):
+            self._update_decision_exit(context, values)
+        else:
+            self._append_decision({**context, "ts": context.get("ts") or self._clock_utc().isoformat(),
+                                   "symbol": symbol, **values})
         getattr(self, "active_decisions", {}).pop(symbol, None)
 
     def _block_unknown_order(self, symbol, label):
