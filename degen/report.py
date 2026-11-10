@@ -40,8 +40,9 @@ def render_report(db):
     if vals:
         def quantile(p): return vals[round((len(vals) - 1) * p)]
         peak_offsets = sorted(offset for offset, _ in peaks.values())
+        def time_quantile(p): return peak_offsets[round((len(peak_offsets) - 1) * p)]
         lines += [f"Max multiple distribution (n={len(vals)}): min={vals[0]:.3f}x, median={quantile(.5):.3f}x, p90={quantile(.9):.3f}x, max={vals[-1]:.3f}x",
-                  f"Time to peak (n={len(peak_offsets)}): median={peak_offsets[len(peak_offsets)//2]:.0f} seconds"]
+                  f"Time to peak distribution (n={len(peak_offsets)}): min={peak_offsets[0]:.0f}s, median={time_quantile(.5):.0f}s, p90={time_quantile(.9):.0f}s, max={peak_offsets[-1]:.0f}s"]
     for label, cutoff in (("+2x", 2.0), ("+5x", 5.0)):
         reached = sum(value >= cutoff for value in vals)
         lines.append(f"- Reached {label} before first 30-minute inactivity death: {reached}/{total} tokens ({(100*reached/total) if total else 0:.1f}%; priced sample n={len(vals)})")
