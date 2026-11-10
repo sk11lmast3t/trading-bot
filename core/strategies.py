@@ -423,6 +423,15 @@ class MtfTrendPullbackStrategy(BaseStrategy):
 
 
 def get_strategy(config) -> BaseStrategy:
+    name = config.strategy.active_strategy
+    if name.startswith("candidate:"):
+        from evolve.evaluate import load_candidate
+        candidate = name.split(":", 1)[1]
+        with open("config/paper_candidates.json", encoding="utf-8") as stream:
+            registered = __import__("json").load(stream).get("paper_only", [])
+        if config.mode != "paper" or candidate not in registered:
+            raise ValueError("Candidate strategies are registered for paper mode only")
+        return load_candidate(candidate, config)[0]
     strategies = {
         "mtf_trend_pullback": MtfTrendPullbackStrategy,
         "ema_rsi_atr": EmaRsiAtrStrategy,
@@ -433,7 +442,6 @@ def get_strategy(config) -> BaseStrategy:
         "crypto_laggard": CryptoLaggardStrategy,
         "combined": CombinedStrategy,
     }
-    name = config.strategy.active_strategy
     if name not in strategies:
         raise ValueError(f"Unknown strategy: {name}")
     return strategies[name](config)

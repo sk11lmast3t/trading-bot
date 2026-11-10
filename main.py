@@ -1074,6 +1074,8 @@ def build_config_from_args(argv=None, environ=None):
         setattr(cfg.backtest, name, value)
     cfg.long_only = args.long_only
     if args.strategy:
+        if args.strategy.startswith("candidate:") and requested_mode != "paper":
+            raise SystemExit("Candidate strategies are available only in paper mode.")
         cfg.strategy.active_strategy = args.strategy
     if args.exchange:
         cfg.exchange.name = args.exchange.lower()
