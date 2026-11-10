@@ -5,6 +5,7 @@ import pytest
 from degen.collector import Collector, SNAPSHOTS
 from degen.source import Event, FakeSource
 from degen.store import DegenStore
+from degen.report import render_report
 
 
 def test_every_launch_including_immediately_dead_has_all_offsets(tmp_path):
@@ -56,3 +57,19 @@ def test_degen_sources_contain_no_signing_imports():
     assert "solders.keypair" not in source.lower()
     assert "solana.keypair" not in source.lower()
     assert "Keypair" not in source
+
+
+def test_report_shows_peak_time_cohort_shares_and_small_bucket_warning(tmp_path):
+    store = DegenStore(str(tmp_path / "degen.db"))
+    start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    with store.writer() as db:
+        db.execute("INSERT INTO launches(mint,ts,creator,name,symbol,description,url,launch_price) VALUES(?,?,?,?,?,?,?,?)",
+                   ("m", start.isoformat(), "", "", "", "", "", 1.0))
+        db.execute("INSERT INTO trades(mint,ts,side,sol_amount,token_amount,wallet,price) VALUES(?,?,?,?,?,?,?)",
+                   ("m", (start + timedelta(minutes=5)).isoformat(), "buy", 1, 1, "w", 2.2))
+        db.execute("INSERT INTO snapshots(mint,offset_seconds,ts,trade_count,buy_sell_ratio,unique_buyers,top10_holder_share,price_vs_launch,sol_volume,alive) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                   ("m", 60, (start + timedelta(minutes=1)).isoformat(), 0, None, 0, None, None, 0, 1))
+    report = render_report(store.connection)
+    assert "Time to peak" in report
+    assert "Reached +2x before first 30-minute inactivity death: 1/1" in report
+    assert "buckets under 100 tokens" in report
