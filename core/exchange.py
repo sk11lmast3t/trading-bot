@@ -240,6 +240,11 @@ class ExchangeConnector:
                 order.state = OrderState.OPEN
                 p = self._build_params(params, post_only=post_only, reduce_only=reduce_only)
                 result = self.exchange.create_order(symbol, order_type, side, amount, price, p)
+                if not isinstance(result, dict):
+                    order.state = OrderState.UNKNOWN
+                    order.last_error = "Order submission returned no usable acknowledgement; execution is unknown"
+                    logger.error("[%s] %s", symbol, order.last_error)
+                    return order
                 if result.get('id'):
                     order.id = str(result['id'])
                 # Query the exchange once: create_order responses are often

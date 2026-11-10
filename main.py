@@ -477,6 +477,10 @@ class UnifiedCryptoBot:
                     logger.error(f"[{symbol}] Maker entry order rejected: None")
                     finish_decision("skipped:maker_rejected")
                     return
+                if self.config.mode == "live" and getattr(entry_order, "state", None) == OrderState.UNKNOWN:
+                    self._block_unknown_order(symbol, "maker entry")
+                    finish_decision("unknown:maker_entry_order")
+                    return
                 if isinstance(entry_order, dict) and entry_order.get('status') == 'rejected':
                     logger.error(f"[{symbol}] Maker entry order rejected: {entry_order.get('reject_reason')}")
                     finish_decision(f"skipped:maker_rejected:{entry_order.get('reject_reason', '')}")
@@ -490,6 +494,12 @@ class UnifiedCryptoBot:
                     else:
                         checked = self.exchange.check_limit_fill(symbol, entry_id, setup.entry_price, side)
                     status = getattr(checked, 'state', None) or (checked.get('status') if isinstance(checked, dict) else None)
+                    if self.config.mode == "live" and status == OrderState.UNKNOWN:
+                        self._block_unknown_order(symbol, "maker entry")
+                        finish_decision("unknown:maker_entry_order")
+                        return
+                    if self.config.mode == "live":
+                        status = getattr(status, "value", status)
                     if status in ('filled', 'closed') or (isinstance(checked, dict) and checked.get('filled', 0) >= size):
                         filled = True
                         entry_order = checked
