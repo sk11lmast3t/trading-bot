@@ -777,7 +777,8 @@ class UnifiedCryptoBot:
             audit(symbol, opp_side, contracts, price, getattr(co,'id',None) or getattr(co,'order_id',None))
             if co is not None and getattr(co, "state", None) == OrderState.REJECTED and any(
                     marker in str(getattr(co, "last_error", "")).lower()
-                    for marker in ("position is zero", "position is flat", "no position", "position not found", "reduceonly")):
+                    for marker in ("position is zero", "position is flat", "no position", "position not found",
+                                   "position does not exist", "position size is zero")):
                 self._record_exchange_stop_flat(symbol)
                 self.risk_manager.release_position(symbol)
                 self.position_entry_cycle.pop(symbol, None)

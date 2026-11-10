@@ -285,7 +285,7 @@ class ExchangeConnector:
             except Exception as e:
                 order.last_error = str(e)
                 flat_markers = ("position is zero", "position is flat", "no position", "position not found",
-                                "reduceonly order rejected", "reduce only order rejected")
+                                "position does not exist", "position size is zero")
                 if reduce_only and any(marker in str(e).lower() for marker in flat_markers):
                     order.state = OrderState.REJECTED
                     logger.warning("[%s] Close rejected because position is already flat: %s", symbol, e)
