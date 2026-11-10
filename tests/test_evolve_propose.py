@@ -19,8 +19,6 @@ class FakeLLM:
 
 def _valid_code():
     return """class Trial(BaseStrategy):
-    def __init__(self, config):
-        super().__init__(config)
     def analyze(self, df):
         return TradeSetup(Signal.HOLD)
 """
@@ -83,7 +81,9 @@ def test_second_holdout_is_refused_and_promotion_requires_pass_and_holdout(tmp_p
     with pytest.raises(RuntimeError, match="single holdout"):
         evolve_cli.promote("trial")
     monkeypatch.setattr(evolve_cli, "evaluate_candidate", lambda *a, **k: {"pass": True})
-    monkeypatch.setattr(evolve_cli, "load_costs", lambda: {})
+    monkeypatch.setattr(evolve_cli, "load_costs", lambda *args: {
+        "maker_fee": 0.0002, "taker_fee": 0.0005, "slippage": 0.0003,
+    })
     evolve_cli.holdout("trial")
     with pytest.raises(RuntimeError, match="already attempted"):
         evolve_cli.holdout("trial")
