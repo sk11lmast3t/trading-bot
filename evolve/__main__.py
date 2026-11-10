@@ -33,7 +33,9 @@ def cycle(max_candidates=3, token_budget=12000, llm_client=None, data_dir="data"
     for offset in range(max_candidates):
         name = f"evolve_{len([e for e in entries if e.get('event', 'candidate') == 'candidate']) + offset + 1:04d}"
         row = {"event": "candidate", "name": name, "parent": "baseline",
-               "params": {"costs": costs, "partitions": ["search", "validation"]}}
+               "code_hash": None,
+               "params": {"costs": costs, "partitions": ["search", "validation"]},
+               "search": {}, "validation": {}}
         try:
             path, used, _ = propose_candidate(name, llm_client=llm_client,
                                                token_budget=token_budget, already_spent=spent)
@@ -41,8 +43,10 @@ def cycle(max_candidates=3, token_budget=12000, llm_client=None, data_dir="data"
             with open(path, encoding="utf-8") as stream:
                 source = stream.read()
             row["code_hash"] = hashlib.sha256(source.encode()).hexdigest()
-            row["search"] = evaluate_candidate(name, "search", data_dir=data_dir, fees=costs, trials=len(entries) + 1)
-            row["validation"] = evaluate_candidate(name, "validation", data_dir=data_dir, fees=costs, trials=len(entries) + 1)
+            row["search"] = evaluate_candidate(name, "search", data_dir=data_dir, fees=costs,
+                                               trials=len(entries) + 1, stress_factor=1.5)
+            row["validation"] = evaluate_candidate(name, "validation", data_dir=data_dir, fees=costs,
+                                                   trials=len(entries) + 1, stress_factor=1.5)
             gate = validation_verdict(row["search"], row["validation"], len(entries) + 1)
             row.update(gate)
             row["what"] = "one fixed candidate rule set evaluated on SEARCH, then VALIDATION"
@@ -59,6 +63,8 @@ def cycle(max_candidates=3, token_budget=12000, llm_client=None, data_dir="data"
 def holdout(name, data_dir="data"):
     name = _safe_name(name)
     if holdout_attempted(name):
+        append_entry({"event": "holdout_refused", "name": name,
+                      "reason": "a holdout attempt is already recorded"})
         raise RuntimeError(f"Holdout already attempted for {name}; second run refused")
     candidate = latest_candidate(name)
     if not candidate or candidate.get("verdict") != "passed":

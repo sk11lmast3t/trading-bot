@@ -16,5 +16,6 @@ def test_holdout_is_single_attempt_and_promotion_needs_validation_and_holdout(tm
     evolve_cli.holdout("trial")
     with pytest.raises(RuntimeError, match="already attempted"):
         evolve_cli.holdout("trial")
+    assert any(row.get("event") == "holdout_refused" for row in evolve_cli.read_entries())
     evolve_cli.promote("trial")
     assert "trial" in (tmp_path / "config" / "paper_candidates.json").read_text()
