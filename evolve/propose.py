@@ -47,7 +47,11 @@ def llm_config(path=LLM_ENV_PATH, environ=None):
 
 def _search_months():
     splits = discover_splits(os.path.join(ROOT, "data"))
-    return {start.strftime("%Y-%m") for split in splits.values() for start, _ in split.search}, splits
+    month_sets = [{start.strftime("%Y-%m") for start, _ in split.search}
+                  for split in splits.values()]
+    # A shared baseline table aggregates symbols. Include only months that are
+    # SEARCH for every symbol so a shorter-history symbol cannot leak later data.
+    return (set.intersection(*month_sets) if month_sets else set()), splits
 
 
 def _baseline_search_tables(months):
@@ -89,9 +93,7 @@ def _journal_summary(months, splits):
         return "No trade journal is available."
     # Do not expose journal rows whose timestamps fall into any validation or
     # holdout period; only use dated SEARCH observations.
-    search_starts = [start for split in splits.values() for start, _ in split.search]
-    search_ends = [end for split in splits.values() for _, end in split.search]
-    lower, upper = min(search_starts), max(search_ends)
+    split_by_symbol = {symbol.replace("_", "/", 1): split for symbol, split in splits.items()}
     with open(journal, newline="", encoding="utf-8") as stream:
         reader = csv.DictReader(stream)
         rows = [row for row in reader if row.get("ts")]
@@ -104,7 +106,9 @@ def _journal_summary(months, splits):
             continue
         if ts.tzinfo is not None:
             ts = ts.tz_convert(None)
-        if lower <= ts < upper:
+        symbol = (row.get("symbol") or "").replace("_", "/", 1)
+        split = split_by_symbol.get(symbol)
+        if split and any(start <= ts < end for start, end in split.search):
             filtered.append(row)
     if not filtered:
         return "No journal observations fall inside the SEARCH date range."
