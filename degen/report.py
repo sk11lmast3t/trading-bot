@@ -8,11 +8,17 @@ SNAPSHOTS = ((60, "1m"), (300, "5m"), (900, "15m"), (3600, "1h"),
 def render_report(db):
     total = db.execute("SELECT COUNT(*) FROM launches").fetchone()[0]
     lines = ["# Degen token cohort report", "", f"Launches recorded: {total}", ""]
+    warnings = []
     for seconds, label in SNAPSHOTS:
         alive = db.execute("SELECT COUNT(*) FROM snapshots WHERE offset_seconds=? AND alive=1", (seconds,)).fetchone()[0]
         n = db.execute("SELECT COUNT(*) FROM snapshots WHERE offset_seconds=?", (seconds,)).fetchone()[0]
         pct = (100 * alive / n) if n else 0
-        lines.append(f"- Alive at {label}: {alive}/{n} ({pct:.1f}%)")
+        dead = n - alive
+        lines.append(f"- Alive at {label}: {alive}/{n} ({pct:.1f}%); dead: {dead}/{n}")
+        if alive < 100:
+            warnings.append(f"alive at {label} bucket has {alive} tokens")
+        if dead < 100:
+            warnings.append(f"dead at {label} bucket has {dead} tokens")
     multiples = db.execute("SELECT l.mint,l.ts,l.launch_price,t.ts,t.price FROM launches l JOIN trades t ON t.mint=l.mint WHERE l.launch_price>0 ORDER BY l.mint,t.ts").fetchall()
     peaks = {}
     previous = {}
@@ -39,9 +45,14 @@ def render_report(db):
     for label, cutoff in (("+2x", 2.0), ("+5x", 5.0)):
         reached = sum(value >= cutoff for value in vals)
         lines.append(f"- Reached {label} before first 30-minute inactivity death: {reached}/{total} tokens ({(100*reached/total) if total else 0:.1f}%; priced sample n={len(vals)})")
+        if reached < 100:
+            warnings.append(f"{label} outcome bucket has {reached} tokens")
     if total < 100:
-        lines += ["", f"**WARNING: sample bucket has {total} tokens; fewer than 100.**"]
+        warnings.append(f"launch cohort has {total} tokens")
     priced_n = len(vals)
     if priced_n < 100:
-        lines += [f"**WARNING: max-multiple/time-to-peak bucket has {priced_n} tokens; fewer than 100.**"]
+        warnings.append(f"max-multiple/time-to-peak bucket has {priced_n} tokens")
+    if warnings:
+        lines += ["", "**WARNING: buckets under 100 tokens:**"]
+        lines.extend(f"- {warning} (<100)" for warning in warnings)
     return "\n".join(lines) + "\n"
