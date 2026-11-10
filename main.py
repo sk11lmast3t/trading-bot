@@ -510,6 +510,10 @@ class UnifiedCryptoBot:
                 self.exchange.set_leverage(symbol, self.config.scalping.leverage)
                 entry_order = self.exchange.create_market_order(symbol, side, size)
                 audit(symbol, side, size, setup.entry_price, getattr(entry_order,'id',None) or getattr(entry_order,'order_id',None))
+                if entry_order is not None and getattr(entry_order, "state", None) == OrderState.UNKNOWN:
+                    self._block_unknown_order(symbol, "entry")
+                    finish_decision("unknown:entry_order")
+                    return
                 if entry_order is None or getattr(entry_order, 'state') != OrderState.FILLED:
                     logger.error(f"[{symbol}] Entry order not filled: state={getattr(entry_order,'state',None)}, error={getattr(entry_order,'last_error',None)}")
                     finish_decision("skipped:entry_not_filled")
@@ -517,6 +521,10 @@ class UnifiedCryptoBot:
                 opp_side = 'sell' if side == 'buy' else 'buy'
                 sl_order = self.exchange.create_stop_loss(symbol, opp_side, size, setup.stop_loss)
                 audit(symbol, opp_side, size, setup.stop_loss, getattr(sl_order,'id',None) or getattr(sl_order,'order_id',None), 'send')
+                if sl_order is not None and getattr(sl_order, "state", None) == OrderState.UNKNOWN:
+                    self._block_unknown_order(symbol, "stop")
+                    finish_decision("unknown:stop_order")
+                    return
                 if sl_order is None or getattr(sl_order, 'state') == OrderState.REJECTED:
                     logger.error(f"[{symbol}] Stop-loss order rejected: {getattr(sl_order,'last_error',None)}")
                     try:
@@ -708,8 +716,31 @@ class UnifiedCryptoBot:
         })
         getattr(self, "active_decisions", {}).pop(symbol, None)
 
+    def _block_unknown_order(self, symbol, label):
+        self.entries_blocked = True
+        logger.error("[%s] %s order state UNKNOWN; blocking entries until position reconciliation", symbol, label)
+        try:
+            self.exchange.get_position(symbol)
+        except Exception as exc:
+            logger.error("[%s] Position check after unknown %s order failed: %s", symbol, label, exc)
+
     def _close_position(self, symbol, pos, price, reason, reference_price=None):
         reference_price = float(price if reference_price is None else reference_price)
+        if self.config.mode == "live":
+            # An exchange stop may have filled between the poll and this close.
+            fresh = self.exchange.get_position(symbol)
+            if not fresh:
+                if getattr(self.exchange, "position_check_error", None):
+                    logger.error("[%s] Position recheck failed; leaving state reserved and blocking entries", symbol)
+                    self.entries_blocked = True
+                    return
+                self._record_exchange_stop_flat(symbol)
+                self.risk_manager.release_position(symbol)
+                self.position_entry_cycle.pop(symbol, None)
+                self.position_targets.pop(symbol, None)
+                self.persist_state()
+                return
+            pos = fresh
         entry = float(pos.get('entryPrice', 0.0))
         contracts = float(pos.get('contracts', 0.0))
         side = pos.get('side', 'long')
@@ -729,8 +760,25 @@ class UnifiedCryptoBot:
         live_exit_fee = None
         if self.config.mode == "live":
             opp_side = 'sell' if side == 'long' else 'buy'
-            co = self.exchange.create_market_order(symbol, opp_side, contracts)
+            co = self.exchange.create_market_order(symbol, opp_side, contracts, reduce_only=True)
             audit(symbol, opp_side, contracts, price, getattr(co,'id',None) or getattr(co,'order_id',None))
+            if co is not None and getattr(co, "state", None) == OrderState.REJECTED and any(
+                    marker in str(getattr(co, "last_error", "")).lower()
+                    for marker in ("position is zero", "position is flat", "no position", "position not found", "reduceonly")):
+                self._record_exchange_stop_flat(symbol)
+                self.risk_manager.release_position(symbol)
+                self.position_entry_cycle.pop(symbol, None)
+                self.position_targets.pop(symbol, None)
+                self.persist_state()
+                return
+            if co is None or getattr(co, "state", None) != OrderState.FILLED:
+                logger.error("[%s] Close fill is not confirmed; blocking entries until position reconciliation", symbol)
+                self.entries_blocked = True
+                try:
+                    self.exchange.get_position(symbol)
+                except Exception:
+                    pass
+                return
             if co is not None:
                 journal_exit_fill = _order_fill_price(co, price)
                 live_exit_fee = _order_fee(co)
