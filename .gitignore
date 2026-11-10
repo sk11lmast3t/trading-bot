@@ -50,3 +50,7 @@ state.json
 *.db
 out*.txt
 reports/*_trades.csv.gz
+
+.pytest_tmp*/
+
+evolve/.llm_env
