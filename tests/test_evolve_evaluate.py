@@ -4,14 +4,13 @@ import pandas as pd
 import pytest
 
 from evolve.evaluate import (
-    CandidateError, _metrics, check_truncated_overlap, validate_candidate_source,
+    CandidateError, _metrics, check_truncated_overlap, load_candidate,
+    validate_candidate_source,
 )
 
 
 def _candidate(body):
     return """class Trial(BaseStrategy):
-    def __init__(self, config):
-        super().__init__(config)
     def analyze(self, df):
 """ + "\n".join("        " + line for line in body.splitlines()) + "\n"
 
@@ -28,6 +27,43 @@ def test_candidate_importing_os_is_rejected():
 
     with pytest.raises(CandidateError, match="import is not allowed"):
         validate_candidate_source(source)
+
+
+@pytest.mark.parametrize("body", [
+    "return TradeSetup(Signal.HOLD)\n        x = ().__class__.__bases__[0].__subclasses__()",
+    "return pd.read_csv('data/x.csv')",
+    "return np.load('data/x.npy')",
+    "return getattr(pd, 'read_pickle')",
+])
+def test_candidate_refuses_introspection_and_io(body):
+    with pytest.raises(CandidateError):
+        validate_candidate_source("import pandas as pd\nimport numpy as np\n" + _candidate(body))
+
+
+@pytest.mark.parametrize("name", [
+    "getattr", "setattr", "delattr", "globals", "locals", "vars", "type",
+    "dir", "breakpoint", "input",
+])
+def test_candidate_refuses_blocked_builtin_calls(name):
+    with pytest.raises(CandidateError):
+        validate_candidate_source(_candidate(f"return {name}(df, 'x')"))
+
+
+@pytest.mark.parametrize("literal", ["getattr", "read_csv", "load", "__class__", "__internal"])
+def test_candidate_refuses_sensitive_string_constants(literal):
+    with pytest.raises(CandidateError):
+        validate_candidate_source(_candidate(f"return TradeSetup(Signal.HOLD)\n        value = '{literal}'"))
+
+
+def test_load_candidate_uses_restricted_builtins(tmp_path, monkeypatch):
+    import evolve.evaluate as evaluate
+
+    candidate_dir = tmp_path / "candidates"
+    candidate_dir.mkdir()
+    (candidate_dir / "safe.py").write_text(_candidate("return TradeSetup(Signal.HOLD)"), encoding="utf-8")
+    monkeypatch.setattr(evaluate, "CANDIDATE_DIR", str(candidate_dir))
+    strategy, _ = load_candidate("safe", object())
+    assert strategy.analyze(pd.DataFrame()).signal.value == "HOLD"
 
 
 def test_truncated_overlap_check_accepts_causal_completed_bar_signals():

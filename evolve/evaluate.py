@@ -21,6 +21,10 @@ CANDIDATE_DIR = os.path.join(ROOT, "strategies", "candidates")
 DEFAULT_COSTS = {"maker_fee": 0.0002, "taker_fee": 0.0005, "slippage": 0.0003}
 ALLOWED_IMPORTS = {"numpy", "pandas", "core.indicators"}
 LOOKAHEAD_CALLS = {"bfill", "backfill"}
+BLOCKED_CALLS = {"getattr", "setattr", "delattr", "globals", "locals", "vars",
+                 "type", "dir", "breakpoint", "input"}
+PANDAS_IO_CALLS = {"to_csv", "to_pickle", "to_parquet", "to_json", "to_excel"}
+NUMPY_IO_CALLS = {"load", "save", "savez", "loadtxt", "fromfile", "tofile", "memmap"}
 
 
 class CandidateError(ValueError):
@@ -45,6 +49,29 @@ def validate_candidate_source(source):
         raise CandidateError(f"Candidate syntax error: {exc}") from exc
     class_names = set()
     for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id.startswith("__"):
+            raise CandidateError(f"Candidate cannot access dunder name: {node.id}")
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("__"):
+                raise CandidateError(f"Candidate cannot access dunder attribute: {node.attr}")
+            if node.attr.startswith("read_") or node.attr in PANDAS_IO_CALLS | NUMPY_IO_CALLS:
+                raise CandidateError(f"Candidate I/O attribute is not allowed: {node.attr}")
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name.startswith("__"):
+            raise CandidateError(f"Candidate cannot define dunder name: {node.name}")
+        if isinstance(node, ast.arg) and node.arg.startswith("__"):
+            raise CandidateError(f"Candidate cannot define dunder argument: {node.arg}")
+        if isinstance(node, ast.alias):
+            for alias_name in (node.name, node.asname or ""):
+                if alias_name.startswith("__"):
+                    raise CandidateError(f"Candidate cannot import dunder name: {alias_name}")
+        if isinstance(node, ast.keyword) and node.arg and node.arg.startswith("__"):
+            raise CandidateError(f"Candidate cannot use dunder keyword: {node.arg}")
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            value = node.value
+            is_dunder = value.startswith("__")
+            is_io_name = value.startswith("read_") or value in PANDAS_IO_CALLS | NUMPY_IO_CALLS
+            if value in BLOCKED_CALLS or is_dunder or is_io_name:
+                raise CandidateError(f"Candidate string constant is not allowed: {value}")
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(" as ", 1)[0]
@@ -57,6 +84,10 @@ def validate_candidate_source(source):
             if any(isinstance(base, ast.Name) and base.id == "BaseStrategy" for base in node.bases):
                 class_names.add(node.name)
         elif isinstance(node, ast.Call):
+            called_name = node.func.id if isinstance(node.func, ast.Name) else (
+                node.func.attr if isinstance(node.func, ast.Attribute) else None)
+            if called_name in BLOCKED_CALLS:
+                raise CandidateError(f"Candidate call is not allowed: {called_name}")
             if isinstance(node.func, ast.Attribute) and node.func.attr in LOOKAHEAD_CALLS:
                 raise CandidateError(f"Potential look-ahead operation is not allowed: {node.func.attr}")
             if isinstance(node.func, ast.Attribute) and node.func.attr == "shift":
@@ -67,7 +98,7 @@ def validate_candidate_source(source):
                         raise CandidateError("Potential look-ahead operation shift(periods=-n) is not allowed")
                     if kw.arg == "center" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
                         raise CandidateError("Centered rolling windows can look ahead")
-        elif isinstance(node, ast.Name) and node.id in {"open", "eval", "exec", "__import__", "compile"}:
+        elif isinstance(node, ast.Name) and node.id in {"open", "eval", "exec", "compile", *BLOCKED_CALLS}:
             if isinstance(node.ctx, ast.Load):
                 raise CandidateError(f"Candidate cannot access {node.id}")
     if len(class_names) != 1:
@@ -107,6 +138,28 @@ def load_candidate(name, config):
     if not callable(getattr(strategy, "analyze", None)):
         raise CandidateError("Candidate strategy must implement analyze(df)")
     return strategy, source
+
+
+class _LongOnlyStrategy:
+    """Thin signal filter for evaluator runs; leaves Backtester unchanged."""
+
+    def __init__(self, wrapped, signal, setup_type):
+        self.wrapped = wrapped
+        self.signal = signal
+        self.setup_type = setup_type
+        self.name = getattr(wrapped, "name", "candidate")
+        self.lookback_bars = getattr(wrapped, "lookback_bars", 300)
+
+    def analyze(self, frame):
+        setup = self.wrapped.analyze(frame)
+        if setup.signal == self.signal.SHORT:
+            return self.setup_type(self.signal.HOLD)
+        return setup
+
+
+def long_only_strategy(strategy):
+    from core.strategies import Signal, TradeSetup
+    return _LongOnlyStrategy(strategy, Signal, TradeSetup)
 
 
 def _setup_signature(setup):
@@ -207,7 +260,8 @@ def load_costs(maker_fee=None, taker_fee=None, slippage=None, costs_path="config
 
 
 def evaluate_candidate(name, partition="search", data_dir="data", fees=None,
-                       hold_minutes=30.0, timeout=1800, trials=1, stress_factor=1.0):
+                       hold_minutes=30.0, timeout=1800, trials=1, stress_factor=1.0,
+                       long_only=False):
     """Evaluate in a network-disabled child process with a hard timeout."""
     if partition not in ("search", "validation", "holdout"):
         raise ValueError(partition)
@@ -225,6 +279,7 @@ def evaluate_candidate(name, partition="search", data_dir="data", fees=None,
                   for symbol, split in splits.items()},
         "fees": fees or DEFAULT_COSTS, "hold_minutes": float(hold_minutes),
         "trials": max(1, int(trials)), "stress_factor": float(stress_factor),
+        "long_only": bool(long_only),
     }
     with tempfile.TemporaryDirectory(prefix="evolve_eval_") as td:
         payload_path = os.path.join(td, "payload.json")
@@ -308,6 +363,8 @@ def _worker(payload_path):
                 segment = frame.iloc[max(0, i0 - warm):i1].copy()
                 bt = Backtester(cfg, max_hold_minutes=payload["hold_minutes"])
                 bt.strategy, _ = load_candidate(payload["name"], cfg)
+                if payload.get("long_only"):
+                    bt.strategy = long_only_strategy(bt.strategy)
                 bt.run(segment, symbol=symbol, trade_from=start)
                 merged_trades.extend(t for t in bt.trades if t.exit_reason != "END")
         all_results[label] = _metrics(merged_trades, alpha=adjusted_alpha)
