@@ -29,6 +29,7 @@ class OrderState(Enum):
     REJECTED = "rejected"
     CANCELLED = "cancelled"
     EXPIRED = "expired"
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -155,10 +156,12 @@ class ExchangeConnector:
     def get_position(self, symbol: str) -> Optional[Dict]:
         try:
             positions = self.exchange.fetch_positions([symbol])
+            self.position_check_error = None
             for pos in positions:
                 if pos['symbol'] == symbol and float(pos.get('contracts', 0)) > 0:
                     return pos
         except Exception as e:
+            self.position_check_error = str(e)
             logger.error(f"Error fetching position for {symbol}: {e}")
         return None
 
@@ -237,13 +240,48 @@ class ExchangeConnector:
                 order.state = OrderState.OPEN
                 p = self._build_params(params, post_only=post_only, reduce_only=reduce_only)
                 result = self.exchange.create_order(symbol, order_type, side, amount, price, p)
-                order.state = OrderState.FILLED
-                order.filled = float(result.get('filled', amount))
-                order.remaining = float(result.get('remaining', 0.0))
-                order.average_price = float(result.get('average', price or 0))
-                order.fee = float(result.get('fee', {}).get('cost', 0.0))
+                if not isinstance(result, dict):
+                    order.state = OrderState.UNKNOWN
+                    order.last_error = "Order submission returned no usable acknowledgement; execution is unknown"
+                    logger.error("[%s] %s", symbol, order.last_error)
+                    return order
                 if result.get('id'):
                     order.id = str(result['id'])
+                # Query the exchange once: create_order responses are often
+                # acknowledgements with missing or null fill fields.
+                try:
+                    fetched = self.exchange.fetch_order(order.id, symbol)
+                except Exception as fetch_error:
+                    order.state = OrderState.UNKNOWN
+                    order.last_error = f"Order accepted but fill status is unknown: {fetch_error}"
+                    logger.error("[%s] %s", symbol, order.last_error)
+                    return order
+                data = fetched or result or {}
+                raw_filled = data.get('filled')
+                raw_remaining = data.get('remaining')
+                raw_average = data.get('average')
+                order.filled = float(raw_filled) if raw_filled is not None else 0.0
+                order.remaining = float(raw_remaining) if raw_remaining is not None else max(0.0, amount - order.filled)
+                order.average_price = (float(raw_average) if raw_average is not None
+                                       else (float(price) if price is not None else None))
+                fee = data.get('fee') or {}
+                raw_fee = fee.get('cost') if isinstance(fee, dict) else None
+                order.fee = float(raw_fee) if raw_fee is not None else 0.0
+                status = str(data.get('status') or '').lower()
+                if order.filled > 0 and order.remaining <= 0 or status in ('closed', 'filled'):
+                    order.state = OrderState.FILLED
+                    if order.filled <= 0:
+                        order.filled = amount
+                elif order.filled > 0:
+                    order.state = OrderState.PARTIAL
+                elif status in ('rejected', 'canceled', 'cancelled', 'expired'):
+                    order.state = {'rejected': OrderState.REJECTED, 'canceled': OrderState.CANCELLED,
+                                   'cancelled': OrderState.CANCELLED, 'expired': OrderState.EXPIRED}[status]
+                else:
+                    order.state = OrderState.UNKNOWN
+                    order.last_error = f"Order {order.id} has no confirmed fill (status={status or 'missing'})"
+                    logger.error("[%s] %s", symbol, order.last_error)
+                    return order
                 logger.info(
                     f"[{symbol}] Order filled: {side} {order.filled}/{amount} @ "
                     f"{order.average_price} (fee: {order.fee})"
@@ -251,6 +289,18 @@ class ExchangeConnector:
                 return order
             except Exception as e:
                 order.last_error = str(e)
+                flat_markers = ("position is zero", "position is flat", "no position", "position not found",
+                                "position does not exist", "position size is zero")
+                if reduce_only and any(marker in str(e).lower() for marker in flat_markers):
+                    order.state = OrderState.REJECTED
+                    logger.warning("[%s] Close rejected because position is already flat: %s", symbol, e)
+                    return order
+                ambiguous_markers = ("network", "timeout", "timed out", "connection", "unavailable", "gateway")
+                if any(marker in str(e).lower() for marker in ambiguous_markers):
+                    order.state = OrderState.UNKNOWN
+                    order.last_error = f"Order submission may have reached exchange; status unknown: {e}"
+                    logger.error("[%s] %s", symbol, order.last_error)
+                    return order
                 if self.retry.should_retry(e, attempt):
                     attempt += 1
                     order.retry_count = attempt
@@ -265,10 +315,11 @@ class ExchangeConnector:
                 logger.error(f"[{symbol}] Order rejected after {attempt+1} attempts: {e}")
                 return order
 
-    def create_market_order(self, symbol: str, side: str, amount: float, params: dict = None):
+    def create_market_order(self, symbol: str, side: str, amount: float, params: dict = None,
+                           reduce_only: bool = False):
         return self.create_order_with_retry(
             symbol, 'market', side, amount, None, params,
-            check_slippage=True,
+            reduce_only=reduce_only, check_slippage=True,
         )
 
     def create_limit_order(self, symbol: str, side: str, amount: float, price: float,
