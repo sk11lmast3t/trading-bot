@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from evolve.evaluate import (
-    CandidateError, _metrics, check_truncated_overlap, load_candidate,
+    CandidateError, _metrics, check_truncated_overlap, constraint_failures, load_candidate,
     validate_candidate_source,
 )
 
@@ -100,3 +100,22 @@ def test_metrics_reports_bootstrap_month_symbol_and_exit_counts():
     assert result["profitable_months"] == 1
     assert result["symbols"] == 2
     assert result["exit_reasons"] == {"SL": 1, "TP": 1}
+
+
+def _geometry_trade(stop_pct, target_pct):
+    return SimpleNamespace(pnl=1.0, notional=100.0,
+                           entry_time=pd.Timestamp("2025-01-01"), symbol="BTC/USDT",
+                           exit_reason="TP", entry_price=100.0,
+                           sl=100.0 * (1 - stop_pct / 100),
+                           tp=100.0 * (1 + target_pct / 100))
+
+
+def test_candidate_with_03_percent_stops_is_rejected():
+    metrics = _metrics([_geometry_trade(0.3, 5.0)], reps=10)
+    failures = constraint_failures({"base": metrics}, stop_pct=0.02)
+    assert any("median stop distance 0.300%" in reason for reason in failures)
+
+
+def test_candidate_with_2_percent_stops_and_5_percent_targets_passes_geometry():
+    metrics = _metrics([_geometry_trade(2.0, 5.0)], reps=10)
+    assert constraint_failures({"base": metrics}, stop_pct=0.02) == []

@@ -44,6 +44,12 @@ def test_proposal_uses_fake_client_and_writes_one_candidate(tmp_path, monkeypatc
     assert client.calls[0][1] > 0
     assert "search journal summary" in prompt
     assert "search only" in prompt
+    assert "DESIGN CONSTRAINTS" in prompt
+    assert "2.0000%" in prompt
+    assert "5.0000%" in prompt
+    assert "1x" in prompt
+    assert "completed bars only" in prompt
+    assert "Holds up to several days are allowed" in prompt
 
 
 def test_api_key_is_read_only_from_llm_env_file(tmp_path):
