@@ -29,6 +29,7 @@ class OrderState(Enum):
     REJECTED = "rejected"
     CANCELLED = "cancelled"
     EXPIRED = "expired"
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -155,10 +156,12 @@ class ExchangeConnector:
     def get_position(self, symbol: str) -> Optional[Dict]:
         try:
             positions = self.exchange.fetch_positions([symbol])
+            self.position_check_error = None
             for pos in positions:
                 if pos['symbol'] == symbol and float(pos.get('contracts', 0)) > 0:
                     return pos
         except Exception as e:
+            self.position_check_error = str(e)
             logger.error(f"Error fetching position for {symbol}: {e}")
         return None
 
@@ -237,13 +240,48 @@ class ExchangeConnector:
                 order.state = OrderState.OPEN
                 p = self._build_params(params, post_only=post_only, reduce_only=reduce_only)
                 result = self.exchange.create_order(symbol, order_type, side, amount, price, p)
-                order.state = OrderState.FILLED
-                order.filled = float(result.get('filled', amount))
-                order.remaining = float(result.get('remaining', 0.0))
-                order.average_price = float(result.get('average', price or 0))
-                order.fee = float(result.get('fee', {}).get('cost', 0.0))
+                if not isinstance(result, dict):
+                    order.state = OrderState.UNKNOWN
+                    order.last_error = "Order submission returned no usable acknowledgement; execution is unknown"
+                    logger.error("[%s] %s", symbol, order.last_error)
+                    return order
                 if result.get('id'):
                     order.id = str(result['id'])
+                # Query the exchange once: create_order responses are often
+                # acknowledgements with missing or null fill fields.
+                try:
+                    fetched = self.exchange.fetch_order(order.id, symbol)
+                except Exception as fetch_error:
+                    order.state = OrderState.UNKNOWN
+                    order.last_error = f"Order accepted but fill status is unknown: {fetch_error}"
+                    logger.error("[%s] %s", symbol, order.last_error)
+                    return order
+                data = fetched or result or {}
+                raw_filled = data.get('filled')
+                raw_remaining = data.get('remaining')
+                raw_average = data.get('average')
+                order.filled = float(raw_filled) if raw_filled is not None else 0.0
+                order.remaining = float(raw_remaining) if raw_remaining is not None else max(0.0, amount - order.filled)
+                order.average_price = (float(raw_average) if raw_average is not None
+                                       else (float(price) if price is not None else None))
+                fee = data.get('fee') or {}
+                raw_fee = fee.get('cost') if isinstance(fee, dict) else None
+                order.fee = float(raw_fee) if raw_fee is not None else 0.0
+                status = str(data.get('status') or '').lower()
+                if order.filled > 0 and order.remaining <= 0 or status in ('closed', 'filled'):
+                    order.state = OrderState.FILLED
+                    if order.filled <= 0:
+                        order.filled = amount
+                elif order.filled > 0:
+                    order.state = OrderState.PARTIAL
+                elif status in ('rejected', 'canceled', 'cancelled', 'expired'):
+                    order.state = {'rejected': OrderState.REJECTED, 'canceled': OrderState.CANCELLED,
+                                   'cancelled': OrderState.CANCELLED, 'expired': OrderState.EXPIRED}[status]
+                else:
+                    order.state = OrderState.UNKNOWN
+                    order.last_error = f"Order {order.id} has no confirmed fill (status={status or 'missing'})"
+                    logger.error("[%s] %s", symbol, order.last_error)
+                    return order
                 logger.info(
                     f"[{symbol}] Order filled: {side} {order.filled}/{amount} @ "
                     f"{order.average_price} (fee: {order.fee})"
@@ -251,6 +289,18 @@ class ExchangeConnector:
                 return order
             except Exception as e:
                 order.last_error = str(e)
+                flat_markers = ("position is zero", "position is flat", "no position", "position not found",
+                                "position does not exist", "position size is zero")
+                if reduce_only and any(marker in str(e).lower() for marker in flat_markers):
+                    order.state = OrderState.REJECTED
+                    logger.warning("[%s] Close rejected because position is already flat: %s", symbol, e)
+                    return order
+                ambiguous_markers = ("network", "timeout", "timed out", "connection", "unavailable", "gateway")
+                if any(marker in str(e).lower() for marker in ambiguous_markers):
+                    order.state = OrderState.UNKNOWN
+                    order.last_error = f"Order submission may have reached exchange; status unknown: {e}"
+                    logger.error("[%s] %s", symbol, order.last_error)
+                    return order
                 if self.retry.should_retry(e, attempt):
                     attempt += 1
                     order.retry_count = attempt
@@ -265,10 +315,11 @@ class ExchangeConnector:
                 logger.error(f"[{symbol}] Order rejected after {attempt+1} attempts: {e}")
                 return order
 
-    def create_market_order(self, symbol: str, side: str, amount: float, params: dict = None):
+    def create_market_order(self, symbol: str, side: str, amount: float, params: dict = None,
+                           reduce_only: bool = False):
         return self.create_order_with_retry(
             symbol, 'market', side, amount, None, params,
-            check_slippage=True,
+            reduce_only=reduce_only, check_slippage=True,
         )
 
     def create_limit_order(self, symbol: str, side: str, amount: float, price: float,
@@ -351,7 +402,8 @@ class PaperExchange:
     def __init__(self, config):
         self.config = config
         self.exec_cfg = config.execution
-        self.balance = config.scalping.initial_capital
+        self._balance = config.scalping.initial_capital
+        self._balance_source = None
         self.positions = {}
         self.trade_history = []
         self.order_id = 0
@@ -364,69 +416,51 @@ class PaperExchange:
         self._current_public = None
         self._init_public_exchanges()
 
+    @property
+    def balance(self):
+        if self._balance_source is not None:
+            return float(self._balance_source.current_balance)
+        return self._balance
+
+    @balance.setter
+    def balance(self, value):
+        if self._balance_source is not None:
+            self._balance_source.current_balance = float(value)
+        else:
+            self._balance = float(value)
+
+    def bind_balance_source(self, source):
+        """Use the risk manager as the balance authority for bot-managed paper trades."""
+        self._balance_source = source
+
     def _init_public_exchanges(self):
-        candidates = []
-        for name in ['binance', 'bybit', 'okx', 'kucoin', 'kraken', 'coinbase']:
-            try:
-                ex_class = getattr(ccxt, name)
-                ex = ex_class({'enableRateLimit': True})
-                try:
-                    ex.fetch_ohlcv('BTC/USDT', '5m', limit=1)
-                except Exception:
-                    pass
-                candidates.append(ex)
-                if self._current_public is None:
-                    self._current_public = ex
-                logger.info('init %s' % getattr(ex,'id',name))
-            except Exception as e:
-                logger.warning('fail %s: %s' % (name,e))
-        self._public_exchanges = candidates
-        if self._current_public is None and candidates:
-            self._current_public = candidates[0]
-        if self._current_public is None:
-            for name in ['binance', 'bybit', 'okx', 'kucoin', 'kraken', 'coinbase']:
-                try:
-                    ex_class = getattr(ccxt,name)
-                    self._current_public = ex_class({'enableRateLimit':True})
-                    self._public_exchanges = [self._current_public]
-                    break
-                except Exception:
-                    continue
-            if self._current_public is None:
-                try:
-                    self._current_public = ccxt.okx({'enableRateLimit':True})
-                except Exception as e:
-                    logger.error('no pub: %s' % e)
+        name = str(self.config.exchange.name).lower()
+        ex_class = getattr(ccxt, name, None)
+        if ex_class is None:
+            raise ValueError(f"Unknown candle exchange: {name}")
+        try:
+            self._current_public = ex_class({'enableRateLimit': True})
+        except Exception as e:
+            logger.error("failed to initialize candle exchange %s: %s", name, e)
+            raise
+        self._public_exchanges = [self._current_public]
+        logger.info("Pinned candle source to %s", getattr(self._current_public, 'id', name))
 
     def fetch_ohlcv(self, symbol: str, timeframe: str = '1m', limit: int = 200):
-        tries = []
-        if self._current_public is not None:
-            tries.append(self._current_public)
-        for ex in self._public_exchanges:
-            if ex not in tries:
-                tries.append(ex)
-        if not tries:
-            self._init_public_exchanges()
-            if self._current_public is not None:
-                tries.append(self._current_public)
-            for ex in self._public_exchanges:
-                if ex not in tries:
-                    tries.append(ex)
-        last=None
-        for ex in tries:
-            try:
-                ohlcv = ex.fetch_ohlcv(symbol,timeframe,limit=limit)
-                df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-                df['timestamp']=pd.to_datetime(df['timestamp'],unit='ms')
-                df.set_index('timestamp',inplace=True)
-                self._current_public = ex
-                return df
-            except Exception as e:
-                last=e
-                logger.warning('fail %s: %s' % (getattr(ex,'id','?'),e))
-                continue
-        logger.error('all fail %s %s: %s' % (symbol,timeframe,last))
-        return None
+        ex = self._current_public
+        if ex is None:
+            logger.error("no pinned candle exchange for %s %s; skipping", symbol, timeframe)
+            return None
+        try:
+            ohlcv = ex.fetch_ohlcv(symbol, timeframe, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            return df
+        except Exception as e:
+            logger.error("pinned candle exchange %s failed for %s %s: %s; skipping bar",
+                         getattr(ex, 'id', self.config.exchange.name), symbol, timeframe, e)
+            return None
 
 
     def _simulate_latency(self):
@@ -679,7 +713,8 @@ class PaperExchange:
         # Apply slippage on exit
         exit_price = self._simulate_slippage(exit_price, 'sell' if side == 'long' else 'buy')
         pnl = (exit_price - entry) * amt if side == 'long' else (entry - exit_price) * amt
-        self.balance += pnl
+        if self._balance_source is None:
+            self.balance += pnl
         return pnl
 
     def cancel_all_orders(self, symbol: str):

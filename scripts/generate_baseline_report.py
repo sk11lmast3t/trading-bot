@@ -99,6 +99,9 @@ def run_task(task):
     """All windows for one (symbol, strategy, scenario). Returns (rows, run_rows, stats, max_acct_err)."""
     from core.backtester import Backtester
     path, symbol, strategy, label, mode, p = task
+    # "name@240" = strategy `name` with a 240-minute time exit (hold-time sweeps need no extra flag)
+    strat_name, _, hold = strategy.partition("@")
+    hold_min = float(hold) if hold else None
     df = load_csv(path)
     if p["last_months"]:
         df = df[df.index >= df.index.max() - pd.DateOffset(months=p["last_months"])]
@@ -107,8 +110,9 @@ def run_task(task):
         i0, i1 = df.index.searchsorted(ws), df.index.searchsorted(we)
         if i1 - i0 < 500:
             continue
-        seg = df.iloc[max(0, i0 - WARMUP_BARS):i1]
-        bt = Backtester(make_cfg(strategy, mode, p))
+        bt = Backtester(make_cfg(strat_name, mode, p), max_hold_minutes=hold_min)
+        warm = max(WARMUP_BARS, int(getattr(bt.strategy, "lookback_bars", 0)))
+        seg = df.iloc[max(0, i0 - warm):i1]
         m = bt.run(seg.copy(), symbol, trade_from=ws)
         acct_err = max(acct_err, abs(bt.balance - (INITIAL_BALANCE + sum(t.pnl for t in bt.trades))))
         window_label = f"{ws:%Y-%m}"
@@ -326,10 +330,12 @@ def build_report(trades, runs, stats, files, args, params, acct_err, scen_filter
                          f"{f(s['avg_win_bps'], 1, True)} / {f(s['avg_loss_bps'], 1, True)}",
                          f(s["pf"], 2), f(float(dd.min()), 1)))
         L.append(md_table(["Strategy", "Trades", "/symbol-day", "Win %", "Gross bps", "Cost bps", "**Net bps**",
-                           "Net R", "Net $", "Avg win / loss bps", "Profit factor", "Worst-month DD %"], rows))
+                           "Net R", "Net $/trade", "Avg win / loss bps", "Profit factor", "Worst-month DD %"], rows))
         L.append("")
         L.append("Gross = mean over ALL trades before costs. Net = gross - cost. A strategy needs gross bps "
                  "comfortably above cost bps before it can pay for itself.")
+        L.append("")
+        L.append("Net $/trade = mean net pnl per trade in USD on a fresh $1,000 account.")
         L.append("")
         # exit reasons
         sub = t[t["scenario"] == lab] if len(t) else t
@@ -369,14 +375,30 @@ def build_report(trades, runs, stats, files, args, params, acct_err, scen_filter
              "(see cost assumptions): **measure the real fill rate in paper/live before relying on maker fees.**")
     L.append("")
     mrows = []
+    warn = []
     for key, lab in (("maker", "all_maker"), ("maker_fallback", "mixed")):
         if lab not in scen_filter:
             continue
-        a, fl, un = stats["by"].get(lab, {}).get("maker_attempts", 0), stats["by"].get(lab, {}).get("maker_fills", 0), \
-            stats["by"].get(lab, {}).get("maker_unfilled", 0)
-        fb = stats["by"].get(lab, {}).get("maker_fallbacks", 0)
-        mrows.append((lab, f"{a:,}", f"{fl:,}", f"{fl / a:.1%}" if a else "n/a", f"{un:,}", f"{fb:,}"))
-    L.append(md_table(["Scenario", "Orders", "Filled as maker", "Fill rate", "Skipped (maker)", "Taker fallbacks"], mrows))
+        s = stats["by"].get(lab, {})
+        a = s.get("maker_attempts", 0)
+        fl = s.get("maker_fills", 0)
+        un = s.get("maker_unfilled", 0)
+        fb = s.get("maker_fallbacks", 0)
+        nn = s.get("maker_no_next_bar", 0)
+        unacc = a - fl - un - fb - nn
+        evaluated = a - nn
+        if unacc != 0:
+            warn.append(lab)
+        mrows.append((lab, f"{a:,}", f"{fl:,}", f"{fl / evaluated:.1%}" if evaluated else "n/a",
+                      f"{un:,}", f"{fb:,}", f"{nn:,}", f"{unacc:,}"))
+    L.append(md_table(["Scenario", "Orders", "Filled as maker", "Fill rate", "Skipped (maker)",
+                      "Taker fallbacks", "No next bar", "Unaccounted"], mrows))
+    L.append("")
+    L.append("Fill rate = filled / (orders - no next bar). **Unaccounted must be 0**: "
+             "orders = filled + skipped + fallbacks + no next bar.")
+    if warn:
+        L.append("")
+        L.append(f"**WARNING: unaccounted maker orders in {', '.join(warn)}**")
     L.append("")
     # ---- signals
     L.append("## 6. Signal diagnostics")
@@ -400,7 +422,7 @@ def build_report(trades, runs, stats, files, args, params, acct_err, scen_filter
     # ---- limitations
     L.append("## 7. What this report does NOT prove")
     for line in [
-        "**Backtester vs live.** The backtester exits on stop, target or the 30 min time limit only. The live bot also "
+        "**Backtester vs live.** The backtester exits on stop, target or the time limit only (30 min unless a strategy label says `name@MINUTES`). The live bot also "
         "arms a breakeven stop and a trailing stop (`risk_manager.py`), which are NOT simulated here. They can change results either way.",
         "**Intrabar order.** If a bar touches both stop and target, the stop is assumed first (pessimistic). Gaps through a stop fill at the stop price (optimistic).",
         "**Maker fills** use a simple queue-penetration rule. Real fill rates and adverse selection must be measured live.",

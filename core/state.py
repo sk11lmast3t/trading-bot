@@ -5,7 +5,19 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 
-DB_PATH = Path("data") / "bot.db"
+_MODE = "paper"
+DB_PATH = Path("data") / "paper.db"
+
+
+def set_mode(mode):
+    """Select isolated persistence for a bot mode; honor explicit test overrides."""
+    global DB_PATH, _MODE
+    mode = str(mode).lower()
+    if mode not in ("paper", "live"):
+        raise ValueError(f"Unsupported state mode: {mode}")
+    if Path(DB_PATH) == Path("data") / f"{_MODE}.db":
+        DB_PATH = Path("data") / f"{mode}.db"
+    _MODE = mode
 
 
 def _conn():

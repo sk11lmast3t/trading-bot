@@ -51,7 +51,7 @@ def make_bot(entry_mode='maker'):
     return bot
 
 
-def test_maker_entry_calls_create_limit_order():
+def test_maker_entry_calls_create_limit_order(monkeypatch):
     bot = make_bot(entry_mode='maker')
     dates = pd.date_range('2023-01-01', periods=50, freq='1min')
     df = pd.DataFrame({
@@ -59,7 +59,7 @@ def test_maker_entry_calls_create_limit_order():
     }, index=dates)
     bot.exchange.fetch_ohlcv.return_value = df
     from core.indicators import Indicators
-    Indicators.calculate_all = MagicMock(return_value=df)
+    monkeypatch.setattr(Indicators, "calculate_all", MagicMock(return_value=df))
 
     maker_order = {'id': 'paper_1', 'symbol': 'BTC/USDT', 'side': 'buy',
                    'amount': 0.01, 'price': 100.0, 'status': 'filled',
@@ -76,7 +76,7 @@ def test_maker_entry_calls_create_limit_order():
     bot.risk_manager.register_position.assert_called_once()
 
 
-def test_market_entry_uses_create_market_order():
+def test_market_entry_uses_create_market_order(monkeypatch):
     bot = make_bot(entry_mode='market')
     dates = pd.date_range('2023-01-01', periods=50, freq='1min')
     df = pd.DataFrame({
@@ -84,7 +84,7 @@ def test_market_entry_uses_create_market_order():
     }, index=dates)
     bot.exchange.fetch_ohlcv.return_value = df
     from core.indicators import Indicators
-    Indicators.calculate_all = MagicMock(return_value=df)
+    monkeypatch.setattr(Indicators, "calculate_all", MagicMock(return_value=df))
 
     market_order = {'id': 'paper_1', 'symbol': 'BTC/USDT', 'side': 'buy',
                     'amount': 0.01, 'price': 100.0, 'status': 'closed',

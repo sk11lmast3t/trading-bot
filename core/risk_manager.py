@@ -74,10 +74,11 @@ class CircuitBreaker:
 
 
 class RiskManager:
-    def __init__(self, config):
+    def __init__(self, config, clock=None):
         self.config = config
         self.rc = config.risk
         self.sc = config.scalping
+        self.clock = clock or getattr(config, "clock", None) or datetime.now
         self.daily_pnl = 0.0
         self.peak_balance = config.scalping.initial_capital
         self.current_balance = config.scalping.initial_capital
@@ -86,7 +87,8 @@ class RiskManager:
         self.last_trade_time = None
         self.pause_until = None
         self.trade_log: List[Dict] = []
-        self._current_day = datetime.utcnow().date()
+        self._current_day = (self.clock().date() if clock is not None or getattr(config, "clock", None)
+                             else datetime.utcnow().date())
         # Portfolio heat: per-symbol notional exposure
         self.symbol_exposure: Dict[str, float] = {}
         self.open_positions: Dict[str, Dict] = {}
@@ -104,7 +106,7 @@ class RiskManager:
             self._current_day = current_day
 
     def can_trade(self, now: Optional[datetime] = None) -> Tuple[bool, str]:
-        now = now or datetime.now()
+        now = now or self.clock()
         self._check_daily_reset(now)
 
         # Circuit breaker check
@@ -152,7 +154,7 @@ class RiskManager:
         self.open_positions[symbol] = {
             'notional': notional_value,
             'side': side,
-            'entry_time': datetime.now(),
+            'entry_time': self.clock(),
             'entry_price': None,
             'high_watermark': None,
             'low_watermark': None,
@@ -245,7 +247,7 @@ class RiskManager:
         return size_value / entry
 
     def record_trade(self, pnl: float, symbol: str = "", trade_time: Optional[datetime] = None):
-        t_time = trade_time or datetime.now()
+        t_time = trade_time or self.clock()
         self.daily_pnl += pnl
         self.current_balance += pnl
         self.daily_trades += 1

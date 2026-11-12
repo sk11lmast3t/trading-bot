@@ -139,6 +139,8 @@ class Backtester:
         logger.info(f"Backtest: {len(df)} candles, ${self.balance}, entry_mode={mode}")
         df = Indicators.calculate_all(df, self.config)
         bar_min = self._bar_minutes(df.index)
+        # bars of history handed to the strategy; multi-timeframe strategies ask for more (default 300)
+        lookback = int(getattr(self.strategy, "lookback_bars", 300))
         max_hold_bars = (int(round(self.max_hold_minutes / bar_min))
                          if self.max_hold_minutes > 0 else None)
         for i in range(60, len(df)):
@@ -166,7 +168,7 @@ class Backtester:
                     self.stats["risk_blocked_bars"] += 1
                     self.stats["risk_blocked:" + str(why).split(" (")[0]] += 1
                 else:
-                    window = df.iloc[max(0, i - 299):i + 1].copy()
+                    window = df.iloc[max(0, i - lookback + 1):i + 1].copy()
                     setup = self.strategy.analyze(window)
                     if setup.signal in (Signal.LONG, Signal.SHORT):
                         self.stats["signals"] += 1
@@ -185,6 +187,8 @@ class Backtester:
         if mode in ("maker", "maker_fallback"):
             self.stats["maker_attempts"] += 1
             if i + 1 >= len(df):
+                # Signal on the last candle of the run: no next bar to test a fill against.
+                self.stats["maker_no_next_bar"] += 1
                 return
             nxt = df.iloc[i + 1]
             pen = float(getattr(bt, "maker_penetration", 0.0))
