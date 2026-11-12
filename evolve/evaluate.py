@@ -220,10 +220,13 @@ def _metrics(trades, reps=2000, seed=7, alpha=0.05):
         month_values[pd.Timestamp(trade.entry_time).strftime("%Y-%m")].append(bps)
         symbol_values[str(trade.symbol)].append(bps)
         reasons[str(trade.exit_reason)] += 1
-        entry = float(trade.entry_price)
-        if entry > 0:
-            stop_distances.append(abs(entry - float(trade.sl)) / entry * 100.0)
-            target_distances.append(abs(float(trade.tp) - entry) / entry * 100.0)
+        entry = getattr(trade, "entry_price", None)
+        stop, target = getattr(trade, "sl", None), getattr(trade, "tp", None)
+        if entry is not None and stop is not None and target is not None:
+            entry = float(entry)
+            if entry > 0:
+                stop_distances.append(abs(entry - float(stop)) / entry * 100.0)
+                target_distances.append(abs(float(target) - entry) / entry * 100.0)
     month_means = {key: float(np.mean(val)) for key, val in sorted(month_values.items())}
     symbol_means = {key: float(np.mean(val)) for key, val in sorted(symbol_values.items())}
     return {
