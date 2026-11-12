@@ -131,7 +131,8 @@ def _journal_summary(months, splits):
             pass
 
 
-def build_prompt(name, ledger_path=None):
+def build_prompt(name, ledger_path=None, stop_pct=0.02, min_target_pct=0.05,
+                 max_leverage=1.0):
     months, splits = _search_months()
     ledger = prompt_entries(ledger_path or os.path.join(ROOT, "evolve", "ledger.jsonl"), 10)
     # Explicitly serialize only the search/validation fields. Holdout results
@@ -147,6 +148,14 @@ evaluation harness injects BaseStrategy, TradeSetup, and Signal. Define exactly
 one BaseStrategy subclass with analyze(df) -> TradeSetup and optional
 lookback_bars. Use one fixed rule set. Use no look-ahead and completed bars only.
 Do not access the filesystem, environment, network, or subprocesses.
+
+DESIGN CONSTRAINTS
+- Stop distance should be about {stop_pct:.4%} of entry price.
+- Target distance must be at least {min_target_pct:.4%} of entry price.
+- Do not use leverage above {max_leverage:g}x.
+- Use completed bars only.
+- Use one fixed rule set.
+- Holds up to several days are allowed.
 
 Interface:
     class BaseStrategy:
@@ -196,8 +205,10 @@ def _extract_code(text):
 
 
 def propose_candidate(name, llm_client=None, token_budget=12000, already_spent=0,
-                      ledger_path=None, config_path=LLM_ENV_PATH):
-    prompt = build_prompt(name, ledger_path=ledger_path)
+                      ledger_path=None, config_path=LLM_ENV_PATH, stop_pct=0.02,
+                      min_target_pct=0.05, max_leverage=1.0):
+    prompt = build_prompt(name, ledger_path=ledger_path, stop_pct=stop_pct,
+                          min_target_pct=min_target_pct, max_leverage=max_leverage)
     remaining = int(token_budget) - int(already_spent) - estimate_tokens(prompt)
     if remaining < 256:
         raise RuntimeError("hard cycle token budget leaves fewer than 256 response tokens")

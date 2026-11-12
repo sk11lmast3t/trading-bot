@@ -28,6 +28,19 @@ def test_cycle_report_starts_with_effective_settings_and_default_limits():
     assert "long_only=True" in report
 
 
+def test_cycle_report_prints_break_even_hit_rate_for_configured_costs():
+    report = render_cycle([{
+        "name": "trial", "verdict": "failed", "reason_failed": [],
+        "search": {"base": {}},
+        "validation": {"base": {"trades": 2, "net_bps_per_trade": 0.0,
+                                 "adjusted_ci": [None, None],
+                                 "median_stop_pct": 2.0, "median_target_pct": 5.0,
+                                 "target_before_stop_rate": 0.5}},
+    }], {"maker_fee": .0002, "taker_fee": .0005, "slippage": .0003,
+         "long_only": False})
+    assert "Break-even hit rate at configured costs:" in report
+
+
 def test_holdout_is_single_attempt_and_promotion_needs_validation_and_holdout(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "evolve").mkdir()
