@@ -201,7 +201,9 @@ def _metrics(trades, reps=2000, seed=7, alpha=0.05):
     if not len(values):
         return {"trades": 0, "net_bps_per_trade": None, "bootstrap_95_ci": [None, None],
                 "adjusted_ci": [None, None], "profitable_months": 0, "months": 0,
-                "profitable_symbols": 0, "symbols": 0, "exit_reasons": {}}
+                "profitable_symbols": 0, "symbols": 0, "exit_reasons": {},
+                "median_stop_pct": None, "median_target_pct": None,
+                "target_before_stop_rate": None}
     rng = np.random.default_rng(seed)
     samples = rng.choice(values, size=(reps, len(values)), replace=True).mean(axis=1)
     alpha = min(max(float(alpha), 1e-6), 0.5)
@@ -210,6 +212,7 @@ def _metrics(trades, reps=2000, seed=7, alpha=0.05):
     month_values = defaultdict(list)
     symbol_values = defaultdict(list)
     reasons = Counter()
+    stop_distances, target_distances = [], []
     for trade in trades:
         if float(trade.notional) <= 0:
             continue
@@ -217,6 +220,10 @@ def _metrics(trades, reps=2000, seed=7, alpha=0.05):
         month_values[pd.Timestamp(trade.entry_time).strftime("%Y-%m")].append(bps)
         symbol_values[str(trade.symbol)].append(bps)
         reasons[str(trade.exit_reason)] += 1
+        entry = float(trade.entry_price)
+        if entry > 0:
+            stop_distances.append(abs(entry - float(trade.sl)) / entry * 100.0)
+            target_distances.append(abs(float(trade.tp) - entry) / entry * 100.0)
     month_means = {key: float(np.mean(val)) for key, val in sorted(month_values.items())}
     symbol_means = {key: float(np.mean(val)) for key, val in sorted(symbol_values.items())}
     return {
@@ -230,7 +237,29 @@ def _metrics(trades, reps=2000, seed=7, alpha=0.05):
         "per_symbol": {key: {"trades": len(symbol_values[key]), "net_bps_per_trade": symbol_means[key]}
                        for key in symbol_means},
         "exit_reasons": dict(sorted(reasons.items())),
+        "median_stop_pct": float(np.median(stop_distances)) if stop_distances else None,
+        "median_target_pct": float(np.median(target_distances)) if target_distances else None,
+        "target_before_stop_rate": (float(reasons.get("TP", 0)) /
+                                     (reasons.get("TP", 0) + reasons.get("SL", 0))
+                                     if reasons.get("TP", 0) + reasons.get("SL", 0) else None),
     }
+
+
+def constraint_failures(result, stop_pct=0.02):
+    """Return geometric stop/target violations for one backtest result."""
+    base = result.get("base", result)
+    stop = base.get("median_stop_pct")
+    target = base.get("median_target_pct")
+    failures = []
+    if stop is None:
+        failures.append("no completed trades to measure median stop distance")
+    elif not 0.6 * stop_pct * 100.0 <= float(stop) <= 1.4 * stop_pct * 100.0:
+        failures.append(f"median stop distance {float(stop):.3f}% is outside 0.6x-1.4x of stop-pct ({stop_pct * 100:.3f}%)")
+    if stop is not None and target is None:
+        failures.append("no completed trades to measure median target distance")
+    elif stop is not None and target is not None and float(target) < 2.0 * float(stop):
+        failures.append(f"median target distance {float(target):.3f}% is below 2x median stop ({float(stop):.3f}%)")
+    return failures
 
 
 def load_costs(maker_fee=None, taker_fee=None, slippage=None, costs_path="config/measured_costs.json"):

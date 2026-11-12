@@ -9,7 +9,8 @@ import re
 import sys
 
 from evolve.costs import learn_costs
-from evolve.evaluate import evaluate_candidate, load_costs, validate_candidate_source
+from evolve.evaluate import (constraint_failures, evaluate_candidate, load_costs,
+                             validate_candidate_source)
 from evolve.gates import validation_verdict
 from evolve.ledger import append_entry, holdout_attempted, latest_candidate, read_entries
 from evolve.propose import propose_candidate
@@ -92,6 +93,15 @@ def cycle(max_candidates=DEFAULT_MAX_CANDIDATES, token_budget=DEFAULT_TOKEN_BUDG
                                                    trials=trials, stress_factor=1.5,
                                                    long_only=settings["long_only"])
             gate = validation_verdict(row["search"], row["validation"], trials)
+            geometry_failures = []
+            for partition in ("search", "validation"):
+                geometry_failures.extend(
+                    f"{partition}: {reason}"
+                    for reason in constraint_failures(row[partition], stop_pct)
+                )
+            if geometry_failures:
+                gate["reason_failed"].extend(geometry_failures)
+                gate["verdict"] = "failed"
             row.update(gate)
             row["what"] = "one fixed candidate rule set evaluated on SEARCH, then VALIDATION"
         except Exception as exc:
