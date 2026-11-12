@@ -53,7 +53,8 @@ def _trial_count(entries, settings):
 
 def cycle(max_candidates=DEFAULT_MAX_CANDIDATES, token_budget=DEFAULT_TOKEN_BUDGET,
           llm_client=None, data_dir="data", maker_fee=None, taker_fee=None,
-          slippage=None, long_only=False):
+          slippage=None, long_only=False, stop_pct=0.02,
+          min_target_pct=0.05, max_leverage=1.0):
     if max_candidates < 1 or max_candidates > 3:
         raise ValueError("A cycle may create between 1 and 3 candidates")
     learn_costs()
@@ -70,11 +71,15 @@ def cycle(max_candidates=DEFAULT_MAX_CANDIDATES, token_budget=DEFAULT_TOKEN_BUDG
                "code_hash": None,
                **settings,
                "params": {"costs": costs, "long_only": settings["long_only"],
+                          "stop_pct": stop_pct, "min_target_pct": min_target_pct,
+                          "max_leverage": max_leverage,
                           "partitions": ["search", "validation"]},
                "search": {}, "validation": {}}
         try:
             path, used, _ = propose_candidate(name, llm_client=llm_client,
-                                               token_budget=token_budget, already_spent=spent)
+                                               token_budget=token_budget, already_spent=spent,
+                                               stop_pct=stop_pct, min_target_pct=min_target_pct,
+                                               max_leverage=max_leverage)
             spent += used
             with open(path, encoding="utf-8") as stream:
                 source = stream.read()
@@ -167,6 +172,9 @@ def main(argv=None):
     cyc.add_argument("--taker-fee", type=float)
     cyc.add_argument("--slippage", type=float)
     cyc.add_argument("--long-only", action="store_true")
+    cyc.add_argument("--stop-pct", type=float, default=0.02)
+    cyc.add_argument("--min-target-pct", type=float, default=0.05)
+    cyc.add_argument("--max-leverage", type=float, default=1.0)
     hold = sub.add_parser("holdout")
     hold.add_argument("name")
     hold.add_argument("--data", default="data")
@@ -180,7 +188,9 @@ def main(argv=None):
     if args.command == "cycle":
         cycle(args.max_candidates, args.token_budget, data_dir=args.data,
               maker_fee=args.maker_fee, taker_fee=args.taker_fee,
-              slippage=args.slippage, long_only=args.long_only)
+              slippage=args.slippage, long_only=args.long_only,
+              stop_pct=args.stop_pct, min_target_pct=args.min_target_pct,
+              max_leverage=args.max_leverage)
     elif args.command == "holdout":
         holdout(args.name, args.data, maker_fee=args.maker_fee,
                 taker_fee=args.taker_fee, slippage=args.slippage,
