@@ -178,8 +178,26 @@ def record_event(event_type, payload, ts=None):
 def load_open_positions():
     conn = _conn()
     try:
-        rows = conn.execute("SELECT * FROM positions WHERE status='open'").fetchall()
-        return [dict(r) for r in rows]
+        rows = conn.execute(
+            "SELECT * FROM positions WHERE status='open' ORDER BY id ASC"
+        ).fetchall()
+        # A symbol can accumulate duplicate open rows if a process died between
+        # the insert and the close update. The latest row is authoritative, and
+        # ordering by id makes the choice deterministic across runs.
+        ordered = []
+        index = {}
+        for row in rows:
+            entry = dict(row)
+            symbol = entry.get("symbol")
+            if not symbol:
+                ordered.append(entry)
+                continue
+            if symbol in index:
+                ordered[index[symbol]] = entry
+            else:
+                index[symbol] = len(ordered)
+                ordered.append(entry)
+        return ordered
     finally:
         conn.close()
 

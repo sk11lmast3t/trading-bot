@@ -343,7 +343,14 @@ def test_paper_restart_restores_positions_from_selected_paper_database(monkeypat
     bot.entries_blocked = False
     bot.position_targets = {}
     bot.position_entry_cycle = {}
+    bot.clock = lambda: datetime(2026, 1, 1, 0, 5)
+    bot._clock_uses_local_timezone = False
     bot._state_path = lambda: str(tmp_path / "paper-session.state.json")
+    bot.exchange.fetch_ohlcv = MagicMock(return_value=pd.DataFrame(
+        {"open": [100.0], "high": [100.0], "low": [100.0], "close": [100.0],
+         "volume": [1.0]},
+        index=[pd.Timestamp("2026-01-01 00:05:00")],
+    ))
     monkeypatch.setattr(main.state, "load_open_positions", lambda: [{
         "symbol": "BTC/USDT", "side": "long", "size": 0.05,
         "entry_price": 100.0, "tp": 105.0, "sl": 98.0,

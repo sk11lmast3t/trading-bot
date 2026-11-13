@@ -567,9 +567,13 @@ class PaperExchange:
 
     def update_mark_price(self, symbol: str, price: float):
         position = self.positions.get(symbol)
-        value = float(price)
+        try:
+            value = float(price)
+        except (TypeError, ValueError):
+            return
         if position and math.isfinite(value) and value > 0:
             position['markPrice'] = value
+            position['mark_price'] = value
 
     def liquidation_price(self, symbol: str):
         position = self.positions.get(symbol)
@@ -880,34 +884,48 @@ class PaperExchange:
         order = self.orders.get(order_id)
         if not order or order.get('status') != 'open':
             return order
+        try:
+            limit_price = float(limit_price)
+        except (TypeError, ValueError):
+            return order
+        if not math.isfinite(limit_price) or limit_price <= 0:
+            return order
         df = self.fetch_ohlcv(symbol, self.config.scalping.timeframe, 2)
         if df is None or len(df) < 2:
             return order
         cur = df.iloc[-1]
-        high = float(cur['high'])
-        low = float(cur['low'])
+        try:
+            high = float(cur['high'])
+            low = float(cur['low'])
+        except (KeyError, TypeError, ValueError):
+            return order
+        if not (math.isfinite(high) and math.isfinite(low)):
+            return order
         # Price traded through the limit price during the bar.
         traded_through = (low <= limit_price <= high)
         if traded_through:
+            try:
+                leverage = float(getattr(self, '_requested_leverage', {}).get(symbol, 1.0))
+            except (TypeError, ValueError):
+                leverage = 1.0
+            if not math.isfinite(leverage) or leverage < 1.0:
+                leverage = 1.0
+            amount = float(order.get('amount') or 0.0)
+            notional = amount * limit_price
             order['status'] = 'filled'
             order['filled'] = order['amount']
             order['price'] = limit_price
-            if side in ('buy', 'long'):
-                self.positions[symbol] = {
-                    'symbol': symbol,
-                    'side': 'long',
-                    'contracts': order['amount'],
-                    'entryPrice': limit_price,
-                    'timestamp': datetime.now().isoformat(),
-                }
-            else:
-                self.positions[symbol] = {
-                    'symbol': symbol,
-                    'side': 'short',
-                    'contracts': order['amount'],
-                    'entryPrice': limit_price,
-                    'timestamp': datetime.now().isoformat(),
-                }
+            self.positions[symbol] = {
+                'symbol': symbol,
+                'side': 'long' if side in ('buy', 'long') else 'short',
+                'contracts': order['amount'],
+                'entryPrice': limit_price,
+                'markPrice': limit_price,
+                'notional': notional,
+                'leverage': leverage,
+                'margin': notional / leverage if leverage else notional,
+                'timestamp': datetime.now().isoformat(),
+            }
             self.trade_history.append(order)
         return order
 
@@ -941,7 +959,8 @@ class PaperExchange:
         self.trade_history.append(order)
         return order
 
-    def close_position(self, symbol: str, exit_price: float) -> Optional[float]:
+    def close_position(self, symbol: str, exit_price: float,
+                       apply_slippage: bool = True) -> Optional[float]:
         self._simulate_latency()
         pos = self.positions.pop(symbol, None)
         if not pos:
@@ -949,8 +968,11 @@ class PaperExchange:
         entry = pos['entryPrice']
         amt = pos['contracts']
         side = pos['side']
-        # Apply slippage on exit
-        exit_price = self._simulate_slippage(exit_price, 'sell' if side == 'long' else 'buy')
+        # Bot-managed closes already charge slippage explicitly, so they pass
+        # apply_slippage=False to avoid charging it twice.
+        if apply_slippage:
+            exit_price = self._simulate_slippage(
+                exit_price, 'sell' if side == 'long' else 'buy')
         pnl = (exit_price - entry) * amt if side == 'long' else (entry - exit_price) * amt
         if self._balance_source is None:
             self.balance += pnl
