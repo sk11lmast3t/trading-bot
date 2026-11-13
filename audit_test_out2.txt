@@ -1,0 +1,577 @@
+﻿........F............................F.FF...........F..........FF....... [ 60%]
+...F.......................................F...                          [100%]
+================================== FAILURES ===================================
+_______ test_position_allocation_cap_preserves_one_percent_risk_budget ________
+
+    def test_position_allocation_cap_preserves_one_percent_risk_budget():
+        cfg = main.build_config_from_args([
+            "--capital", "10", "--max-position-notional-pct", "0.50",
+        ], environ={})
+        rm = RiskManager(cfg)
+        amount = rm.calculate_position_size(10.0, 100.0, 98.0)
+    
+>       assert amount * 100.0 == pytest.approx(5.0)
+E       assert 4.63306152705708 == 5.0 ▒ 5.0e-06
+E         
+E         comparison failed
+E         Obtained: 4.63306152705708
+E         Expected: 5.0 ▒ 5.0e-06
+
+tests\test_paper_parity.py:97: AssertionError
+_ test_process_symbol_fetches_mtf_history_and_applies_long_only[Signal.LONG-True-expected_entries0-entered] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000024647AA4A10>
+tmp_path = WindowsPath('C:/Users/webdeveloper/Downloads/rea-main/unified-crypto-scalper/.pytest_tmp_audit_run2/test_process_symbol_fetches_mt0')
+signal = <Signal.LONG: 'LONG'>, long_only = True
+expected_entries = ['BTC/USDT'], expected_status = 'entered'
+
+    @pytest.mark.parametrize("signal,long_only,expected_entries,expected_status", [
+        (Signal.LONG, True, ["BTC/USDT"], "entered"),
+        (Signal.SHORT, True, [], "skipped:long_only"),
+    ])
+    def test_process_symbol_fetches_mtf_history_and_applies_long_only(
+        monkeypatch, tmp_path, signal, long_only, expected_entries, expected_status,
+    ):
+        cfg = BotConfig()
+        cfg.strategy.active_strategy = "mtf_trend_pullback"
+        cfg.scalping.scan_all_coins = False
+        cfg.execution.entry_mode = "market"
+        cfg.long_only = long_only
+    
+        idx = pd.date_range("2026-01-01", periods=724, freq="5min")
+        close = np.linspace(100.0, 110.0, len(idx))
+        bars = pd.DataFrame({
+            "open": close, "high": close + 1, "low": close - 1,
+            "close": close, "volume": 1000.0,
+        }, index=idx)
+    
+        class FakeExchange:
+            def __init__(self):
+                self.requested_limits = {}
+                self.positions = {}
+                self.entries = []
+    
+            def fetch_ohlcv(self, symbol, timeframe, limit):
+                self.requested_limits[timeframe] = limit
+                return bars.iloc[-limit:]
+    
+            def get_position(self, symbol):
+                return self.positions.get(symbol)
+    
+            def create_market_order(self, symbol, side, amount, params=None):
+                price = params["price"]
+                self.positions[symbol] = {
+                    "symbol": symbol, "side": "long", "contracts": amount,
+                    "entryPrice": price,
+                }
+                self.entries.append(symbol)
+                return {"status": "closed", "filled": amount, "price": price}
+    
+        bot = main.UnifiedCryptoBot.__new__(main.UnifiedCryptoBot)
+        bot.config = cfg
+        bot.strategy = MtfTrendPullbackStrategy(cfg)
+        exchange = FakeExchange()
+        bot.exchange = exchange
+        bot.risk_manager = MagicMock()
+        bot.risk_manager.open_positions = {}
+        bot.risk_manager.current_balance = cfg.scalping.initial_capital
+        bot.risk_manager.can_trade.return_value = (True, "OK")
+        bot.risk_manager.calculate_position_size.return_value = 0.1
+        bot.risk_manager.check_portfolio_heat.return_value = (True, "OK")
+        bot.cycle_count = 1
+        bot.position_entry_cycle = {}
+        bot.position_targets = {}
+        bot.entries_blocked = False
+        bot.last_rejection_log = {}
+        bot.decision_log_path = str(tmp_path / "decisions.csv")
+        seen_rows = []
+    
+        def synthetic_signal(window):
+            seen_rows.append(len(window))
+            return TradeSetup(signal, 110.0, 108.0, 114.0, 0.7, "mtf_trend_pullback")
+    
+        monkeypatch.setattr(bot.strategy, "analyze", synthetic_signal)
+        monkeypatch.setattr(main.state, "save_position_at_entry", lambda *args, **kwargs: None)
+        bot.process_symbol("BTC/USDT")
+    
+        assert exchange.requested_limits["5m"] >= 722
+        assert seen_rows and max(seen_rows) >= 720
+>       assert exchange.entries == expected_entries
+E       AssertionError: assert [] == ['BTC/USDT']
+E         
+E         Right contains one more item: 'BTC/USDT'
+E         Use -v to get more diff
+
+tests\test_paper_parity.py:587: AssertionError
+------------------------------ Captured log call ------------------------------
+ERROR    main:main.py:801 Error processing BTC/USDT: not enough values to unpack (expected 3, got 0)
+____________ test_run_metadata_records_effective_costs_and_context ____________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000024647A93490>
+tmp_path = WindowsPath('C:/Users/webdeveloper/Downloads/rea-main/unified-crypto-scalper/.pytest_tmp_audit_run2/test_run_metadata_records_effe0')
+
+    def test_run_metadata_records_effective_costs_and_context(monkeypatch, tmp_path):
+        cfg = BotConfig()
+        cfg.exchange.name = "kucoin"
+        cfg.scalping.symbols = ["BTC/USDT"]
+        cfg.strategy.active_strategy = "ema_rsi_atr"
+        cfg.backtest.maker_fee = 0.0002
+        cfg.backtest.taker_fee = 0.0005
+        cfg.backtest.slippage = 0.0003
+        bot = main.UnifiedCryptoBot.__new__(main.UnifiedCryptoBot)
+        bot.config = cfg
+        monkeypatch.chdir(tmp_path)
+    
+>       bot.write_run_metadata()
+
+C:\Users\webdeveloper\Downloads\rea-main\unified-crypto-scalper\tests\test_paper_parity.py:611: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <main.UnifiedCryptoBot object at 0x0000024647ACC640>
+
+    def write_run_metadata(self):
+        """Record the resolved run settings before trading starts."""
+        try:
+            commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                check=True, timeout=2,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            commit = "unknown"
+        metadata = {
+            "exchange": self.config.exchange.name,
+            "symbols": list(self.config.scalping.symbols),
+                    "strategy": self.config.strategy.active_strategy,
+            "maker_fee": self.config.backtest.maker_fee,
+            "taker_fee": self.config.backtest.taker_fee,
+            "slippage": self.config.backtest.slippage,
+            "hold_minutes": self.config.risk.max_hold_time_minutes,
+            "git_commit": commit,
+            "start_time": getattr(self, "clock", datetime.now)().isoformat(),
+            "paper_session_id": getattr(self.config, "paper_session_id", None),
+            "state_database": getattr(self.config, "state_db_path", "data/paper.db"),
+            "portfolio_profit_target_enabled": self.config.portfolio_profit_target_enabled,
+            "portfolio_profit_target_pct": self.config.portfolio_profit_target_pct,
+>           "max_cycles": self.max_cycles,
+                          ^^^^^^^^^^^^^^^
+            "initial_portfolio_equity": getattr(
+                self, "initial_portfolio_equity", self.config.scalping.initial_capital),
+        }
+E       AttributeError: 'UnifiedCryptoBot' object has no attribute 'max_cycles'
+
+C:\Users\webdeveloper\Downloads\rea-main\unified-crypto-scalper\main.py:1618: AttributeError
+_______ test_process_symbol_enters_at_most_once_for_same_completed_bar ________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000246479168F0>
+tmp_path = WindowsPath('C:/Users/webdeveloper/Downloads/rea-main/unified-crypto-scalper/.pytest_tmp_audit_run2/test_process_symbol_enters_at_0')
+
+    def test_process_symbol_enters_at_most_once_for_same_completed_bar(monkeypatch, tmp_path):
+        cfg = BotConfig()
+        cfg.scalping.scan_all_coins = False
+        cfg.execution.entry_mode = "market"
+        idx = pd.date_range("2026-01-01", periods=302, freq="5min")
+        close = np.linspace(100.0, 105.0, len(idx))
+        bars = pd.DataFrame({
+            "open": close, "high": close + 1, "low": close - 1,
+            "close": close, "volume": 1000.0,
+        }, index=idx)
+    
+        class FakeExchange:
+            def __init__(self):
+                self.positions = {}
+                self.entries = []
+    
+            def fetch_ohlcv(self, symbol, timeframe, limit):
+                return bars.iloc[-limit:]
+    
+            def get_position(self, symbol):
+                return self.positions.get(symbol)
+    
+            def create_market_order(self, symbol, side, amount, params=None):
+                price = params["price"]
+                self.positions[symbol] = {
+                    "symbol": symbol, "side": "long", "contracts": amount,
+                    "entryPrice": price,
+                }
+                self.entries.append(symbol)
+                return {"status": "closed", "filled": amount, "price": price}
+    
+        bot = main.UnifiedCryptoBot.__new__(main.UnifiedCryptoBot)
+        bot.config = cfg
+        bot.strategy = MagicMock()
+        bot.strategy.lookback_bars = 300
+        bot.strategy.analyze.return_value = TradeSetup(Signal.LONG, 105.0, 103.0, 109.0, 0.7, "test")
+        exchange = FakeExchange()
+        bot.exchange = exchange
+        bot.risk_manager = MagicMock()
+        bot.risk_manager.open_positions = {}
+        bot.risk_manager.current_balance = cfg.scalping.initial_capital
+        bot.risk_manager.can_trade.return_value = (True, "OK")
+        bot.risk_manager.calculate_position_size.return_value = 0.1
+        bot.risk_manager.check_portfolio_heat.return_value = (True, "OK")
+        bot.cycle_count = 1
+        bot.position_entry_cycle = {}
+        bot.position_targets = {}
+        bot.entries_blocked = False
+        bot.last_rejection_log = {}
+        bot.last_processed_bar = {}
+        bot.decision_log_path = str(tmp_path / "decisions.csv")
+        monkeypatch.setattr(main.state, "save_position_at_entry", lambda *args, **kwargs: None)
+    
+        bot.process_symbol("BTC/USDT")
+        bot.process_symbol("BTC/USDT")
+    
+        assert bot.strategy.analyze.call_count == 1
+>       assert exchange.entries == ["BTC/USDT"]
+E       AssertionError: assert [] == ['BTC/USDT']
+E         
+E         Right contains one more item: 'BTC/USDT'
+E         Use -v to get more diff
+
+tests\test_paper_parity.py:682: AssertionError
+------------------------------ Captured log call ------------------------------
+ERROR    main:main.py:801 Error processing BTC/USDT: not enough values to unpack (expected 3, got 0)
+__________ test_time_exit_uses_signal_close_and_includes_exact_limit __________
+
+    def test_time_exit_uses_signal_close_and_includes_exact_limit():
+        bot = UnifiedCryptoBot.__new__(UnifiedCryptoBot)
+        bot.config = SimpleNamespace(
+            mode="paper", scalping=SimpleNamespace(timeframe="5m", stop_loss_pct=.05,
+                                                   take_profit_pct=.10, max_hold_cycles=60),
+            risk=SimpleNamespace(max_hold_time_minutes=30),
+            backtest=SimpleNamespace(slippage=.001, taker_fee=.0005))
+        bot.clock = lambda: datetime(2026, 1, 1, 0, 35)
+        bot.exchange = MagicMock()
+        bot.exchange.get_position.return_value = {"entryPrice": 100, "contracts": 1, "side": "long"}
+        idx = pd.date_range("2026-01-01 00:00", periods=3, freq="5min")
+        bot.exchange.fetch_ohlcv.return_value = pd.DataFrame(
+            {"open": [100] * 3, "high": [104] * 3, "low": [96] * 3, "close": [100] * 3}, index=idx)
+        bot.position_targets = {"X": {"sl": 95, "tp": 110, "signal_bar_open": "2026-01-01T00:00:00"}}
+        bot.risk_manager = MagicMock()
+        bot.risk_manager.open_positions = {"X": {"entry_time": datetime(2026, 1, 1, 0, 5)}}
+        bot.risk_manager.check_trailing_stop.return_value = (False, "")
+        bot._close_position = MagicMock()
+        bot.check_exits("X")
+>       assert bot._close_position.call_args.args[3] == "Time exit (wall-clock)"
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'NoneType' object has no attribute 'args'
+
+tests\test_exit_time_fidelity.py:29: AttributeError
+------------------------------ Captured log call ------------------------------
+ERROR    main:main.py:1190 Error checking exits for X: 'types.SimpleNamespace' object has no attribute 'adaptive_leverage'
+__________________ test_maker_entry_calls_create_limit_order __________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000024647B46970>
+
+    def test_maker_entry_calls_create_limit_order(monkeypatch):
+        bot = make_bot(entry_mode='maker')
+        dates = pd.date_range('2023-01-01', periods=50, freq='1min')
+        df = pd.DataFrame({
+            'open': [100]*50, 'high': [101]*50, 'low': [99]*50, 'close': [100]*50, 'volume': [1000]*50
+        }, index=dates)
+        bot.exchange.fetch_ohlcv.return_value = df
+        from core.indicators import Indicators
+        monkeypatch.setattr(Indicators, "calculate_all", MagicMock(return_value=df))
+    
+        maker_order = {'id': 'paper_1', 'symbol': 'BTC/USDT', 'side': 'buy',
+                       'amount': 0.01, 'price': 100.0, 'status': 'filled',
+                       'filled': 0.01, 'timestamp': 'now'}
+        bot.exchange.create_best_bid_ask_limit_order = MagicMock(return_value=maker_order)
+        bot.exchange.check_limit_fill = MagicMock(return_value=maker_order)
+        bot.exchange.cancel_all_orders = MagicMock()
+        bot.risk_manager.register_position = MagicMock()
+    
+        bot.process_symbol('BTC/USDT')
+    
+>       bot.exchange.create_best_bid_ask_limit_order.assert_called_once()
+
+tests\test_maker_entry.py:74: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <MagicMock name='mock.create_best_bid_ask_limit_order' id='2500872388688'>
+
+    def assert_called_once(self):
+        """assert that the mock was called only once.
+        """
+        if not self.call_count == 1:
+            msg = ("Expected '%s' to have been called once. Called %s times.%s"
+                   % (self._mock_name or 'mock',
+                      self.call_count,
+                      self._calls_repr()))
+>           raise AssertionError(msg)
+E           AssertionError: Expected 'create_best_bid_ask_limit_order' to have been called once. Called 0 times.
+
+C:\Python314\Lib\unittest\mock.py:965: AssertionError
+------------------------------ Captured log call ------------------------------
+ERROR    main:main.py:801 Error processing BTC/USDT: not enough values to unpack (expected 3, got 0)
+_________________ test_market_entry_uses_create_market_order __________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000024688BB6EB0>
+
+    def test_market_entry_uses_create_market_order(monkeypatch):
+        bot = make_bot(entry_mode='market')
+        dates = pd.date_range('2023-01-01', periods=50, freq='1min')
+        df = pd.DataFrame({
+            'open': [100]*50, 'high': [101]*50, 'low': [99]*50, 'close': [100]*50, 'volume': [1000]*50
+        }, index=dates)
+        bot.exchange.fetch_ohlcv.return_value = df
+        from core.indicators import Indicators
+        monkeypatch.setattr(Indicators, "calculate_all", MagicMock(return_value=df))
+    
+        market_order = {'id': 'paper_1', 'symbol': 'BTC/USDT', 'side': 'buy',
+                        'amount': 0.01, 'price': 100.0, 'status': 'closed',
+                        'filled': 0.01, 'timestamp': 'now'}
+        bot.exchange.create_market_order = MagicMock(return_value=market_order)
+        bot.exchange.create_best_bid_ask_limit_order = MagicMock()
+        bot.risk_manager.register_position = MagicMock()
+    
+        bot.process_symbol('BTC/USDT')
+    
+>       bot.exchange.create_market_order.assert_called_once()
+
+tests\test_maker_entry.py:98: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <MagicMock name='mock.create_market_order' id='2500872395744'>
+
+    def assert_called_once(self):
+        """assert that the mock was called only once.
+        """
+        if not self.call_count == 1:
+            msg = ("Expected '%s' to have been called once. Called %s times.%s"
+                   % (self._mock_name or 'mock',
+                      self.call_count,
+                      self._calls_repr()))
+>           raise AssertionError(msg)
+E           AssertionError: Expected 'create_market_order' to have been called once. Called 0 times.
+
+C:\Python314\Lib\unittest\mock.py:965: AssertionError
+------------------------------ Captured log call ------------------------------
+ERROR    main:main.py:801 Error processing BTC/USDT: not enough values to unpack (expected 3, got 0)
+_________________ test_target_persists_through_session_resume _________________
+
+tmp_path = WindowsPath('C:/Users/webdeveloper/Downloads/rea-main/unified-crypto-scalper/.pytest_tmp_audit_run2/test_target_persists_through_s0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000024647868D00>
+
+    def test_target_persists_through_session_resume(tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        first_cfg = main.build_config_from_args([
+            "--fresh", "--paper-session-id", "target-audit", "--capital", "10",
+            "--portfolio-profit-target-pct", "70",
+        ], environ={})
+        bot = _paper_bot(tmp_path, monkeypatch)
+        bot.config = first_cfg
+        bot.initial_portfolio_equity = 10.0
+        bot.risk_manager.current_balance = 12.25
+        bot.portfolio_target_status = "ACTIVE"
+        bot.persist_state()
+        main.state.set_database(bot.config.state_db_path)
+        main.state.save_risk_state("session_seed", "ready")
+    
+        resumed_cfg = main.build_config_from_args([
+            "--paper-session-id", "target-audit", "--capital", "10",
+            "--portfolio-profit-target-pct", "90",
+        ], environ={})
+        resumed = main.UnifiedCryptoBot.__new__(main.UnifiedCryptoBot)
+        resumed.config = resumed_cfg
+        resumed.risk_manager = RiskManager(resumed_cfg)
+        resumed.exchange = type("PaperPositionView", (), {"get_positions": lambda _self: {}})()
+        resumed.loaded_positions = []
+        resumed.position_targets = {}
+        resumed.position_entry_cycle = {}
+        resumed.entries_blocked = False
+        resumed.initial_portfolio_equity = 10.0
+        resumed.portfolio_target_status = "ACTIVE"
+        resumed.trading_halted = False
+        main.state.set_database(resumed_cfg.state_db_path)
+    
+        resumed.load_state()
+    
+>       assert resumed.risk_manager.current_balance == pytest.approx(12.25)
+E       assert 10.0 == 12.25 ▒ 1.2e-05
+E         
+E         comparison failed
+E         Obtained: 10.0
+E         Expected: 12.25 ▒ 1.2e-05
+
+C:\Users\webdeveloper\Downloads\rea-main\unified-crypto-scalper\tests\test_portfolio_profit_target.py:174: AssertionError
+__________ test_closed_trade_journals_excursions_r_and_stable_header __________
+
+tmp_path = WindowsPath('C:/Users/webdeveloper/Downloads/rea-main/unified-crypto-scalper/.pytest_tmp_audit_run2/test_closed_trade_journals_exc0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002464786B2A0>
+
+    def test_closed_trade_journals_excursions_r_and_stable_header(tmp_path, monkeypatch):
+        path = tmp_path / "decisions.csv"
+        bot = main.UnifiedCryptoBot.__new__(main.UnifiedCryptoBot)
+        bot.decision_log_path = str(path)
+        bot.decision_log_lock = __import__("threading").Lock()
+        bot.config = SimpleNamespace(
+            mode="paper", backtest=SimpleNamespace(taker_fee=0.0, slippage=0.0),
+        )
+        bot.clock = lambda: datetime(2026, 4, 6, 12, 25)
+        bot.exchange = MagicMock()
+        bot.risk_manager = MagicMock()
+        bot.risk_manager.current_balance = 1000.0
+        bot.risk_manager.record_trade = MagicMock()
+        bot.risk_manager.release_position = MagicMock()
+        bot.position_entry_cycle = {"BTC/USDT": 1}
+        bot.position_targets = {"BTC/USDT": {
+            "sl": 95.0, "tp": 110.0, "signal_bar_open": "2026-04-06T12:00:00",
+        }}
+        bot.active_decisions = {}
+        bot.paper_trade_meta = {"BTC/USDT": {"entry_fee": 0.0, "entry_slippage": 0.0}}
+        bot.persist_state = MagicMock()
+        monkeypatch.setattr(main.state, "record_trade", lambda *args, **kwargs: None)
+    
+        row = {
+            "ts": "2026-04-06T12:00:00", "symbol": "BTC/USDT", "strategy": "synthetic",
+            "signal": "LONG", "intended_entry": 100.0, "sl": 95.0, "tp": 110.0,
+            "status": "entered", "fill_price": 100.0, "quantity": 1.0,
+            "notional": 100.0, "planned_sl_bps": 500.0, "planned_tp_bps": 1000.0,
+            "atr_1h_pct": 1.25, "ema20_1h_slope_sign": "up", "ema20_1h_slope_pct": 0.02,
+            "trend_30m": "up", "rsi_5m": 60.0, "ema_distance_atr_5m": 0.5,
+            "hour_utc": 12, "day_of_week_utc": 0, "rv_24h_bucket": "medium",
+            "entry_fill_diff_bps": 0.0, "entry_time": datetime(2026, 4, 6, 12, 10),
+        }
+        bot._append_decision(row)
+        bot.active_decisions["BTC/USDT"] = dict(row)
+        frame_idx = pd.date_range("2026-04-06 12:00", periods=5, freq="5min")
+        frame = pd.DataFrame({
+            "high": [101, 103, 102, 100, 100],
+            "low": [99, 98, 99, 97, 99],
+            "close": [100, 101, 101, 100, 100],
+        }, index=frame_idx)
+        position = {"entryPrice": 100.0, "contracts": 1.0, "side": "long"}
+        assert bot._exit_excursions("BTC/USDT", position, frame, row) == {
+            "mfe_bps": 300.0, "mae_bps": 300.0, "bars_held": 4,
+        }
+        bot._prepare_poll_close("BTC/USDT", position, frame, 102.0)
+        assert bot.active_decisions["BTC/USDT"]["mfe_bps"] == pytest.approx(300.0)
+>       bot._close_position("BTC/USDT", position, 101.0, "TAKE PROFIT", reference_price=102.0)
+
+tests\test_trade_journal.py:112: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <main.UnifiedCryptoBot object at 0x000002463A503360>, symbol = 'BTC/USDT'
+pos = {'entryPrice': 100.0, 'contracts': 1.0, 'side': 'long'}, price = 101.0
+reason = 'TAKE PROFIT', reference_price = 102.0
+
+    def _close_position(self, symbol, pos, price, reason, reference_price=None):
+        reference_price = float(price if reference_price is None else reference_price)
+        if self.config.mode == "live":
+            # An exchange stop may have filled between the poll and this close.
+            fresh = self.exchange.get_position(symbol)
+            if not fresh:
+                if getattr(self.exchange, "position_check_error", None):
+                    logger.error("[%s] Position recheck failed; leaving state reserved and blocking entries", symbol)
+                    self.entries_blocked = True
+                    return
+                self._record_exchange_stop_flat(symbol)
+                self.risk_manager.release_position(symbol)
+                self.position_entry_cycle.pop(symbol, None)
+                self.position_targets.pop(symbol, None)
+                self.persist_state()
+                return
+            pos = fresh
+        entry = float(pos.get('entryPrice', 0.0))
+        contracts = float(pos.get('contracts', 0.0))
+        side = pos.get('side', 'long')
+        decision_context = getattr(self, "active_decisions", {}).pop(symbol, None)
+        targets = getattr(self, "position_targets", {}).get(symbol, {})
+        if decision_context is None:
+            decision_context = targets.get("journal_entry")
+        hold_minutes = ""
+        if decision_context and isinstance(decision_context.get("entry_time"), datetime):
+            hold_minutes = max((getattr(self, "clock", datetime.now)() - decision_context["entry_time"]).total_seconds() / 60.0, 0.0)
+        if side == 'long':
+            gross_pnl = (reference_price - entry) * contracts
+        else:
+            gross_pnl = (entry - reference_price) * contracts
+        pnl = gross_pnl
+        journal_exit_fill = float(price)
+        live_exit_fee = None
+        if self.config.mode == "live":
+            opp_side = 'sell' if side == 'long' else 'buy'
+            co = self.exchange.create_market_order(symbol, opp_side, contracts, reduce_only=True)
+            audit(symbol, opp_side, contracts, price, getattr(co,'id',None) or getattr(co,'order_id',None))
+            if co is not None and getattr(co, "state", None) == OrderState.REJECTED and any(
+                    marker in str(getattr(co, "last_error", "")).lower()
+                    for marker in ("position is zero", "position is flat", "no position", "position not found",
+                                   "position does not exist", "position size is zero")):
+                self._record_exchange_stop_flat(symbol)
+                self.risk_manager.release_position(symbol)
+                self.position_entry_cycle.pop(symbol, None)
+                self.position_targets.pop(symbol, None)
+                self.persist_state()
+                return
+            if co is None or getattr(co, "state", None) != OrderState.FILLED:
+                logger.error("[%s] Close fill is not confirmed; blocking entries until position reconciliation", symbol)
+                self.entries_blocked = True
+                try:
+                    self.exchange.get_position(symbol)
+                except Exception:
+                    pass
+                return
+            if co is not None:
+                journal_exit_fill = _order_fill_price(co, price)
+                live_exit_fee = _order_fee(co)
+            try:
+                self.exchange.cancel_all_orders(symbol)
+                audit(symbol, 'cancel', contracts, price, None, 'cancel')
+            except Exception:
+                pass
+        else:
+            self.exchange.close_position(symbol, price)
+            audit(symbol, 'close', contracts, price, None, 'fill')
+            meta = getattr(self, "paper_trade_meta", {}).pop(symbol, {})
+            exit_fee = reference_price * contracts * self.config.backtest.taker_fee
+            exit_slippage = reference_price * contracts * self.config.backtest.slippage
+            decision_fee = meta.get("entry_fee", 0.0) + exit_fee
+            decision_slippage = meta.get("entry_slippage", 0.0) + exit_slippage
+            if hold_minutes == "" and meta.get("entry_time"):
+                hold_minutes = max((getattr(self, "clock", datetime.now)() -
+                                    meta["entry_time"]).total_seconds() / 60.0, 0.0)
+            hold_for_funding = float(hold_minutes or 0.0)
+>           funding_cost = (entry * contracts * abs(float(self.config.backtest.funding_rate)) *
+                                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                            hold_for_funding / 480.0)
+E           AttributeError: 'types.SimpleNamespace' object has no attribute 'funding_rate'
+
+main.py:984: AttributeError
+------------------------------ Captured log call ------------------------------
+INFO     audit:main.py:60 fill symbol=BTC/USDT side=close qty=1.0 price=101.0 order_id=None
+============================== warnings summary ===============================
+tests/test_paper_parity.py: 8 warnings
+tests/test_risk_manager_1_1.py: 1 warning
+tests/test_live_guard.py: 5 warnings
+tests/test_trailing_stop.py: 3 warnings
+tests/test_restart_reconcile.py: 2 warnings
+tests/test_portfolio_profit_target.py: 8 warnings
+tests/test_adaptive_leverage.py: 4 warnings
+tests/test_backtester_costs.py: 26 warnings
+  C:\Users\webdeveloper\Downloads\rea-main\unified-crypto-scalper\core\risk_manager.py:93: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    else datetime.utcnow().date())
+
+tests/test_state.py::test_save_at_entry_persists
+tests/test_state.py::test_paper_state_never_touches_live_database
+  C:\Users\webdeveloper\Downloads\rea-main\unified-crypto-scalper\core\state.py:112: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    entry_time = datetime.utcnow().isoformat()
+
+tests/test_portfolio_profit_target.py::test_unrealized_target_crossing_liquidates_but_fees_can_leave_target_unmet
+tests/test_portfolio_profit_target.py::test_target_closes_every_paper_position_and_cancels_pending_entries
+tests/test_portfolio_profit_target.py::test_target_closes_every_paper_position_and_cancels_pending_entries
+  C:\Users\webdeveloper\Downloads\rea-main\unified-crypto-scalper\core\state.py:140: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    exit_time = datetime.utcnow().isoformat()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_paper_parity.py::test_position_allocation_cap_preserves_one_percent_risk_budget
+FAILED tests/test_paper_parity.py::test_process_symbol_fetches_mtf_history_and_applies_long_only[Signal.LONG-True-expected_entries0-entered]
+FAILED tests/test_paper_parity.py::test_run_metadata_records_effective_costs_and_context
+FAILED tests/test_paper_parity.py::test_process_symbol_enters_at_most_once_for_same_completed_bar
+FAILED tests/test_exit_time_fidelity.py::test_time_exit_uses_signal_close_and_includes_exact_limit
+FAILED tests/test_maker_entry.py::test_maker_entry_calls_create_limit_order
+FAILED tests/test_maker_entry.py::test_market_entry_uses_create_market_order
+FAILED tests/test_portfolio_profit_target.py::test_target_persists_through_session_resume
+FAILED tests/test_trade_journal.py::test_closed_trade_journals_excursions_r_and_stable_header
+9 failed, 110 passed, 62 warnings in 111.43s (0:01:51)

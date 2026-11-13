@@ -34,6 +34,7 @@ def make_bot(entry_mode='maker'):
     bot.risk_manager.current_balance = 10000
     bot.risk_manager.open_positions = {}
     bot.risk_manager.calculate_position_size.return_value = 0.01
+    bot.risk_manager.check_stop_loss_risk.return_value = (True, 'OK', 0.01)
     bot.risk_manager.check_portfolio_heat.return_value = (True, 'OK')
     bot.risk_manager.register_position = MagicMock()
     bot.risk_manager.update_position_price = MagicMock()

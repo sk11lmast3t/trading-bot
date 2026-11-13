@@ -13,8 +13,8 @@ load_dotenv()
 @dataclass
 class ExchangeConfig:
     name: str = os.getenv("EXCHANGE_NAME", "binance")
-    api_key: str = os.getenv("API_KEY", "")
-    api_secret: str = os.getenv("API_SECRET", "")
+    api_key: str = field(default_factory=lambda: os.getenv("API_KEY", ""), repr=False)
+    api_secret: str = field(default_factory=lambda: os.getenv("API_SECRET", ""), repr=False)
     testnet: bool = True
     demo: bool = os.getenv("DEMO", "false").lower() == "true"
     rate_limit: int = 1200
@@ -70,7 +70,7 @@ class StrategyConfig:
     bb_std: float = 2.0
     volume_sma_period: int = 20
     min_volume_multiplier: float = 1.2
-    orderbook_depth: int = 10
+    orderbook_depth: int = 20
     imbalance_threshold: float = 0.6
 
     # BNF 25-Period Disparity (Kairi-ritsu) Strategy
@@ -126,6 +126,26 @@ class RiskConfig:
 
 
 @dataclass
+class AdaptiveLeverageConfig:
+    """Paper-only portfolio margin and walk-forward evidence thresholds."""
+    enabled: bool = False
+    min_leverage: float = 1.0
+    max_leverage: float = 3.0
+    max_margin_allocation_pct: float = 0.50
+    max_gross_exposure_pct: float = 1.50
+    min_oos_trades: int = 100
+    edge_small: float = 0.02
+    edge_moderate: float = 0.05
+    edge_strong: float = 0.08
+    edge_exceptional: float = 0.12
+    reduce_drawdown_pct: float = 0.02
+    min_only_drawdown_pct: float = 0.04
+    maintenance_margin_rate: float = 0.01
+    history_window: int = 500
+    requested_max_leverage: Optional[float] = None
+
+
+@dataclass
 class ExecutionConfig:
     # Order retry
     max_order_retries: int = 3
@@ -151,6 +171,8 @@ class ExecutionConfig:
     entry_mode: str = "market"
     # Maker order timeout (seconds) before cancelling unfilled limit
     maker_cancel_seconds: int = 30
+    cost_safety_buffer_pct: float = 0.0002
+    minimum_expected_net_reward_pct: float = 0.0002
 
 
 
@@ -179,6 +201,17 @@ class BotConfig:
     risk: RiskConfig = field(default_factory=RiskConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
+    adaptive_leverage: AdaptiveLeverageConfig = field(default_factory=AdaptiveLeverageConfig)
+    portfolio_profit_target_pct: float = 70.0
+    portfolio_profit_target_enabled: bool = True
+    paper_session_id: str | None = None
+    strategy_names: Optional[List[str]] = None
+    timeframes: List[str] = field(default_factory=lambda: ["5m"])
+    exchange_timeframes: List[str] = field(default_factory=list)
+    timeframe_warnings: List[str] = field(default_factory=list)
+    min_timeframe_confirmations: int = 0
+    market_type: str = "spot"
+    market_leverage_evidence: bool = False
     log_level: str = "INFO"
     log_file: str = "logs/bot.log"
     mode: str = "paper"

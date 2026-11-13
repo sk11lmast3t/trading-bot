@@ -1,0 +1,245 @@
+﻿...FFFF............                                                      [100%]
+================================== FAILURES ===================================
+_______ test_strategy_failures_are_isolated_and_candle_fetch_is_cached ________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001ACD9CED5B0>
+
+    def test_strategy_failures_are_isolated_and_candle_fetch_is_cached(monkeypatch):
+        class Broken:
+            def __init__(self, config):
+                pass
+    
+            def analyze(self, frame):
+                raise RuntimeError("fixture")
+    
+        class Hold:
+            def __init__(self, config):
+                pass
+    
+            def analyze(self, frame):
+                return TradeSetup(Signal.HOLD)
+    
+        monkeypatch.setitem(STRATEGIES, "fixture_broken", StrategyInfo("fixture_broken", Broken, (), 1, "both"))
+        monkeypatch.setitem(STRATEGIES, "fixture_hold", StrategyInfo("fixture_hold", Hold, (), 1, "both"))
+    
+        class Exchange:
+            calls = 0
+    
+            def fetch_ohlcv(self, symbol, timeframe, limit):
+                self.calls += 1
+                return candles()
+    
+        exchange = Exchange()
+        cfg = BotConfig()
+        now = pd.Timestamp("2026-01-01 04:00")
+        engine = StrategyEngine(["fixture_broken", "fixture_hold"], ["5m"], cfg)
+>       setup, frame, timeframe, bar = engine.evaluate(exchange, "BTC/USDT", now=now)
+                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests\test_strategy_engine.py:77: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <core.strategy_engine.StrategyEngine object at 0x000001ACD9E1DBE0>
+exchange = <tests.test_strategy_engine.test_strategy_failures_are_isolated_and_candle_fetch_is_cached.<locals>.Exchange object at 0x000001ACCCAC6F90>
+symbol = 'BTC/USDT', now = Timestamp('2026-01-01 04:00:00')
+
+    def evaluate(self, exchange, symbol, now=None):
+        now = pd.Timestamp.now(tz="UTC").tz_localize(None) if now is None else pd.Timestamp(now)
+        if now.tzinfo is not None:
+            now = now.tz_convert("UTC").tz_localize(None)
+        data, changed = {}, False
+        self.last_rejection_reason.pop(symbol, None)
+        self.last_skip_reasons = getattr(self, "last_skip_reasons", {})
+        self.last_skip_reasons[symbol] = {}
+        newest_update = None
+        for timeframe in self.timeframes:
+            for name in self.strategy_names:
+>               if timeframe not in TIMEFRAME_RULES[name]:
+                                    ^^^^^^^^^^^^^^^^^^^^^
+E               KeyError: 'fixture_broken'
+
+core\strategy_engine.py:162: KeyError
+________ test_incremental_update_uses_since_and_reuses_indicator_frame ________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001ACD9CEDCD0>
+
+    def test_incremental_update_uses_since_and_reuses_indicator_frame(monkeypatch):
+        class Exchange:
+            def __init__(self):
+                self.since_values = []
+    
+            def fetch_ohlcv(self, symbol, timeframe, limit, since=None):
+                if since is None:
+                    return candles()
+                self.since_values.append(since)
+                return None
+    
+        class Hold:
+            def __init__(self, config):
+                pass
+    
+            def analyze(self, frame):
+                return TradeSetup(Signal.HOLD)
+    
+        from core.strategy_engine import STRATEGIES, StrategyInfo
+        monkeypatch.setitem(STRATEGIES, "fixture_hold", StrategyInfo("fixture_hold", Hold, (), 1, "both"))
+        calls = []
+        original = main.Indicators.calculate_all
+        monkeypatch.setattr(main.Indicators, "calculate_all", staticmethod(lambda frame, cfg: (calls.append(1), original(frame, cfg))[1]))
+        exchange = Exchange()
+        engine = StrategyEngine(["fixture_hold"], ["5m"], BotConfig())
+        first_now = pd.Timestamp("2026-01-01 04:00")
+>       engine.evaluate(exchange, "BTC/USDT", now=first_now)
+
+tests\test_strategy_engine.py:111: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <core.strategy_engine.StrategyEngine object at 0x000001ACD9E06D50>
+exchange = <tests.test_strategy_engine.test_incremental_update_uses_since_and_reuses_indicator_frame.<locals>.Exchange object at 0x000001ACD9E1C1A0>
+symbol = 'BTC/USDT', now = Timestamp('2026-01-01 04:00:00')
+
+    def evaluate(self, exchange, symbol, now=None):
+        now = pd.Timestamp.now(tz="UTC").tz_localize(None) if now is None else pd.Timestamp(now)
+        if now.tzinfo is not None:
+            now = now.tz_convert("UTC").tz_localize(None)
+        data, changed = {}, False
+        self.last_rejection_reason.pop(symbol, None)
+        self.last_skip_reasons = getattr(self, "last_skip_reasons", {})
+        self.last_skip_reasons[symbol] = {}
+        newest_update = None
+        for timeframe in self.timeframes:
+            for name in self.strategy_names:
+>               if timeframe not in TIMEFRAME_RULES[name]:
+                                    ^^^^^^^^^^^^^^^^^^^^^
+E               KeyError: 'fixture_hold'
+
+core\strategy_engine.py:162: KeyError
+____________ test_signal_from_same_closed_bar_is_emitted_only_once ____________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001ACD9D74CB0>
+
+    def test_signal_from_same_closed_bar_is_emitted_only_once(monkeypatch):
+        class Long:
+            def __init__(self, config):
+                pass
+    
+            def analyze(self, frame):
+                return TradeSetup(Signal.LONG, 100, 98, 104, 0.8, "long")
+    
+        from core.strategy_engine import STRATEGIES, StrategyInfo
+        monkeypatch.setitem(STRATEGIES, "fixture_long", StrategyInfo("fixture_long", Long, (), 1, "long"))
+    
+        class Exchange:
+            def fetch_ohlcv(self, symbol, timeframe, limit):
+                return candles()
+    
+        engine = StrategyEngine(["fixture_long"], ["5m"], BotConfig())
+        now = pd.Timestamp("2026-01-01 04:00")
+>       first = engine.evaluate(Exchange(), "BTC/USDT", now=now)[0]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests\test_strategy_engine.py:134: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <core.strategy_engine.StrategyEngine object at 0x000001ACD9E07ED0>
+exchange = <tests.test_strategy_engine.test_signal_from_same_closed_bar_is_emitted_only_once.<locals>.Exchange object at 0x000001ACD9E1DD30>
+symbol = 'BTC/USDT', now = Timestamp('2026-01-01 04:00:00')
+
+    def evaluate(self, exchange, symbol, now=None):
+        now = pd.Timestamp.now(tz="UTC").tz_localize(None) if now is None else pd.Timestamp(now)
+        if now.tzinfo is not None:
+            now = now.tz_convert("UTC").tz_localize(None)
+        data, changed = {}, False
+        self.last_rejection_reason.pop(symbol, None)
+        self.last_skip_reasons = getattr(self, "last_skip_reasons", {})
+        self.last_skip_reasons[symbol] = {}
+        newest_update = None
+        for timeframe in self.timeframes:
+            for name in self.strategy_names:
+>               if timeframe not in TIMEFRAME_RULES[name]:
+                                    ^^^^^^^^^^^^^^^^^^^^^
+E               KeyError: 'fixture_long'
+
+core\strategy_engine.py:162: KeyError
+_____________ test_conflicting_candidate_directions_are_rejected ______________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001ACD9E506B0>
+
+    def test_conflicting_candidate_directions_are_rejected(monkeypatch):
+        class Long:
+            def __init__(self, config):
+                pass
+    
+            def analyze(self, frame):
+                return TradeSetup(Signal.LONG, 100, 98, 104, 0.8, "long")
+    
+        class Short:
+            def __init__(self, config):
+                pass
+    
+            def analyze(self, frame):
+                return TradeSetup(Signal.SHORT, 100, 102, 96, 0.79, "short")
+    
+        monkeypatch.setitem(STRATEGIES, "fixture_long", StrategyInfo("fixture_long", Long, (), 1, "long"))
+        monkeypatch.setitem(STRATEGIES, "fixture_short", StrategyInfo("fixture_short", Short, (), 1, "short"))
+    
+        class Exchange:
+            def fetch_ohlcv(self, symbol, timeframe, limit):
+                return candles()
+    
+        cfg = BotConfig()
+        engine = StrategyEngine(["fixture_long", "fixture_short"], ["5m"], cfg)
+>       setup, _, _, _ = engine.evaluate(
+            Exchange(), "BTC/USDT", now=pd.Timestamp("2026-01-01 04:00"))
+
+tests\test_strategy_engine.py:164: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <core.strategy_engine.StrategyEngine object at 0x000001ACD9CEF950>
+exchange = <tests.test_strategy_engine.test_conflicting_candidate_directions_are_rejected.<locals>.Exchange object at 0x000001ACD9E1D2B0>
+symbol = 'BTC/USDT', now = Timestamp('2026-01-01 04:00:00')
+
+    def evaluate(self, exchange, symbol, now=None):
+        now = pd.Timestamp.now(tz="UTC").tz_localize(None) if now is None else pd.Timestamp(now)
+        if now.tzinfo is not None:
+            now = now.tz_convert("UTC").tz_localize(None)
+        data, changed = {}, False
+        self.last_rejection_reason.pop(symbol, None)
+        self.last_skip_reasons = getattr(self, "last_skip_reasons", {})
+        self.last_skip_reasons[symbol] = {}
+        newest_update = None
+        for timeframe in self.timeframes:
+            for name in self.strategy_names:
+>               if timeframe not in TIMEFRAME_RULES[name]:
+                                    ^^^^^^^^^^^^^^^^^^^^^
+E               KeyError: 'fixture_long'
+
+core\strategy_engine.py:162: KeyError
+============================== warnings summary ===============================
+tests/test_main_exits.py::TestMainExits::test_sl_hit_closes_position
+tests/test_main_exits.py::TestMainExits::test_time_exit
+tests/test_main_exits.py::TestMainExits::test_tp_hit
+tests/test_main_exits.py::TestMainExits::test_trailing_hit
+tests/test_risk_manager_1_1.py::test_register_position_stores_normalized_side
+  C:\Users\webdeveloper\Downloads\rea-main\unified-crypto-scalper\core\risk_manager.py:93: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    else datetime.utcnow().date())
+
+tests/test_main_exits.py::TestMainExits::test_sl_hit_closes_position
+tests/test_main_exits.py::TestMainExits::test_time_exit
+tests/test_main_exits.py::TestMainExits::test_tp_hit
+tests/test_main_exits.py::TestMainExits::test_trailing_hit
+  C:\Users\webdeveloper\Downloads\rea-main\unified-crypto-scalper\core\state.py:140: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    exit_time = datetime.utcnow().isoformat()
+
+tests/test_state.py::test_save_at_entry_persists
+tests/test_state.py::test_paper_state_never_touches_live_database
+  C:\Users\webdeveloper\Downloads\rea-main\unified-crypto-scalper\core\state.py:112: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    entry_time = datetime.utcnow().isoformat()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_strategy_engine.py::test_strategy_failures_are_isolated_and_candle_fetch_is_cached
+FAILED tests/test_strategy_engine.py::test_incremental_update_uses_since_and_reuses_indicator_frame
+FAILED tests/test_strategy_engine.py::test_signal_from_same_closed_bar_is_emitted_only_once
+FAILED tests/test_strategy_engine.py::test_conflicting_candidate_directions_are_rejected
+4 failed, 15 passed, 11 warnings in 19.80s

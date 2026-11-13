@@ -81,6 +81,8 @@ class RiskManager:
         self.clock = clock or getattr(config, "clock", None) or datetime.now
         self.daily_pnl = 0.0
         self.peak_balance = config.scalping.initial_capital
+        self.peak_equity = config.scalping.initial_capital
+        self.max_drawdown_pct = 0.0
         self.current_balance = config.scalping.initial_capital
         self.consecutive_losses = 0
         self.daily_trades = 0
@@ -148,14 +150,23 @@ class RiskManager:
             return False, f"Portfolio heat limit ({total_heat:.2f} > {max_portfolio_notional:.2f})"
         return True, "OK"
 
-    def register_position(self, symbol: str, notional_value: float, side: str):
+    def register_position(self, symbol: str, notional_value: float, side: str,
+                          leverage: float = 1.0, margin: float = 0.0,
+                          quantity: float = 0.0, strategy: str = "",
+                          stop_price: Optional[float] = None):
         side = normalize_side(side)
         self.symbol_exposure[symbol] = self.symbol_exposure.get(symbol, 0.0) + notional_value
         self.open_positions[symbol] = {
             'notional': notional_value,
+            'margin': margin or notional_value / max(float(leverage), 1.0),
+            'leverage': float(leverage),
+            'quantity': float(quantity),
+            'strategy': strategy,
+            'stop_price': stop_price,
             'side': side,
             'entry_time': self.clock(),
             'entry_price': None,
+            'mark_price': None,
             'high_watermark': None,
             'low_watermark': None,
             'trailing_stop': None,
@@ -167,8 +178,27 @@ class RiskManager:
         if not pos:
             return
         pos['entry_price'] = pos.get('entry_price') or price
+        pos['mark_price'] = float(price)
         pos['high_watermark'] = max(pos.get('high_watermark') or price, price)
         pos['low_watermark'] = min(pos.get('low_watermark') or price, price)
+        self._refresh_equity_drawdown()
+
+    def _refresh_equity_drawdown(self):
+        if getattr(self.config, "mode", "paper") != "paper":
+            return
+        unrealized = 0.0
+        for position in self.open_positions.values():
+            entry = float(position.get('entry_price') or 0.0)
+            mark = float(position.get('mark_price') or entry)
+            quantity = float(position.get('quantity') or 0.0)
+            side = position.get('side', 'long')
+            if entry > 0 and mark > 0 and quantity > 0:
+                unrealized += (mark - entry) * quantity * (1.0 if side == 'long' else -1.0)
+        equity = self.current_balance + unrealized
+        self.peak_equity = max(getattr(self, 'peak_equity', self.peak_balance), equity)
+        drawdown = ((self.peak_equity - equity) / self.peak_equity
+                    if self.peak_equity > 0 else 0.0)
+        self.max_drawdown_pct = max(self.max_drawdown_pct, drawdown)
 
     def check_trailing_stop(self, symbol: str, price: float) -> Tuple[bool, str]:
         """Return (should_exit, reason) if trailing stop or breakeven is hit."""
@@ -224,6 +254,7 @@ class RiskManager:
         if symbol in self.symbol_exposure:
             del self.symbol_exposure[symbol]
         self.open_positions.pop(symbol, None)
+        self._refresh_equity_drawdown()
 
     def calculate_position_size(self, capital: float, entry: float, stop_loss: float,
                                 atr: Optional[float] = None) -> float:
@@ -243,10 +274,71 @@ class RiskManager:
             return 0.0
 
         max_size_value = capital * self.rc.max_position_size_pct
-        size_value = min((capital * risk_pct) / price_risk * entry, max_size_value)
+        costs_per_unit = self.stop_costs_per_unit(entry, stop_loss)
+        effective_risk_per_unit = price_risk + costs_per_unit
+        size_value = min((capital * risk_pct) / effective_risk_per_unit * entry, max_size_value)
         return size_value / entry
 
-    def record_trade(self, pnl: float, symbol: str = "", trade_time: Optional[datetime] = None):
+    def stop_costs_per_unit(self, entry: float, stop: float) -> float:
+        """Estimated entry/closing costs and funding per unit at the planned stop."""
+        costs = getattr(self.config, "backtest", None)
+        execution = getattr(self.config, "execution", None)
+        if costs is None:
+            return 0.0
+        maker = getattr(execution, "entry_mode", "market") == "maker"
+        entry_fee = costs.maker_fee if maker else costs.taker_fee
+        entry_slip = 0.0 if maker else costs.slippage
+        exit_fee, exit_slip = costs.taker_fee, costs.slippage
+        hold_minutes = float(self.rc.max_hold_time_minutes)
+        funding = abs(float(getattr(costs, "funding_rate", 0.0) or 0.0)) * hold_minutes / 480.0
+        return (float(entry) * (entry_fee + entry_slip + funding) +
+                float(stop) * (exit_fee + exit_slip))
+
+    def stop_risk_for_position(self, position: dict) -> Optional[float]:
+        try:
+            entry = float(position.get("entry_price") or position.get("entryPrice") or 0.0)
+            stop = float(position.get("stop_price") or position.get("sl") or 0.0)
+            quantity = float(position.get("quantity") or position.get("contracts") or position.get("size") or 0.0)
+            side = normalize_side(position.get("side", "long"))
+        except (TypeError, ValueError):
+            return None
+        if min(entry, stop, quantity) <= 0:
+            return None
+        distance = max(0.0, entry - stop) if side == "long" else max(0.0, stop - entry)
+        return distance * quantity + quantity * self.stop_costs_per_unit(entry, stop)
+
+    def current_equity(self) -> float:
+        """Realized balance plus open-position unrealized PnL (paper mark)."""
+        unrealized = 0.0
+        for position in self.open_positions.values():
+            entry = float(position.get('entry_price') or 0.0)
+            mark = float(position.get('mark_price') or entry)
+            quantity = float(position.get('quantity') or 0.0)
+            side = position.get('side', 'long')
+            if entry > 0 and mark > 0 and quantity > 0:
+                unrealized += (mark - entry) * quantity * (1.0 if side == 'long' else -1.0)
+        return self.current_balance + unrealized
+
+    def check_stop_loss_risk(self, entry: float, stop: float, quantity: float,
+                             side: str = "long") -> Tuple[bool, str, float]:
+        active_risk = 0.0
+        for position in self.open_positions.values():
+            risk = self.stop_risk_for_position(position)
+            if risk is None:
+                return False, "cannot price existing position stop risk", float("inf")
+            active_risk += risk
+        candidate = self.stop_risk_for_position({
+            "entry_price": entry, "stop_price": stop, "quantity": quantity, "side": side
+        })
+        total = active_risk + (candidate or 0.0)
+        budget = self.current_equity() * min(float(self.rc.risk_per_trade), 0.01)
+        if total > budget + max(1e-9, budget * 1e-9):
+            return False, f"aggregate stop risk ${total:.6f} exceeds 1% budget ${budget:.6f}", total
+        return True, "OK", total
+
+    def record_trade(self, pnl: float, symbol: str = "", trade_time: Optional[datetime] = None,
+                     *, strategy: str = "", net_return: Optional[float] = None,
+                     selected_leverage: float = 1.0, expected_value: Optional[float] = None):
         t_time = trade_time or self.clock()
         self.daily_pnl += pnl
         self.current_balance += pnl
@@ -259,11 +351,23 @@ class RiskManager:
             self.consecutive_losses += 1
         if self.current_balance > self.peak_balance:
             self.peak_balance = self.current_balance
+        drawdown = ((self.peak_balance - self.current_balance) / self.peak_balance
+                    if self.peak_balance > 0 else 0.0)
+        self.max_drawdown_pct = max(self.max_drawdown_pct, drawdown)
+        if not self.open_positions:
+            self.peak_equity = max(self.peak_equity, self.current_balance)
+            equity_drawdown = ((self.peak_equity - self.current_balance) / self.peak_equity
+                               if self.peak_equity > 0 else 0.0)
+            self.max_drawdown_pct = max(self.max_drawdown_pct, equity_drawdown)
         self.trade_log.append({
             'timestamp': t_time.isoformat() if hasattr(t_time, 'isoformat') else str(t_time),
             'symbol': symbol,
             'pnl': pnl,
-            'balance': self.current_balance
+            'balance': self.current_balance,
+            'strategy': strategy,
+            'net_return': net_return,
+            'selected_leverage': float(selected_leverage),
+            'expected_value': expected_value,
         })
         tag = "WIN" if pnl >= 0 else "LOSS"
         logger.info(f"[{tag}] PnL: ${pnl:.4f} | New Bal: ${self.current_balance:.2f} | Streak: {self.consecutive_losses}")
@@ -283,8 +387,54 @@ class RiskManager:
         losses = total - wins
         total_pnl = sum(t['pnl'] for t in self.trade_log)
         wr = (wins / total * 100) if total > 0 else 0
-        dd = (self.peak_balance - self.current_balance) / self.peak_balance * 100 if self.peak_balance > 0 else 0
+        current_unrealized = sum(
+            (float(p.get('mark_price') or p.get('entry_price') or 0.0) -
+             float(p.get('entry_price') or 0.0)) * float(p.get('quantity') or 0.0) *
+            (1.0 if p.get('side', 'long') == 'long' else -1.0)
+            for p in self.open_positions.values()
+            if float(p.get('entry_price') or 0.0) > 0 and float(p.get('quantity') or 0.0) > 0
+        )
+        current_equity = self.current_balance + current_unrealized
+        if getattr(self.config, "mode", "paper") == "paper":
+            current_dd = ((self.peak_equity - current_equity) / self.peak_equity * 100
+                          if self.peak_equity > 0 else 0.0)
+            dd = max(self.max_drawdown_pct * 100.0, current_dd)
+        else:
+            dd = ((self.peak_balance - self.current_balance) / self.peak_balance * 100
+                  if self.peak_balance > 0 else 0.0)
         halted, halt_reason = self.circuit_breaker.is_halted()
+        unrealized = used_margin = gross_exposure = portfolio_heat = 0.0
+        unpriced_stop_risk_positions = 0
+        open_leverages = []
+        for position in self.open_positions.values():
+            entry = float(position.get('entry_price') or 0.0)
+            mark = float(position.get('mark_price') or entry)
+            quantity = float(position.get('quantity') or 0.0)
+            side = position.get('side', 'long')
+            if quantity > 0 and entry > 0 and mark > 0:
+                unrealized += (mark - entry) * quantity * (1.0 if side == 'long' else -1.0)
+                gross_exposure += mark * quantity
+            else:
+                gross_exposure += float(position.get('notional') or 0.0)
+            used_margin += float(position.get('margin') or 0.0)
+            stop_risk = self.stop_risk_for_position(position)
+            if stop_risk is None:
+                unpriced_stop_risk_positions += 1
+            else:
+                portfolio_heat += stop_risk
+            open_leverages.append(float(position.get('leverage') or 1.0))
+        equity = self.current_balance + unrealized
+        adaptive = getattr(self.config, 'adaptive_leverage', None)
+        # The aggregate margin-allocation cap applies whether or not adaptive
+        # leverage is enabled; disabling adaptive mode must not silently raise
+        # the allocation ceiling to 100% of equity.
+        margin_pct = (float(getattr(adaptive, 'max_margin_allocation_pct', 0.50))
+                      if adaptive is not None else 0.50)
+        margin_pct = min(max(margin_pct, 0.0), 1.0)
+        available_account_equity = max(0.0, equity - used_margin)
+        remaining_margin_capacity = max(0.0, equity * margin_pct - used_margin)
+        available_margin = min(available_account_equity, remaining_margin_capacity)
+        leverage_values = [float(t.get('selected_leverage') or 1.0) for t in self.trade_log]
         return {
             'total_trades': total,
             'wins': wins,
@@ -292,9 +442,29 @@ class RiskManager:
             'win_rate': wr,
             'total_pnl': total_pnl,
             'max_drawdown': dd,
+            'max_drawdown_pct': dd,  # percentage points, matching the UI label
+            'max_drawdown_fraction': dd / 100.0,
             'balance': self.current_balance,
+            'portfolio_equity': equity,
+            'realized_pnl': total_pnl,
+            'unrealized_pnl': unrealized,
+            'current_leverage': max(open_leverages, default=1.0),
+            'average_leverage': (sum(leverage_values) / len(leverage_values)
+                                 if leverage_values else 1.0),
+            'maximum_leverage_used': max(leverage_values + open_leverages, default=1.0),
+            'total_margin_used': used_margin,
+            'available_margin': available_margin,
+            'available_account_equity': available_account_equity,
+            'remaining_margin_capacity': remaining_margin_capacity,
+            'margin_allocation_cap': equity * margin_pct,
+            'total_gross_exposure': gross_exposure,
+            'gross_exposure_pct': gross_exposure / equity * 100.0 if equity > 0 else 0.0,
             'peak': self.peak_balance,
-            'portfolio_heat': sum(self.symbol_exposure.values()),
+            'portfolio_heat': portfolio_heat,
+            'portfolio_heat_pct': portfolio_heat / equity * 100.0 if equity > 0 else 0.0,
+            'unpriced_stop_risk_positions': unpriced_stop_risk_positions,
+            'stop_risk_budget': self.current_equity() * min(float(self.rc.risk_per_trade), 0.01),
+            'stop_risk_budget_pct': min(float(self.rc.risk_per_trade), 0.01) * 100.0,
             'circuit_breaker_halted': halted,
             'circuit_breaker_reason': halt_reason,
         }

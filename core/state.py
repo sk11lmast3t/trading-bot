@@ -20,6 +20,12 @@ def set_mode(mode):
     _MODE = mode
 
 
+def set_database(path):
+    """Use an explicit persistence file for an isolated paper session."""
+    global DB_PATH
+    DB_PATH = Path(path)
+
+
 def _conn():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
@@ -40,14 +46,30 @@ def _init(conn):
         sl REAL,
         strategy TEXT,
         entry_time TEXT,
-        status TEXT
+        status TEXT,
+        leverage REAL NOT NULL DEFAULT 1.0,
+        margin REAL NOT NULL DEFAULT 0.0
     );
     CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         pnl REAL,
+        gross_pnl REAL,
         symbol TEXT,
         exit_reason TEXT,
-        exit_time TEXT
+        exit_time TEXT,
+        strategy TEXT,
+        notional REAL,
+        net_return REAL,
+        prediction_probability REAL,
+        probability_lower_bound REAL,
+        break_even_probability REAL,
+        expected_value REAL,
+        selected_leverage REAL NOT NULL DEFAULT 1.0,
+        required_margin REAL,
+        funding_cost REAL,
+        fees REAL NOT NULL DEFAULT 0.0,
+        slippage REAL NOT NULL DEFAULT 0.0,
+        oos_validated INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS risk_state (
         key TEXT PRIMARY KEY,
@@ -60,17 +82,39 @@ def _init(conn):
         payload TEXT
     );
     """)
+    migrations = {
+        "positions": {
+            "leverage": "REAL NOT NULL DEFAULT 1.0",
+            "margin": "REAL NOT NULL DEFAULT 0.0",
+        },
+        "trades": {
+            "strategy": "TEXT", "notional": "REAL", "net_return": "REAL",
+            "gross_pnl": "REAL",
+            "prediction_probability": "REAL", "probability_lower_bound": "REAL",
+            "break_even_probability": "REAL", "expected_value": "REAL",
+            "selected_leverage": "REAL NOT NULL DEFAULT 1.0",
+            "required_margin": "REAL", "funding_cost": "REAL",
+            "fees": "REAL NOT NULL DEFAULT 0.0", "slippage": "REAL NOT NULL DEFAULT 0.0",
+            "oos_validated": "INTEGER NOT NULL DEFAULT 0",
+        },
+    }
+    for table, columns in migrations.items():
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for column, declaration in columns.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
     conn.commit()
 
 
-def save_position_at_entry(symbol, side, size, entry_price, tp, sl, strategy, entry_time=None, status="open"):
+def save_position_at_entry(symbol, side, size, entry_price, tp, sl, strategy,
+                           entry_time=None, status="open", leverage=1.0, margin=0.0):
     if entry_time is None:
         entry_time = datetime.utcnow().isoformat()
     conn = _conn()
     try:
         conn.execute(
-            "INSERT INTO positions (symbol, side, size, entry_price, tp, sl, strategy, entry_time, status) VALUES (?,?,?,?,?,?,?,?,?)",
-            (symbol, side, size, entry_price, tp, sl, strategy, entry_time, status),
+            "INSERT INTO positions (symbol, side, size, entry_price, tp, sl, strategy, entry_time, status, leverage, margin) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (symbol, side, size, entry_price, tp, sl, strategy, entry_time, status, leverage, margin),
         )
         conn.commit()
     finally:
@@ -86,12 +130,28 @@ def close_position(symbol, status="closed"):
         conn.close()
 
 
-def record_trade(pnl, symbol, exit_reason, exit_time=None):
+def record_trade(pnl, symbol, exit_reason, exit_time=None, *, strategy="", notional=None,
+                 net_return=None, prediction_probability=None,
+                 probability_lower_bound=None, break_even_probability=None,
+                 expected_value=None, selected_leverage=1.0, required_margin=None,
+                 funding_cost=0.0, fees=0.0, slippage=0.0, gross_pnl=None,
+                 oos_validated=False):
     if exit_time is None:
         exit_time = datetime.utcnow().isoformat()
     conn = _conn()
     try:
-        conn.execute("INSERT INTO trades (pnl, symbol, exit_reason, exit_time) VALUES (?,?,?,?)", (pnl, symbol, exit_reason, exit_time))
+        conn.execute(
+            """INSERT INTO trades (
+                pnl, gross_pnl, symbol, exit_reason, exit_time, strategy, notional, net_return,
+                prediction_probability, probability_lower_bound,
+                break_even_probability, expected_value, selected_leverage,
+                required_margin, funding_cost, fees, slippage, oos_validated
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (pnl, gross_pnl, symbol, exit_reason, exit_time, strategy, notional, net_return,
+             prediction_probability, probability_lower_bound, break_even_probability,
+             expected_value, selected_leverage, required_margin, funding_cost, fees, slippage,
+             int(bool(oos_validated))),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -139,6 +199,86 @@ def load_risk_state():
         return out
     finally:
         conn.close()
+
+
+def load_strategy_trades(strategy, limit=500, before=None):
+    """Load validated completed outcomes, optionally closed strictly before an entry time."""
+    conn = _conn()
+    try:
+        cutoff = before.isoformat() if hasattr(before, "isoformat") else before
+        cutoff_sql = " AND exit_time < ?" if cutoff is not None else ""
+        rows = conn.execute(
+            f"""SELECT id, exit_time, strategy, net_return, prediction_probability,
+                      probability_lower_bound, break_even_probability, expected_value,
+                      selected_leverage, oos_validated
+               FROM trades WHERE strategy=? AND oos_validated=1 AND net_return IS NOT NULL{cutoff_sql}
+               ORDER BY id DESC LIMIT ?""",
+            ((str(strategy), cutoff, max(1, int(limit))) if cutoff is not None
+             else (str(strategy), max(1, int(limit)))),
+        ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+    finally:
+        conn.close()
+
+
+def strategy_performance():
+    """Summarize realized paper outcomes by stored strategy@timeframe label."""
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            """SELECT strategy, symbol, net_return, pnl, fees, slippage, oos_validated FROM trades
+               WHERE strategy IS NOT NULL AND strategy != '' AND net_return IS NOT NULL
+               ORDER BY id"""
+        ).fetchall()
+    finally:
+        conn.close()
+    grouped = {}
+    for row in rows:
+        item = grouped.setdefault(row["strategy"], {"returns": [], "oos": 0, "symbols": {}})
+        value = float(row["net_return"])
+        item["returns"].append(value)
+        item["oos"] += int(bool(row["oos_validated"]))
+        symbol = item["symbols"].setdefault(row["symbol"], {"returns": [], "oos": 0})
+        symbol["returns"].append(value)
+        symbol["oos"] += int(bool(row["oos_validated"]))
+    result = {}
+    for strategy, item in grouped.items():
+        returns = item["returns"]
+        wins = [value for value in returns if value > 0]
+        losses = [-value for value in returns if value < 0]
+        equity = peak = 1.0
+        max_drawdown = 0.0
+        loss_streak = max_loss_streak = 0
+        for value in returns:
+            equity *= 1.0 + value
+            peak = max(peak, equity)
+            max_drawdown = max(max_drawdown, (peak - equity) / peak if peak else 0.0)
+            loss_streak = loss_streak + 1 if value < 0 else 0
+            max_loss_streak = max(max_loss_streak, loss_streak)
+        symbol_metrics = {}
+        for symbol_name, symbol_stats in item["symbols"].items():
+            values = symbol_stats["returns"]
+            symbol_metrics[symbol_name] = {
+                "completed": len(values), "oos_validated": symbol_stats["oos"],
+                "win_rate": sum(v > 0 for v in values) / len(values),
+                "net_expectancy": sum(values) / len(values),
+            }
+        result[strategy] = {
+            "completed": len(returns), "oos_validated": item["oos"],
+            "win_rate": len(wins) / len(returns) if returns else 0.0,
+            "average_win": sum(wins) / len(wins) if wins else 0.0,
+            "average_loss": sum(losses) / len(losses) if losses else 0.0,
+            "net_expectancy": sum(returns) / len(returns) if returns else 0.0,
+            "profit_factor": sum(wins) / sum(losses) if losses else (float("inf") if wins else 0.0),
+            "fees": sum(float(row["fees"] or 0) for row in rows if row["strategy"] == strategy),
+            "slippage": sum(float(row["slippage"] or 0) for row in rows if row["strategy"] == strategy),
+            "max_drawdown": max_drawdown, "max_consecutive_losses": max_loss_streak,
+            "wilson_win_rate_lower_bound": __import__(
+                "core.adaptive_leverage", fromlist=["wilson_lower_bound"]
+            ).wilson_lower_bound(len(wins), len(returns)),
+            "symbols": symbol_metrics,
+        }
+    return result
 
 
 def report(days=7):

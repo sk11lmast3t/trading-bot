@@ -139,7 +139,12 @@ def run_bot(frame, symbol, cfg, start, end):
         log = bot.risk_manager.trade_log[-1]
         reference = float(kwargs.get("reference_price", price))
         exit_fee = reference * float(before["contracts"]) * cfg.backtest.taker_fee
-        exit_slippage = reference * float(before["contracts"]) * cfg.backtest.slippage
+        # Mirror main._close_position: a take-profit is a resting limit and pays
+        # no exit slippage, while stops/time exits pay the configured rate.
+        slip_rate = kwargs.get("exit_slippage_rate")
+        if slip_rate is None:
+            slip_rate = cfg.backtest.slippage
+        exit_slippage = reference * float(before["contracts"]) * max(0.0, float(slip_rate))
         completed.append({"side": before["side"], "entry_time": entry_time,
             "signal_bar_open": entry_time - timedelta(minutes=5),
             "entry_price": float(before["entryPrice"]), "exit_price": float(price),
@@ -298,7 +303,17 @@ def compare(bot_trades, bt_trades, frame, bt_obj=None):
                        t.exit_slip, t.exit_price * t.size),
         )
         if any(abs(diff) > 1e-10 for diff in rate_diffs):
-            causes.append("slippage/fee formula")
+            # A take-profit is a resting limit in the paper bot (no exit
+            # slippage) but a market fill in the backtester (pays slippage).
+            # Label that deliberate model difference instead of calling it a
+            # formula bug. Any other cost-rate difference stays generic.
+            tp_limit_only = (
+                bot_reason == bt_reason == "TP"
+                and all(abs(diff) <= 1e-10 for diff in rate_diffs[:3])
+                and abs(rate_diffs[3]) > 1e-10
+            )
+            causes.append("TP limit vs market slippage model" if tp_limit_only
+                          else "slippage/fee formula")
         if abs(pnl_bps) > 1e-9 and not causes:
             causes.append("other pnl mismatch")
         causes = list(dict.fromkeys(causes))

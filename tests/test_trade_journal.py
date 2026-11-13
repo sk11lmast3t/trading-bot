@@ -128,6 +128,77 @@ def test_closed_trade_journals_excursions_r_and_stable_header(tmp_path, monkeypa
     assert len(rows[0]) == len(main.DECISION_FIELDS)
 
 
+def close_bot(tmp_path, monkeypatch, *, mode="paper"):
+    bot = main.UnifiedCryptoBot.__new__(main.UnifiedCryptoBot)
+    bot.config = SimpleNamespace(
+        mode=mode,
+        backtest=SimpleNamespace(taker_fee=0.0005, slippage=0.0003, funding_rate=0.0),
+    )
+    bot.clock = lambda: datetime(2026, 4, 6, 12, 25)
+    bot._clock_uses_local_timezone = False
+    bot.exchange = MagicMock()
+    bot.risk_manager = MagicMock()
+    bot.risk_manager.current_balance = 1000.0
+    bot.position_entry_cycle = {}
+    bot.position_targets = {}
+    bot.active_decisions = {}
+    bot.paper_trade_meta = {}
+    bot.persist_state = MagicMock()
+    monkeypatch.setattr(main.state, "record_trade", MagicMock())
+    return bot
+
+
+def test_take_profit_net_pnl_is_gross_minus_fees_and_entry_slippage(tmp_path, monkeypatch):
+    bot = close_bot(tmp_path, monkeypatch)
+    bot.paper_trade_meta["BTC/USDT"] = {"entry_fee": 0.05, "entry_slippage": 0.03}
+
+    bot._close_position(
+        "BTC/USDT", {"entryPrice": 100.0, "contracts": 1.0, "side": "long"},
+        110.0, "TAKE PROFIT", reference_price=110.0, exit_slippage_rate=0.0,
+    )
+
+    net = bot.risk_manager.record_trade.call_args.args[0]
+    assert net == pytest.approx(10.0 - 0.05 - 0.03 - 110.0 * 0.0005)
+    kwargs = main.state.record_trade.call_args.kwargs
+    assert kwargs["gross_pnl"] == pytest.approx(10.0)
+    assert kwargs["fees"] == pytest.approx(0.05 + 110.0 * 0.0005)
+    assert kwargs["slippage"] == pytest.approx(0.03)  # no exit slippage on a TP
+
+
+def test_short_take_profit_net_pnl_is_positive_and_exit_slippage_is_zero(tmp_path, monkeypatch):
+    bot = close_bot(tmp_path, monkeypatch)
+    bot.paper_trade_meta["ETH/USDT"] = {"entry_fee": 0.1, "entry_slippage": 0.06}
+
+    bot._close_position(
+        "ETH/USDT", {"entryPrice": 2000.0, "contracts": 0.1, "side": "short"},
+        1990.0, "TAKE PROFIT", reference_price=1990.0, exit_slippage_rate=0.0,
+    )
+
+    net = bot.risk_manager.record_trade.call_args.args[0]
+    assert net == pytest.approx(1.0 - 0.1 - 0.06 - 1990.0 * 0.1 * 0.0005)
+    assert net > 0
+    kwargs = main.state.record_trade.call_args.kwargs
+    assert kwargs["gross_pnl"] == pytest.approx(1.0)
+    assert kwargs["slippage"] == pytest.approx(0.06)
+
+
+def test_stop_loss_net_pnl_includes_adverse_exit_slippage(tmp_path, monkeypatch):
+    bot = close_bot(tmp_path, monkeypatch)
+    bot.paper_trade_meta["BTC/USDT"] = {"entry_fee": 0.05, "entry_slippage": 0.03}
+    trigger = 95.0
+    fill = trigger * (1 - 0.001)
+
+    bot._close_position(
+        "BTC/USDT", {"entryPrice": 100.0, "contracts": 1.0, "side": "long"},
+        fill, "STOP LOSS", reference_price=trigger, exit_slippage_rate=0.001,
+    )
+
+    net = bot.risk_manager.record_trade.call_args.args[0]
+    expected = (-5.0 - 0.05 - 0.03 - 95.0 * 0.0005 - 95.0 * 0.001)
+    assert net == pytest.approx(expected)
+    assert net < -5.0
+
+
 def test_skipped_signal_is_logged_with_context_columns(tmp_path, monkeypatch):
     cfg = BotConfig()
     cfg.scalping.scan_all_coins = False

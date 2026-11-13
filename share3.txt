@@ -1,0 +1,1565 @@
+﻿
+===== FILE: main.py =====
+
+"""
+Unified Crypto Scalper & Disparity Bot - Main Entry Point
+Integrates:
+- Real-time technical scalping (Freqtrade / Jesse AI)
+- High-frequency OrderBook microstructure & trade delta flow (Hummingbot)
+- Anti-drawdown risk management & grid accumulation (Passivbot)
+- Takashi Kotegawa (BNF) 25-Period Disparity (Kairi-ritsu) panic buying
+- Deep learning GRU price trend validation
+"""
+import time
+import logging
+import os
+import json
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+import pandas as pd
+from rich.console import Console
+from rich.table import Table
+
+from config.settings import BotConfig
+from core.indicators import Indicators
+from core.strategies import get_strategy, Signal
+from core.exchange import ExchangeConnector, PaperExchange, OrderState
+from core.risk_manager import RiskManager
+from core import state
+from core.gru_predictor import GRUPredictor
+
+console = Console()
+os.makedirs('logs', exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('logs/bot.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+os.makedirs('logs', exist_ok=True)
+audit_logger = logging.getLogger('audit')
+audit_logger.setLevel(logging.INFO)
+if not audit_logger.handlers:
+    ah = logging.FileHandler('logs/audit.log')
+    ah.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+    audit_logger.addHandler(ah)
+def audit(symbol, side, qty, price, order_id, action='send'):
+    audit_logger.info(f"{action} symbol={symbol} side={side} qty={qty} price={price} order_id={order_id}")
+
+
+class UnifiedCryptoBot:
+    def __init__(self, config=None):
+        self.config = config or BotConfig()
+        self.strategy = get_strategy(self.config)
+        self.risk_manager = RiskManager(self.config)
+        self.gru_predictor = GRUPredictor(
+            model_path=self.config.strategy.gru_model_path,
+            scaler_path=self.config.strategy.gru_scaler_path,
+            lookback=self.config.strategy.gru_lookback
+        )
+        self.running = False
+        self.cycle_count = 0
+        self.position_entry_cycle = {}
+        self.position_targets = {}
+        self.entries_blocked = False
+        self.loaded_positions = []
+        self.last_rejection_log = {}
+        self.trade_lock = threading.Lock()
+        self.last_symbol_refresh = 0
+
+        if self.config.mode == "live":
+            self.exchange = ExchangeConnector(self.config).connect()
+        else:
+            self.exchange = PaperExchange(self.config)
+
+        if self.config.scalping.scan_all_coins:
+            self.refresh_symbols()
+
+        self.load_state()
+
+    def refresh_symbols(self):
+        try:
+            logger.info("Scanning market for active liquid trading pairs...")
+            discovered = self.exchange.fetch_active_symbols(
+                limit=self.config.scalping.max_symbols_to_scan,
+                min_volume=self.config.scalping.min_24h_volume_usd,
+                exclude=self.config.scalping.exclude_coins
+            )
+            if discovered:
+                self.config.scalping.symbols = discovered
+                self.last_symbol_refresh = time.time()
+                logger.info(f"Market scan complete. Dynamically tracking {len(discovered)} coins: {', '.join(discovered[:8])}...")
+        except Exception as e:
+            logger.warning(f"Error during market symbol refresh: {e}")
+
+    def show_banner(self):
+        console.print("[bold cyan]====================================================[/bold cyan]")
+        console.print("[bold green]  UNIFIED CRYPTO SCALPER & DISPARITY BOT (100% PYTHON) [/bold green]")
+        console.print("[bold cyan]====================================================[/bold cyan]")
+        console.print(f"Mode: [yellow]{self.config.mode.upper()}[/yellow] | Strategy: [magenta]{self.config.strategy.active_strategy}[/magenta]")
+        sym_list = self.config.scalping.symbols
+        display_syms = ', '.join(sym_list[:8]) + (f" ... (+{len(sym_list)-8} more)" if len(sym_list) > 8 else "")
+        console.print(f"Symbols ({len(sym_list)} total): {display_syms}")
+        console.print(f"Timeframe: {self.config.scalping.timeframe} | Leverage: {self.config.scalping.leverage}x | Workers: {self.config.scalping.parallel_workers}")
+        console.print(f"Disparity Period: {self.config.strategy.disparity_period} (Panic Thresh: {self.config.strategy.disparity_panic_threshold}%)")
+        console.print("[bold cyan]----------------------------------------------------[/bold cyan]")
+
+    def process_symbol(self, symbol: str):
+        if getattr(self, "entries_blocked", False) and symbol not in getattr(self.risk_manager, "open_positions", {}):
+            try:
+                self.check_exits(symbol)
+            except Exception:
+                pass
+            return
+        try:
+            # 1. Fetch OHLCV
+            df = self.exchange.fetch_ohlcv(symbol, self.config.scalping.timeframe, 201)
+            if df is None or len(df) < 30:
+                return
+            df = df.iloc[:-1]
+
+            # 2. Vectorized Indicators & Disparity
+            df = Indicators.calculate_all(df, self.config)
+
+            # 3. Strategy Evaluation
+            setup = self.strategy.analyze(df)
+            if setup.signal == Signal.HOLD:
+                return
+
+            # 4. Optional GRU Deep Learning Directional Filter
+            if self.config.strategy.use_gru_filter and self.gru_predictor.model is not None:
+                predicted_price = self.gru_predictor.predict_next_price(df)
+                if predicted_price is not None:
+                    curr_price = df['close'].iloc[-1]
+                    if setup.signal == Signal.LONG and predicted_price < curr_price:
+                        last_time = self.last_rejection_log.get((symbol, "gru_long"), 0)
+                        if time.time() - last_time > 300:
+                            logger.info(f"[{symbol}] LONG signal filtered out by GRU forecast (${predicted_price:.2f} < ${curr_price:.2f})")
+                            self.last_rejection_log[(symbol, "gru_long")] = time.time()
+                        return
+                    elif setup.signal == Signal.SHORT and predicted_price > curr_price:
+                        last_time = self.last_rejection_log.get((symbol, "gru_short"), 0)
+                        if time.time() - last_time > 300:
+                            logger.info(f"[{symbol}] SHORT signal filtered out by GRU forecast (${predicted_price:.2f} > ${curr_price:.2f})")
+                            self.last_rejection_log[(symbol, "gru_short")] = time.time()
+                        return
+
+            # 5. Risk Governor Verification
+            now = datetime.now()
+            can_trade, reason = self.risk_manager.can_trade(now)
+            if not can_trade:
+                last_time = self.last_rejection_log.get((symbol, reason), 0)
+                if time.time() - last_time > 300:  # Log at most once per 5 minutes per reason
+                    logger.info(f"[{symbol}] {setup.signal.value} rejected by RiskManager: {reason}")
+                    self.last_rejection_log[(symbol, reason)] = time.time()
+                return
+            else:
+                self.last_rejection_log.pop((symbol, reason), None)
+
+            # 6. Check existing positions (No Averaging Down)
+            if self.exchange.get_position(symbol):
+                return
+
+            # 6b. Max positions enforcement
+            if len(self.risk_manager.open_positions) >= self.config.risk.max_open_positions:
+                logger.info(f"[{symbol}] {setup.signal.value} skipped: max open positions reached")
+                return
+
+            # 7. Position Sizing
+            atr = df.get('atr', pd.Series([0])).iloc[-1] if 'atr' in df.columns else None
+            size = self.risk_manager.calculate_position_size(
+                self.risk_manager.current_balance, setup.entry_price, setup.stop_loss, atr
+            )
+            if size <= 0:
+                return
+
+            # 8. Portfolio Heat Check
+            notional_value = setup.entry_price * size
+            heat_ok, heat_reason = self.risk_manager.check_portfolio_heat(symbol, notional_value)
+            if not heat_ok:
+                logger.info(f"[{symbol}] {setup.signal.value} rejected by Portfolio Heat: {heat_reason}")
+                return
+
+            side = 'buy' if setup.signal == Signal.LONG else 'sell'
+            logger.info(
+                f"[{symbol}] [EXECUTE {setup.signal.value}] Strategy: {setup.strategy_name} | "
+                f"Entry: ${setup.entry_price:.4f} | SL: ${setup.stop_loss:.4f} | "
+                f"TP: ${setup.take_profit:.4f} | Size: {size:.6f} | Notional: ${notional_value:.2f} | Conf: {setup.confidence:.2f}"
+            )
+
+            # 9. Order Placement with retry & slippage checks
+            entry_mode = self.config.execution.entry_mode
+            if entry_mode == "maker":
+                # Post-only limit at best bid/ask; track fill rate; cancel after timeout.
+                if self.config.mode == "live":
+                    self.exchange.set_leverage(symbol, self.config.scalping.leverage)
+                    entry_order = self.exchange.create_best_bid_ask_limit_order(
+                        symbol, side, size, post_only=True
+                    )
+                else:
+                    entry_order = self.exchange.create_best_bid_ask_limit_order(
+                        symbol, side, size, post_only=True
+                    )
+                entry_id = (getattr(entry_order, 'id', None) or
+                            getattr(entry_order, 'order_id', None) or
+                            (entry_order.get('id') if isinstance(entry_order, dict) else None))
+                audit(symbol, side, size, setup.entry_price, entry_id)
+                if entry_order is None:
+                    logger.error(f"[{symbol}] Maker entry order rejected: None")
+                    return
+                if isinstance(entry_order, dict) and entry_order.get('status') == 'rejected':
+                    logger.error(f"[{symbol}] Maker entry order rejected: {entry_order.get('reject_reason')}")
+                    return
+                # Track fill rate and cancel after timeout if unfilled.
+                filled = False
+                cancel_deadline = time.time() + self.config.execution.maker_cancel_seconds
+                while time.time() < cancel_deadline:
+                    if self.config.mode == "live":
+                        checked = self.exchange.check_maker_fill(symbol, entry_id, setup.entry_price, side)
+                    else:
+                        checked = self.exchange.check_limit_fill(symbol, entry_id, setup.entry_price, side)
+                    status = getattr(checked, 'state', None) or (checked.get('status') if isinstance(checked, dict) else None)
+                    if status in ('filled', 'closed') or (isinstance(checked, dict) and checked.get('filled', 0) >= size):
+                        filled = True
+                        entry_order = checked
+                        break
+                    if status in ('cancelled', 'canceled', 'rejected'):
+                        break
+                    time.sleep(1)
+                if not filled:
+                    logger.info(f"[{symbol}] Maker entry not filled within {self.config.execution.maker_cancel_seconds}s; cancelling")
+                    try:
+                        self.exchange.cancel_all_orders(symbol)
+                        audit(symbol, 'cancel', size, setup.entry_price, entry_id, 'cancel')
+                    except Exception:
+                        pass
+                    return
+            elif self.config.mode == "live":
+                self.exchange.set_leverage(symbol, self.config.scalping.leverage)
+                entry_order = self.exchange.create_market_order(symbol, side, size)
+                audit(symbol, side, size, setup.entry_price, getattr(entry_order,'id',None) or getattr(entry_order,'order_id',None))
+                if entry_order is None or getattr(entry_order, 'state') != OrderState.FILLED:
+                    logger.error(f"[{symbol}] Entry order not filled: state={getattr(entry_order,'state',None)}, error={getattr(entry_order,'last_error',None)}")
+                    return
+                opp_side = 'sell' if side == 'buy' else 'buy'
+                sl_order = self.exchange.create_stop_loss(symbol, opp_side, size, setup.stop_loss)
+                audit(symbol, opp_side, size, setup.stop_loss, getattr(sl_order,'id',None) or getattr(sl_order,'order_id',None), 'send')
+                if sl_order is None or getattr(sl_order, 'state') == OrderState.REJECTED:
+                    logger.error(f"[{symbol}] Stop-loss order rejected: {getattr(sl_order,'last_error',None)}")
+                    try:
+                        self.exchange.close_position(symbol)
+                    except Exception:
+                        try:
+                            self.exchange.create_market_order(symbol, opp_side, size)
+                        except Exception:
+                            pass
+                    try:
+                        self.exchange.cancel_all_orders(symbol)
+                    except Exception:
+                        pass
+                    return
+            else:
+                entry_order = self.exchange.create_market_order(symbol, side, size, {'price': setup.entry_price})
+                audit(symbol, side, size, setup.entry_price, getattr(entry_order,'id',None) or getattr(entry_order,'order_id',None) or (entry_order.get('id') if isinstance(entry_order,dict) else None))
+                if entry_order is None:
+                    logger.error(f"[{symbol}] Entry order rejected: None")
+                    return
+                if isinstance(entry_order, dict) and entry_order.get('status') == 'rejected':
+                    logger.error(f"[{symbol}] Entry order rejected: {entry_order.get('reject_reason')}")
+                    return
+
+            # 10. Register position for heat & trailing stop tracking
+            self.risk_manager.register_position(symbol, notional_value, side)
+            state.save_position_at_entry(symbol, side, size, setup.entry_price, setup.take_profit, setup.stop_loss, setup.strategy_name)
+            self.risk_manager.update_position_price(symbol, setup.entry_price)
+            self.position_entry_cycle[symbol] = self.cycle_count
+            self.position_targets[symbol] = {
+                'tp': setup.take_profit,
+                'sl': setup.stop_loss,
+                'strategy': setup.strategy_name
+            }
+
+        except Exception as e:
+            logger.error(f"Error processing {symbol}: {e}")
+
+    def _close_position(self, symbol, pos, price, reason):
+        entry = float(pos.get('entryPrice', 0.0))
+        contracts = float(pos.get('contracts', 0.0))
+        side = pos.get('side', 'long')
+        if side == 'long':
+            pnl = (price - entry) * contracts
+        else:
+            pnl = (entry - price) * contracts
+        logger.info(f"[{symbol}] Closed {side.upper()} position: {reason} | PnL: ${pnl:.4f}")
+        if self.config.mode == "live":
+            opp_side = 'sell' if side == 'long' else 'buy'
+            co = self.exchange.create_market_order(symbol, opp_side, contracts)
+            audit(symbol, opp_side, contracts, price, getattr(co,'id',None) or getattr(co,'order_id',None))
+            try:
+                self.exchange.cancel_all_orders(symbol)
+                audit(symbol, 'cancel', contracts, price, None, 'cancel')
+            except Exception:
+                pass
+        else:
+            self.exchange.close_position(symbol, price)
+            audit(symbol, 'close', contracts, price, None, 'fill')
+        self.risk_manager.record_trade(pnl, symbol)
+        state.record_trade(pnl, symbol, reason)
+        self.risk_manager.release_position(symbol)
+        self.position_entry_cycle.pop(symbol, None)
+        self.position_targets.pop(symbol, None)
+        self.persist_state()
+
+    def check_exits(self, symbol: str):
+        try:
+            pos = self.exchange.get_position(symbol)
+            if not pos:
+                return
+
+            df = self.exchange.fetch_ohlcv(symbol, self.config.scalping.timeframe, 5)
+            if df is None or len(df) == 0:
+                return
+
+            price = df.iloc[-1]['close']
+            entry = float(pos.get('entryPrice', 0.0))
+            side = pos.get('side', 'long')
+            sc = self.config.scalping
+            targets = self.position_targets.get(symbol, {})
+            tp_price = targets.get('tp')
+            sl_price = targets.get('sl')
+
+            self.risk_manager.update_position_price(symbol, price)
+
+            # 1. Hard SL (never skipped)
+            if side == 'long':
+                hit_sl = (price <= sl_price) if (sl_price and sl_price < entry) else (price <= entry * (1 - sc.stop_loss_pct))
+            else:
+                hit_sl = (price >= sl_price) if (sl_price and sl_price > entry) else (price >= entry * (1 + sc.stop_loss_pct))
+            if hit_sl:
+                self._close_position(symbol, pos, price, "STOP LOSS")
+                return
+
+            # 2. TP
+            if side == 'long':
+                hit_tp = (price >= tp_price) if (tp_price and tp_price > entry) else (price >= entry * (1 + sc.take_profit_pct))
+            else:
+                hit_tp = (price <= tp_price) if (tp_price and tp_price < entry) else (price <= entry * (1 - sc.take_profit_pct))
+            if hit_tp:
+                self._close_position(symbol, pos, price, "TAKE PROFIT")
+                return
+
+            # 3. Trailing / breakeven (isolated so failure can't skip SL above)
+            try:
+                trail_hit, trail_reason = self.risk_manager.check_trailing_stop(symbol, price)
+                if trail_hit:
+                    self._close_position(symbol, pos, price, f"TRAILING STOP: {trail_reason}")
+                    return
+            except Exception as e:
+                logger.error(f"Trailing check error for {symbol}: {e}")
+
+            # 4. Time exit (wall-clock)
+            rm_pos = self.risk_manager.open_positions.get(symbol, {})
+            entry_time = rm_pos.get('entry_time')
+            if entry_time is not None:
+                hold_min = (datetime.now() - entry_time).total_seconds() / 60.0
+                if hold_min > self.config.risk.max_hold_time_minutes:
+                    self._close_position(symbol, pos, price, "Time exit (wall-clock)")
+                    return
+            else:
+                entry_cycle = self.position_entry_cycle.get(symbol, self.cycle_count)
+                max_hold = getattr(sc, 'max_hold_cycles', 60)
+                if self.cycle_count - entry_cycle > max_hold:
+                    self._close_position(symbol, pos, price, "TIME EXIT")
+                    return
+
+        except Exception as e:
+            logger.error(f"Error checking exits for {symbol}: {e}")
+
+    def print_status(self):
+        stats = self.risk_manager.get_stats()
+        table = Table(title="[bold yellow]Unified Bot Live Telemetry[/bold yellow]")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="green")
+        for k, v in stats.items():
+            table.add_row(k.replace('_', ' ').title(), f"{v:.4f}" if isinstance(v, float) else str(v))
+        table.add_row("Cycle Iteration", str(self.cycle_count))
+        console.print(table)
+
+    def _state_path(self):
+        return 'state.json'
+
+    def persist_state(self):
+        try:
+            data = {
+                'open_positions': {},
+                'position_targets': self.position_targets,
+                'position_entry_cycle': self.position_entry_cycle,
+            }
+            for sym, pos in getattr(self.risk_manager, 'open_positions', {}).items():
+                p = dict(pos)
+                if isinstance(p.get('entry_time'), datetime):
+                    p['entry_time'] = p['entry_time'].isoformat()
+                data['open_positions'][sym] = p
+            with open(self._state_path(), 'w') as f:
+                json.dump(data, f, default=str)
+            logger.info("State persisted")
+        except Exception as e:
+            logger.error(f"persist_state failed: {e}")
+
+    def load_state(self):
+        import core.state as cstate
+        try:
+            self.loaded_positions = cstate.load_open_positions()
+        except Exception as e:
+            logger.error(f"load_state failed: {e}")
+            self.loaded_positions = []
+        try:
+            ex_positions = {}
+            try:
+                ex_positions = self.exchange.get_positions() or {}
+            except Exception:
+                for pp in self.loaded_positions:
+                    sym = pp.get('symbol')
+                    if sym:
+                        try:
+                            ep = self.exchange.get_position(sym)
+                            if ep:
+                                ex_positions[sym] = ep
+                        except Exception:
+                            pass
+            loaded_syms = set(p.get('symbol') for p in self.loaded_positions if p.get('symbol'))
+            ex_syms = set(ex_positions.keys()) if isinstance(ex_positions, dict) else set()
+            if loaded_syms != ex_syms:
+                self.entries_blocked = True
+                logger.warning(f"Restart reconcile mismatch: loaded={loaded_syms} exchange={ex_syms}")
+                return
+            rm = self.risk_manager
+            for pp in self.loaded_positions:
+                sym = pp.get('symbol')
+                if not sym:
+                    continue
+                pos = dict(pp)
+                if pos.get('entry_time'):
+                    try:
+                        pos['entry_time'] = datetime.fromisoformat(pos['entry_time'])
+                    except Exception:
+                        pass
+                rm.open_positions[sym] = pos
+            path = self._state_path()
+            if os.path.exists(path):
+                try:
+                    with open(path) as f:
+                        data = json.load(f)
+                    self.position_targets = data.get('position_targets', self.position_targets)
+                    self.position_entry_cycle = data.get('position_entry_cycle', self.position_entry_cycle)
+                except Exception:
+                    pass
+            if os.environ.get('RECONCILE_CONFIRM') == '1':
+                self.entries_blocked = False
+            logger.info("State loaded")
+        except Exception as e:
+            logger.error(f"reconcile failed: {e}")
+
+    def run(self):
+        self.show_banner()
+        self.running = True
+        logger.info("Bot execution cycle initialized!")
+
+        try:
+            while self.running:
+                self.cycle_count += 1
+                for sym in self.config.scalping.symbols:
+                    self.check_exits(sym)
+                    self.process_symbol(sym)
+
+                if self.cycle_count % 10 == 0:
+                    self.print_status()
+
+                time.sleep(5)  # 5-second polling loop
+        except KeyboardInterrupt:
+            logger.info("Bot manually terminated by user.")
+            self.print_status()
+            self.persist_state()
+        finally:
+            try:
+                self.persist_state()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    mode = "paper"
+    demo_flag = False
+    if len(sys.argv) > 1:
+        for arg in sys.argv[1:]:
+            if arg == "--demo":
+                demo_flag = True
+                continue
+            if arg.lower() in ("live", "paper"):
+                mode = arg.lower()
+                continue
+            if arg.lower().startswith("--mode="):
+                mode = arg.lower().split("=", 1)[1]
+                continue
+
+    cfg = BotConfig()
+    if demo_flag:
+        cfg.exchange.demo = True
+        cfg.exchange.testnet = False
+        mode = "live"
+    cfg.mode = mode
+    if cfg.mode == "live":
+        if not cfg.exchange.api_key or not cfg.exchange.api_secret:
+            logger.error("API key or secret missing for live mode")
+            sys.exit(1)
+    bot = UnifiedCryptoBot(cfg)
+    bot.run()
+
+
+
+
+
+===== FILE: core\exchange.py =====
+
+"""
+Unified Exchange Connector & Paper Trading Simulator
+Supports CCXT live futures/spot connectivity as well as offline paper trading.
+Execution Quality Enhancements (P1):
+- Order state machine (pending -> open/filled/partial/rejected/cancelled)
+- Retry with exponential backoff on transient errors
+- Slippage estimation from orderbook depth
+- Post-only / reduce-only order flags
+- Paper trading realism: latency, slippage, partial fills, rejects
+"""
+import ccxt
+import pandas as pd
+import logging
+import time
+import random
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+
+class OrderState(Enum):
+    PENDING = "pending"
+    OPEN = "open"
+    PARTIAL = "partial"
+    FILLED = "filled"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+
+@dataclass
+class OrderRecord:
+    id: str
+    symbol: str
+    side: str
+    type: str
+    amount: float
+    price: Optional[float]
+    state: OrderState = OrderState.PENDING
+    filled: float = 0.0
+    remaining: float = 0.0
+    fee: float = 0.0
+    average_price: Optional[float] = None
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    last_error: Optional[str] = None
+    retry_count: int = 0
+
+    def __post_init__(self):
+        self.remaining = self.amount
+
+
+class SlippageModel:
+    """Estimates slippage from orderbook depth for a given notional size."""
+
+    def __init__(self, depth_levels: int = 10):
+        self.depth_levels = depth_levels
+
+    def estimate(self, orderbook: Dict, side: str, amount: float, mid_price: float) -> float:
+        """Return estimated slippage percentage (0.0 to 1.0)."""
+        if not orderbook or amount <= 0 or mid_price <= 0:
+            return 0.0
+
+        book_side = orderbook.get('asks' if side in ('buy', 'long') else 'bids', [])
+        if not book_side:
+            return 0.01  # conservative fallback
+
+        cumulative = 0.0
+        weighted_price_sum = 0.0
+        for level in book_side[:self.depth_levels]:
+            price = float(level[0])
+            qty = float(level[1])
+            take = min(qty, amount - cumulative)
+            weighted_price_sum += price * take
+            cumulative += take
+            if cumulative >= amount:
+                break
+
+        if cumulative == 0:
+            return 0.01
+
+        avg_fill_price = weighted_price_sum / cumulative
+        if side in ('buy', 'long'):
+            slippage = (avg_fill_price - mid_price) / mid_price
+        else:
+            slippage = (mid_price - avg_fill_price) / mid_price
+
+        return max(0.0, slippage)
+
+
+class RetryHandler:
+    """Exponential backoff retry for transient exchange errors."""
+
+    def __init__(self, max_retries: int = 3, base_ms: int = 500, max_ms: int = 5000):
+        self.max_retries = max_retries
+        self.base_ms = base_ms
+        self.max_ms = max_ms
+
+    def should_retry(self, error: Exception, attempt: int) -> bool:
+        if attempt >= self.max_retries:
+            return False
+        msg = str(error).lower()
+        transient = ('network' in msg or 'timeout' in msg or '502' in msg or
+                     '503' in msg or '504' in msg or 'rate limit' in msg or
+                     'temporarily' in msg or 'unavailable' in msg)
+        return transient
+
+    def backoff_ms(self, attempt: int) -> int:
+        return min(self.base_ms * (2 ** attempt), self.max_ms)
+
+
+class ExchangeConnector:
+    def __init__(self, config):
+        self.config = config
+        self.exchange = None
+        self.exec_cfg = config.execution
+        self.retry = RetryHandler(
+            max_retries=self.exec_cfg.max_order_retries,
+            base_ms=self.exec_cfg.retry_backoff_base_ms,
+            max_ms=self.exec_cfg.retry_backoff_max_ms,
+        )
+        self.slippage_model = SlippageModel(depth_levels=self.exec_cfg.slippage_depth_levels)
+        self.orders: Dict[str, OrderRecord] = {}
+
+    def connect(self):
+        ec = self.config.exchange
+        exchange_class = getattr(ccxt, ec.name, ccxt.binance)
+        params = {
+            'apiKey': ec.api_key,
+            'secret': ec.api_secret,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'future'},
+        }
+        if ec.testnet:
+            params['sandbox'] = True
+        self.exchange = exchange_class(params)
+        logger.info(f"Connected to {ec.name} (sandbox={ec.testnet})")
+        return self
+
+    def fetch_ohlcv(self, symbol: str, timeframe: str = '1m', limit: int = 200) -> pd.DataFrame:
+        ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        return df
+
+    def fetch_orderbook(self, symbol: str, limit: int = 10) -> Dict:
+        return self.exchange.fetch_order_book(symbol, limit)
+
+    def fetch_balance(self) -> Dict:
+        return self.exchange.fetch_balance()
+
+    def get_position(self, symbol: str) -> Optional[Dict]:
+        try:
+            positions = self.exchange.fetch_positions([symbol])
+            for pos in positions:
+                if pos['symbol'] == symbol and float(pos.get('contracts', 0)) > 0:
+                    return pos
+        except Exception as e:
+            logger.error(f"Error fetching position for {symbol}: {e}")
+        return None
+
+    def set_leverage(self, symbol: str, leverage: int):
+        try:
+            self.exchange.set_leverage(leverage, symbol)
+        except Exception as e:
+            logger.warning(f"Leverage error on {symbol}: {e}")
+
+    def fetch_active_symbols(self, limit: int = 50, min_volume: float = 5_000_000.0,
+                             exclude: Optional[List[str]] = None) -> List[str]:
+        """Fetch all active USDT pairs ranked by 24h trading volume."""
+        exclude_set = set(exclude or [
+            'USDC/USDT', 'TUSD/USDT', 'BUSD/USDT', 'FDUSD/USDT', 'USDP/USDT',
+            'EUR/USDT', 'USD1/USDT', 'DAI/USDT', 'USTC/USDT', 'RLUSD/USDT'
+        ])
+        try:
+            tickers = self.exchange.fetch_tickers()
+            valid = []
+            for sym, t in tickers.items():
+                if not sym.endswith('/USDT') or sym in exclude_set:
+                    continue
+                vol = t.get('quoteVolume', 0) or 0
+                if vol >= min_volume:
+                    valid.append((sym, vol))
+            valid.sort(key=lambda x: x[1], reverse=True)
+            symbols = [s[0] for s in valid[:limit]]
+            return symbols if symbols else ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+        except Exception as e:
+            logger.warning(f"Error fetching active symbols: {e}. Falling back to default list.")
+            return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+
+    def _build_params(self, params: dict, post_only: bool = False,
+                      reduce_only: bool = False) -> dict:
+        p = dict(params or {})
+        if post_only:
+            p['postOnly'] = True
+        if reduce_only:
+            p['reduceOnly'] = True
+        return p
+
+    def create_order_with_retry(self, symbol: str, order_type: str, side: str,
+                                amount: float, price: Optional[float] = None,
+                                params: dict = None,
+                                post_only: bool = False,
+                                reduce_only: bool = False,
+                                check_slippage: bool = True) -> Optional[OrderRecord]:
+        """Create an order with retry, slippage check, and state tracking."""
+        order_id = f"ord_{int(time.time()*1000)}_{random.randint(1000,9999)}"
+        order = OrderRecord(
+            id=order_id, symbol=symbol, side=side, type=order_type,
+            amount=amount, price=price,
+        )
+        self.orders[order_id] = order
+
+        # Slippage check for market orders
+        if check_slippage and self.exec_cfg.slippage_model_enabled and order_type == 'market':
+            try:
+                orderbook = self.fetch_orderbook(symbol, limit=self.exec_cfg.slippage_depth_levels)
+                ticker = self.exchange.fetch_ticker(symbol)
+                mid_price = (ticker.get('bid', 0) + ticker.get('ask', 0)) / 2 or ticker.get('last', 0)
+                if mid_price > 0:
+                    est_slippage = self.slippage_model.estimate(orderbook, side, amount, mid_price)
+                    if est_slippage > self.exec_cfg.max_slippage_pct:
+                        order.state = OrderState.REJECTED
+                        order.last_error = f"Estimated slippage {est_slippage*100:.2f}% exceeds max {self.exec_cfg.max_slippage_pct*100:.2f}%"
+                        logger.warning(f"[{symbol}] Order rejected: {order.last_error}")
+                        return order
+            except Exception as e:
+                logger.warning(f"[{symbol}] Slippage check failed: {e}")
+
+        # Retry loop
+        attempt = 0
+        while True:
+            try:
+                order.state = OrderState.OPEN
+                p = self._build_params(params, post_only=post_only, reduce_only=reduce_only)
+                result = self.exchange.create_order(symbol, order_type, side, amount, price, p)
+                order.state = OrderState.FILLED
+                order.filled = float(result.get('filled', amount))
+                order.remaining = float(result.get('remaining', 0.0))
+                order.average_price = float(result.get('average', price or 0))
+                order.fee = float(result.get('fee', {}).get('cost', 0.0))
+                if result.get('id'):
+                    order.id = str(result['id'])
+                logger.info(
+                    f"[{symbol}] Order filled: {side} {order.filled}/{amount} @ "
+                    f"{order.average_price} (fee: {order.fee})"
+                )
+                return order
+            except Exception as e:
+                order.last_error = str(e)
+                if self.retry.should_retry(e, attempt):
+                    attempt += 1
+                    order.retry_count = attempt
+                    delay_ms = self.retry.backoff_ms(attempt - 1)
+                    logger.warning(
+                        f"[{symbol}] Order attempt {attempt} failed: {e}. "
+                        f"Retrying in {delay_ms}ms..."
+                    )
+                    time.sleep(delay_ms / 1000.0)
+                    continue
+                order.state = OrderState.REJECTED
+                logger.error(f"[{symbol}] Order rejected after {attempt+1} attempts: {e}")
+                return order
+
+    def create_market_order(self, symbol: str, side: str, amount: float, params: dict = None):
+        return self.create_order_with_retry(
+            symbol, 'market', side, amount, None, params,
+            check_slippage=True,
+        )
+
+    def create_limit_order(self, symbol: str, side: str, amount: float, price: float,
+                           params: dict = None, post_only: bool = False):
+        return self.create_order_with_retry(
+            symbol, 'limit', side, amount, price, params,
+            post_only=self.exec_cfg.post_only or post_only,
+            check_slippage=False,
+        )
+
+    def create_best_bid_ask_limit_order(self, symbol: str, side: str, amount: float,
+                                        post_only: bool = True, params: dict = None):
+        """Place a post-only limit order at the best bid (buy) or best ask (sell)."""
+        try:
+            orderbook = self.fetch_orderbook(symbol, limit=1)
+        except Exception as e:
+            logger.warning(f'[{symbol}] Failed to fetch orderbook for best-bid/ask: {e}')
+            return None
+        if not orderbook:
+            return None
+        if side in ('buy', 'long'):
+            book = orderbook.get('bids') or []
+        else:
+            book = orderbook.get('asks') or []
+        if not book:
+            return None
+        best_price = float(book[0][0])
+        return self.create_limit_order(symbol, side, amount, best_price,
+                                       params=params, post_only=post_only)
+
+    def check_maker_fill(self, symbol: str, order_id: str, limit_price: float, side: str):
+        """Poll a live maker limit order; return updated OrderRecord (or None)."""
+        order = self.orders.get(order_id)
+        if order is None:
+            return None
+        try:
+            raw = self.exchange.fetch_order(order_id, symbol)
+        except Exception as e:
+            logger.warning(f'[{symbol}] fetch_order {order_id} failed: {e}')
+            return order
+        filled = float(raw.get('filled', 0.0))
+        status = raw.get('status', '').lower()
+        if filled > 0:
+            order.filled = filled
+            order.remaining = order.amount - filled
+            order.average_price = float(raw.get('average', limit_price))
+            order.state = OrderState.FILLED if filled >= order.amount else OrderState.PARTIAL
+        elif status in ('closed', 'filled'):
+            order.state = OrderState.FILLED
+            order.filled = order.amount
+        elif status in ('canceled', 'cancelled'):
+            order.state = OrderState.CANCELLED
+        elif status in ('rejected',):
+            order.state = OrderState.REJECTED
+        return order
+
+    def create_stop_loss(self, symbol: str, side: str, amount: float, stop_price: float):
+        params = {'stopPrice': stop_price}
+        if self.exec_cfg.reduce_only_stops:
+            params['reduceOnly'] = True
+        return self.create_order_with_retry(
+            symbol, 'stop_market', side, amount, None, params,
+            reduce_only=self.exec_cfg.reduce_only_stops,
+            check_slippage=True,
+        )
+
+    def cancel_all_orders(self, symbol: str):
+        self.exchange.cancel_all_orders(symbol)
+
+    def get_order(self, order_id: str) -> Optional[OrderRecord]:
+        return self.orders.get(order_id)
+
+    def get_orders(self, symbol: Optional[str] = None) -> List[OrderRecord]:
+        if symbol:
+            return [o for o in self.orders.values() if o.symbol == symbol]
+        return list(self.orders.values())
+
+
+class PaperExchange:
+    def __init__(self, config):
+        self.config = config
+        self.exec_cfg = config.execution
+        self.balance = config.scalping.initial_capital
+        self.positions = {}
+        self.trade_history = []
+        self.order_id = 0
+        self.orders = {}
+        self.latency_ms = self.exec_cfg.paper_latency_ms
+        self.base_slippage_pct = self.exec_cfg.paper_slippage_pct
+        self.partial_fill_chance = self.exec_cfg.paper_partial_fill_chance
+        self.reject_chance = self.exec_cfg.paper_reject_chance
+        self._public_exchanges = []
+        self._current_public = None
+        self._init_public_exchanges()
+
+    def _init_public_exchanges(self):
+        candidates = []
+        for name in ['binance', 'bybit', 'okx', 'kucoin', 'kraken', 'coinbase']:
+            try:
+                ex_class = getattr(ccxt, name)
+                ex = ex_class({'enableRateLimit': True})
+                try:
+                    ex.fetch_ohlcv('BTC/USDT', '5m', limit=1)
+                except Exception:
+                    pass
+                candidates.append(ex)
+                if self._current_public is None:
+                    self._current_public = ex
+                logger.info('init %s' % getattr(ex,'id',name))
+            except Exception as e:
+                logger.warning('fail %s: %s' % (name,e))
+        self._public_exchanges = candidates
+        if self._current_public is None and candidates:
+            self._current_public = candidates[0]
+        if self._current_public is None:
+            for name in ['binance', 'bybit', 'okx', 'kucoin', 'kraken', 'coinbase']:
+                try:
+                    ex_class = getattr(ccxt,name)
+                    self._current_public = ex_class({'enableRateLimit':True})
+                    self._public_exchanges = [self._current_public]
+                    break
+                except Exception:
+                    continue
+            if self._current_public is None:
+                try:
+                    self._current_public = ccxt.okx({'enableRateLimit':True})
+                except Exception as e:
+                    logger.error('no pub: %s' % e)
+
+    def fetch_ohlcv(self, symbol: str, timeframe: str = '1m', limit: int = 200):
+        tries = []
+        if self._current_public is not None:
+            tries.append(self._current_public)
+        for ex in self._public_exchanges:
+            if ex not in tries:
+                tries.append(ex)
+        if not tries:
+            self._init_public_exchanges()
+            if self._current_public is not None:
+                tries.append(self._current_public)
+            for ex in self._public_exchanges:
+                if ex not in tries:
+                    tries.append(ex)
+        last=None
+        for ex in tries:
+            try:
+                ohlcv = ex.fetch_ohlcv(symbol,timeframe,limit=limit)
+                df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+                df['timestamp']=pd.to_datetime(df['timestamp'],unit='ms')
+                df.set_index('timestamp',inplace=True)
+                self._current_public = ex
+                return df
+            except Exception as e:
+                last=e
+                logger.warning('fail %s: %s' % (getattr(ex,'id','?'),e))
+                continue
+        logger.error('all fail %s %s: %s' % (symbol,timeframe,last))
+        return None
+
+
+    def _simulate_latency(self):
+        if self.latency_ms > 0:
+            time.sleep(self.latency_ms / 1000.0)
+
+    def _simulate_slippage(self, price: float, side: str) -> float:
+        slippage = random.uniform(0, self.base_slippage_pct)
+        if side in ('buy', 'long'):
+            return price * (1 + slippage)
+        return price * (1 - slippage)
+
+    def _simulate_outcome(self) -> Optional[str]:
+        """Returns None if order proceeds, or a reject reason."""
+        if random.random() < self.reject_chance:
+            return "Simulated order rejection"
+        return None
+
+    def fetch_balance(self) -> Dict:
+        self._simulate_latency()
+        return {'USDT': {'free': self.balance, 'total': self.balance}}
+
+    def get_position(self, symbol: str) -> Optional[Dict]:
+        self._simulate_latency()
+        return self.positions.get(symbol)
+
+    def set_leverage(self, symbol: str, leverage: int):
+        pass
+
+    def create_market_order(self, symbol: str, side: str, amount: float, params: dict = None) -> Dict:
+        self._simulate_latency()
+        reject_reason = self._simulate_outcome()
+        if reject_reason:
+            self.order_id += 1
+            order = {
+                'id': f"paper_{self.order_id}",
+                'symbol': symbol,
+                'side': side,
+                'amount': amount,
+                'price': 0.0,
+                'status': 'rejected',
+                'timestamp': datetime.now().isoformat(),
+                'reject_reason': reject_reason,
+            }
+            self.trade_history.append(order)
+            return order
+
+        # Partial fill simulation
+        fill_ratio = 1.0
+        if random.random() < self.partial_fill_chance:
+            fill_ratio = random.uniform(0.5, 0.95)
+
+        filled_amount = amount * fill_ratio
+        price = self._simulate_slippage(params.get('price', 0.0) if params else 0.0, side)
+
+        self.order_id += 1
+        order = {
+            'id': f"paper_{self.order_id}",
+            'symbol': symbol,
+            'side': side,
+            'amount': amount,
+            'filled': filled_amount,
+            'price': price,
+            'status': 'partial' if fill_ratio < 1.0 else 'closed',
+            'timestamp': datetime.now().isoformat(),
+        }
+        self.orders[order['id']] = order
+
+        if side in ['buy', 'long']:
+            self.positions[symbol] = {
+                'symbol': symbol,
+                'side': 'long',
+                'contracts': filled_amount,
+                'entryPrice': price,
+                'timestamp': datetime.now().isoformat(),
+            }
+        else:
+            self.positions[symbol] = {
+                'symbol': symbol,
+                'side': 'short',
+                'contracts': filled_amount,
+                'entryPrice': price,
+                'timestamp': datetime.now().isoformat(),
+            }
+        self.trade_history.append(order)
+        return order
+
+    def create_limit_order(self, symbol: str, side: str, amount: float, price: float,
+                           params: dict = None, post_only: bool = False) -> Dict:
+        self._simulate_latency()
+        reject_reason = self._simulate_outcome()
+        if reject_reason:
+            self.order_id += 1
+            return {
+                'id': f"paper_{self.order_id}",
+                'symbol': symbol,
+                'side': side,
+                'amount': amount,
+                'price': price,
+                'status': 'rejected',
+                'timestamp': datetime.now().isoformat(),
+                'reject_reason': reject_reason,
+            }
+        # Limit orders fill at limit price (simplified)
+        self.order_id += 1
+        order = {
+            'id': f"paper_{self.order_id}",
+            'symbol': symbol,
+            'side': side,
+            'amount': amount,
+            'price': price,
+            'status': 'open',
+            'timestamp': datetime.now().isoformat(),
+            'post_only': post_only,
+        }
+        self.orders[order['id']] = order
+        self.trade_history.append(order)
+        return order
+
+    def create_best_bid_ask_limit_order(self, symbol: str, side: str, amount: float,
+                                          post_only: bool = True, params: dict = None) -> Dict:
+        """Place a post-only limit order at the best bid (buy) or best ask (sell)."""
+        self._simulate_latency()
+        reject_reason = self._simulate_outcome()
+        if reject_reason:
+            self.order_id += 1
+            return {
+                'id': f"paper_{self.order_id}",
+                'symbol': symbol,
+                'side': side,
+                'amount': amount,
+                'price': 0.0,
+                'status': 'rejected',
+                'timestamp': datetime.now().isoformat(),
+                'reject_reason': reject_reason,
+            }
+        best_price = self._get_best_price(symbol, side)
+        if best_price is None:
+            self.order_id += 1
+            return {
+                'id': f"paper_{self.order_id}",
+                'symbol': symbol,
+                'side': side,
+                'amount': amount,
+                'price': 0.0,
+                'status': 'rejected',
+                'timestamp': datetime.now().isoformat(),
+                'reject_reason': 'No orderbook price available',
+            }
+        return self.create_limit_order(symbol, side, amount, best_price,
+                                       params=params, post_only=post_only)
+
+    def _get_best_price(self, symbol: str, side: str):
+        """Best bid for buys, best ask for sells from the public orderbook."""
+        if self._current_public is None:
+            return None
+        try:
+            orderbook = self._current_public.fetch_order_book(symbol, limit=1)
+        except Exception as e:
+            logger.warning('orderbook fetch failed for %s: %s' % (symbol, e))
+            return None
+        if not orderbook:
+            return None
+        if side in ('buy', 'long'):
+            book = orderbook.get('bids') or []
+        else:
+            book = orderbook.get('asks') or []
+        if not book:
+            return None
+        try:
+            return float(book[0][0])
+        except (TypeError, IndexError, ValueError):
+            return None
+
+    def check_limit_fill(self, symbol: str, order_id: str, limit_price: float, side: str) -> Dict:
+        """Adverse-selection fill model: fill only if price trades through the limit on the next bar."""
+        self._simulate_latency()
+        order = self.orders.get(order_id)
+        if not order or order.get('status') != 'open':
+            return order
+        df = self.fetch_ohlcv(symbol, self.config.scalping.timeframe, 2)
+        if df is None or len(df) < 2:
+            return order
+        cur = df.iloc[-1]
+        high = float(cur['high'])
+        low = float(cur['low'])
+        # Price traded through the limit price during the bar.
+        traded_through = (low <= limit_price <= high)
+        if traded_through:
+            order['status'] = 'filled'
+            order['filled'] = order['amount']
+            order['price'] = limit_price
+            if side in ('buy', 'long'):
+                self.positions[symbol] = {
+                    'symbol': symbol,
+                    'side': 'long',
+                    'contracts': order['amount'],
+                    'entryPrice': limit_price,
+                    'timestamp': datetime.now().isoformat(),
+                }
+            else:
+                self.positions[symbol] = {
+                    'symbol': symbol,
+                    'side': 'short',
+                    'contracts': order['amount'],
+                    'entryPrice': limit_price,
+                    'timestamp': datetime.now().isoformat(),
+                }
+            self.trade_history.append(order)
+        return order
+
+    def create_stop_loss(self, symbol: str, side: str, amount: float, stop_price: float) -> Dict:
+        self._simulate_latency()
+        reject_reason = self._simulate_outcome()
+        if reject_reason:
+            self.order_id += 1
+            return {
+                'id': f"paper_{self.order_id}",
+                'symbol': symbol,
+                'side': side,
+                'amount': amount,
+                'stopPrice': stop_price,
+                'status': 'rejected',
+                'timestamp': datetime.now().isoformat(),
+                'reject_reason': reject_reason,
+            }
+        self.order_id += 1
+        order = {
+            'id': f"paper_{self.order_id}",
+            'symbol': symbol,
+            'side': side,
+            'amount': amount,
+            'stopPrice': stop_price,
+            'status': 'open',
+            'timestamp': datetime.now().isoformat(),
+            'reduceOnly': True,
+        }
+        self.orders[order['id']] = order
+        self.trade_history.append(order)
+        return order
+
+    def close_position(self, symbol: str, exit_price: float) -> Optional[float]:
+        self._simulate_latency()
+        pos = self.positions.pop(symbol, None)
+        if not pos:
+            return None
+        entry = pos['entryPrice']
+        amt = pos['contracts']
+        side = pos['side']
+        # Apply slippage on exit
+        exit_price = self._simulate_slippage(exit_price, 'sell' if side == 'long' else 'buy')
+        pnl = (exit_price - entry) * amt if side == 'long' else (entry - exit_price) * amt
+        self.balance += pnl
+        return pnl
+
+    def cancel_all_orders(self, symbol: str):
+        self._simulate_latency()
+        to_cancel = [k for k,v in self.orders.items() if v.get('symbol') == symbol]
+        self.orders = {k: v for k, v in self.orders.items() if v.get('symbol') != symbol}
+        return len(to_cancel)
+
+    def get_order(self, order_id: str) -> Optional[Dict]:
+        return self.orders.get(order_id)
+
+    def get_orders(self, symbol: Optional[str] = None) -> List[Dict]:
+        if symbol:
+            return [o for o in self.orders.values() if o.get('symbol') == symbol]
+        return list(self.orders.values())
+
+    def fetch_active_symbols(self, limit: int = 50, min_volume: float = 5_000_000.0,
+                             exclude: Optional[List[str]] = None) -> List[str]:
+        """Fetch all active USDT pairs ranked by 24h trading volume for Paper trading."""
+        exclude_set = set(exclude or [
+            'USDC/USDT', 'TUSD/USDT', 'BUSD/USDT', 'FDUSD/USDT', 'USDP/USDT',
+            'EUR/USDT', 'USD1/USDT', 'DAI/USDT', 'USTC/USDT', 'RLUSD/USDT',
+            'AEUR/USDT', 'EURI/USDT'
+        ])
+        tries = []
+        if self._current_public is not None:
+            tries.append(self._current_public)
+        for ex in self._public_exchanges:
+            if ex not in tries:
+                tries.append(ex)
+
+        for ex in tries:
+            try:
+                tickers = ex.fetch_tickers()
+                valid = []
+                for sym, t in tickers.items():
+                    if not sym.endswith('/USDT') or sym in exclude_set:
+                        continue
+                    vol = t.get('quoteVolume', 0) or 0
+                    if vol >= min_volume:
+                        valid.append((sym, vol))
+                valid.sort(key=lambda x: x[1], reverse=True)
+                symbols = [s[0] for s in valid[:limit]]
+                if symbols:
+                    logger.info(f"Dynamically discovered {len(symbols)} active coins from {getattr(ex, 'id', 'exchange')}")
+                    return symbols
+            except Exception as e:
+                logger.warning(f"Error fetching active symbols from {getattr(ex, 'id', 'exchange')}: {e}")
+                continue
+
+        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+
+
+
+===== FILE: core\risk_manager.py =====
+
+"""
+Unified Risk Management Engine
+Includes Passivbot-style anti-drawdown logic and BNF strict no-averaging-down discipline.
+Enhancements:
+- Portfolio heat & per-symbol position limits
+- Volatility-adjusted (ATR-normalized) position sizing
+- Circuit breakers (flash-crash drawdown, error streaks)
+- Trailing stop & breakeven activation
+"""
+import logging
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple, Optional
+
+logger = logging.getLogger(__name__)
+
+def normalize_side(side: str) -> str:
+    s = str(side).strip().lower()
+    if s in ('buy', 'long'):
+        return 'long'
+    if s in ('sell', 'short'):
+        return 'short'
+    raise ValueError(f"Unknown side: {side!r}")
+
+class CircuitBreaker:
+    """Tracks rapid drawdown and error streaks to halt trading automatically."""
+
+    def __init__(self, risk_config, initial_capital: float):
+        self.enabled = risk_config.circuit_breaker_enabled
+        self.drawdown_pct = risk_config.circuit_breaker_drawdown_pct
+        self.time_window_min = risk_config.circuit_breaker_time_window_min
+        self.error_streak_limit = risk_config.circuit_breaker_error_streak
+        self.peak_balance = initial_capital
+        self.window_start: Optional[datetime] = None
+        self.window_low: Optional[float] = None
+        self.error_count = 0
+        self.halted = False
+        self.halt_reason: Optional[str] = None
+
+    def check_drawdown(self, current_balance: float, now: datetime) -> Tuple[bool, str]:
+        if not self.enabled:
+            return False, ""
+        if self.window_start is None or now - self.window_start > timedelta(minutes=self.time_window_min):
+            self.window_start = now
+            self.window_low = current_balance
+            self.peak_balance = max(self.peak_balance, current_balance)
+
+        if current_balance > self.peak_balance:
+            self.peak_balance = current_balance
+        if current_balance < (self.window_low or current_balance):
+            self.window_low = current_balance
+
+        dd = (self.peak_balance - current_balance) / self.peak_balance
+        if dd >= self.drawdown_pct:
+            self.halted = True
+            self.halt_reason = f"Circuit breaker: {dd*100:.1f}% drawdown in {self.time_window_min}min"
+            return True, self.halt_reason
+        return False, ""
+
+    def record_error(self) -> Tuple[bool, str]:
+        if not self.enabled:
+            return False, ""
+        self.error_count += 1
+        if self.error_count >= self.error_streak_limit:
+            self.halted = True
+            self.halt_reason = f"Circuit breaker: {self.error_count} consecutive exchange errors"
+            return True, self.halt_reason
+        return False, ""
+
+    def reset_errors(self):
+        self.error_count = 0
+
+    def is_halted(self) -> Tuple[bool, Optional[str]]:
+        return self.halted, self.halt_reason
+
+
+class RiskManager:
+    def __init__(self, config):
+        self.config = config
+        self.rc = config.risk
+        self.sc = config.scalping
+        self.daily_pnl = 0.0
+        self.peak_balance = config.scalping.initial_capital
+        self.current_balance = config.scalping.initial_capital
+        self.consecutive_losses = 0
+        self.daily_trades = 0
+        self.last_trade_time = None
+        self.pause_until = None
+        self.trade_log: List[Dict] = []
+        self._current_day = datetime.utcnow().date()
+        # Portfolio heat: per-symbol notional exposure
+        self.symbol_exposure: Dict[str, float] = {}
+        self.open_positions: Dict[str, Dict] = {}
+        # Circuit breaker
+        self.circuit_breaker = CircuitBreaker(config.risk, config.scalping.initial_capital)
+
+    def _check_daily_reset(self, now = None):
+        if now is None:
+            now = datetime.utcnow()
+        current_day = now.date() if hasattr(now, 'date') else now
+        if self._current_day is None:
+            self._current_day = current_day
+        elif current_day != self._current_day:
+            self.reset_daily()
+            self._current_day = current_day
+
+    def can_trade(self, now: Optional[datetime] = None) -> Tuple[bool, str]:
+        now = now or datetime.now()
+        self._check_daily_reset(now)
+
+        # Circuit breaker check
+        halted, reason = self.circuit_breaker.is_halted()
+        if halted:
+            return False, reason
+
+        if self.pause_until and now < self.pause_until:
+            wait_s = int((self.pause_until - now).total_seconds())
+            return False, f"Paused after loss streak ({wait_s}s remaining)"
+        if self.rc.daily_trade_limit > 0 and self.daily_trades >= self.rc.daily_trade_limit:
+            return False, f"Daily trade limit reached ({self.daily_trades}/{self.rc.daily_trade_limit})"
+        if self.daily_pnl <= -(self.current_balance * self.rc.max_daily_loss_pct):
+            return False, f"Max daily loss reached ({self.daily_pnl:.2f})"
+        drawdown = (self.peak_balance - self.current_balance) / self.peak_balance
+        if drawdown >= self.rc.max_drawdown_pct:
+            return False, f"Max drawdown hit ({drawdown*100:.1f}%)"
+        if self.consecutive_losses >= self.rc.max_consecutive_losses:
+            self.pause_until = now + timedelta(seconds=self.rc.pause_after_loss_streak)
+            self.consecutive_losses = 0
+            return False, "Loss streak pause triggered"
+        if self.last_trade_time:
+            cooldown = timedelta(seconds=self.sc.cooldown_seconds)
+            if now - self.last_trade_time < cooldown:
+                return False, "Cooldown between trades"
+        return True, "OK"
+
+    def check_portfolio_heat(self, symbol: str, notional_value: float) -> Tuple[bool, str]:
+        """Reject trade if per-symbol or portfolio heat would exceed limits."""
+        current_symbol_exposure = self.symbol_exposure.get(symbol, 0.0)
+        new_symbol_exposure = current_symbol_exposure + notional_value
+        max_symbol_notional = self.current_balance * self.rc.max_position_per_symbol_pct
+        if new_symbol_exposure > max_symbol_notional:
+            return False, f"Per-symbol heat limit for {symbol} ({new_symbol_exposure:.2f} > {max_symbol_notional:.2f})"
+
+        total_heat = sum(self.symbol_exposure.values()) + notional_value
+        max_portfolio_notional = self.current_balance * self.rc.max_portfolio_heat_pct
+        if total_heat > max_portfolio_notional:
+            return False, f"Portfolio heat limit ({total_heat:.2f} > {max_portfolio_notional:.2f})"
+        return True, "OK"
+
+    def register_position(self, symbol: str, notional_value: float, side: str):
+        side = normalize_side(side)
+        self.symbol_exposure[symbol] = self.symbol_exposure.get(symbol, 0.0) + notional_value
+        self.open_positions[symbol] = {
+            'notional': notional_value,
+            'side': side,
+            'entry_time': datetime.now(),
+            'entry_price': None,
+            'high_watermark': None,
+            'low_watermark': None,
+            'trailing_stop': None,
+            'breakeven_armed': False,
+        }
+
+    def update_position_price(self, symbol: str, price: float):
+        pos = self.open_positions.get(symbol)
+        if not pos:
+            return
+        pos['entry_price'] = pos.get('entry_price') or price
+        pos['high_watermark'] = max(pos.get('high_watermark') or price, price)
+        pos['low_watermark'] = min(pos.get('low_watermark') or price, price)
+
+    def check_trailing_stop(self, symbol: str, price: float) -> Tuple[bool, str]:
+        """Return (should_exit, reason) if trailing stop or breakeven is hit."""
+        pos = self.open_positions.get(symbol)
+        if not pos or not self.rc.trailing_stop_enabled:
+            return False, ""
+
+        entry = pos['entry_price'] or price
+        side = normalize_side(pos.get('side', ''))
+        high = pos['high_watermark'] or price
+        low = pos['low_watermark'] or price
+
+        # Breakeven: arm at breakeven_activation_pct, offset stop by round_trip_cost_pct
+        if not pos.get('breakeven_armed', False) and self.rc.breakeven_activation_pct > 0:
+            if side == 'long' and price >= entry * (1 + self.rc.breakeven_activation_pct):
+                pos['breakeven_armed'] = True
+                if pos.get('trailing_stop') is None:
+                    pos['trailing_stop'] = entry * (1 + self.rc.round_trip_cost_pct)
+                logger.info(f"[{symbol}] Breakeven armed at {pos.get('trailing_stop'):.4f}")
+            elif side == 'short' and price <= entry * (1 - self.rc.breakeven_activation_pct):
+                pos['breakeven_armed'] = True
+                if pos.get('trailing_stop') is None:
+                    pos['trailing_stop'] = entry * (1 - self.rc.round_trip_cost_pct)
+                logger.info(f"[{symbol}] Breakeven armed at {pos.get('trailing_stop'):.4f}")
+
+        # Trailing stop activation: arm when price moves trailing_stop_activation_pct in favor
+        if pos.get('trailing_stop') is None and self.rc.trailing_stop_activation_pct > 0:
+            if side == 'long' and price >= entry * (1 + self.rc.trailing_stop_activation_pct):
+                pos['trailing_stop'] = high * (1 - self.rc.trailing_stop_pct)
+                logger.info(f"[{symbol}] Trailing armed at {pos['trailing_stop']:.4f}")
+            elif side == 'short' and price <= entry * (1 - self.rc.trailing_stop_activation_pct):
+                pos['trailing_stop'] = low * (1 + self.rc.trailing_stop_pct)
+                logger.info(f"[{symbol}] Trailing armed at {pos['trailing_stop']:.4f}")
+
+        # Trailing stop update & hit check
+        if pos.get('trailing_stop') is not None:
+            if side == 'long':
+                new_trail = high * (1 - self.rc.trailing_stop_pct)
+                if new_trail > pos['trailing_stop']:
+                    pos['trailing_stop'] = new_trail
+                if price <= pos['trailing_stop']:
+                    return True, f"Trailing stop hit at {pos['trailing_stop']:.4f}"
+            else:
+                new_trail = low * (1 + self.rc.trailing_stop_pct)
+                if new_trail < pos['trailing_stop']:
+                    pos['trailing_stop'] = new_trail
+                if price >= pos['trailing_stop']:
+                    return True, f"Trailing stop hit at {pos['trailing_stop']:.4f}"
+        return False, ""
+
+
+    def release_position(self, symbol: str):
+        if symbol in self.symbol_exposure:
+            del self.symbol_exposure[symbol]
+        self.open_positions.pop(symbol, None)
+
+    def calculate_position_size(self, capital: float, entry: float, stop_loss: float,
+                                atr: Optional[float] = None) -> float:
+        risk_pct = self.rc.risk_per_trade
+        # Anti-martingale size decay on losses
+        if self.rc.reduce_size_on_loss and self.consecutive_losses > 0:
+            risk_pct *= self.rc.size_reduction_factor ** self.consecutive_losses
+
+        # Volatility-adjusted sizing: scale risk by ATR if enabled
+        if self.rc.vol_adjust_sizing and atr is not None and atr > 0:
+            vol_risk = atr * self.rc.atr_multiplier_sizing
+            price_risk = max(abs(entry - stop_loss), vol_risk)
+        else:
+            price_risk = abs(entry - stop_loss)
+
+        if price_risk == 0:
+            return 0.0
+
+        max_size_value = capital * self.rc.max_position_size_pct
+        size_value = min((capital * risk_pct) / price_risk * entry, max_size_value)
+        return size_value / entry
+
+    def record_trade(self, pnl: float, symbol: str = "", trade_time: Optional[datetime] = None):
+        t_time = trade_time or datetime.now()
+        self.daily_pnl += pnl
+        self.current_balance += pnl
+        self.daily_trades += 1
+        self.last_trade_time = t_time
+        if pnl >= 0:
+            self.consecutive_losses = 0
+            self.circuit_breaker.reset_errors()
+        else:
+            self.consecutive_losses += 1
+        if self.current_balance > self.peak_balance:
+            self.peak_balance = self.current_balance
+        self.trade_log.append({
+            'timestamp': t_time.isoformat() if hasattr(t_time, 'isoformat') else str(t_time),
+            'symbol': symbol,
+            'pnl': pnl,
+            'balance': self.current_balance
+        })
+        tag = "WIN" if pnl >= 0 else "LOSS"
+        logger.info(f"[{tag}] PnL: ${pnl:.4f} | New Bal: ${self.current_balance:.2f} | Streak: {self.consecutive_losses}")
+
+    def record_error(self):
+        halted, reason = self.circuit_breaker.record_error()
+        if halted:
+            logger.error(f"CIRCUIT BREAKER HALT: {reason}")
+
+    def reset_daily(self):
+        self.daily_pnl = 0.0
+        self.daily_trades = 0
+
+    def get_stats(self) -> Dict:
+        total = len(self.trade_log)
+        wins = sum(1 for t in self.trade_log if t['pnl'] > 0)
+        losses = total - wins
+        total_pnl = sum(t['pnl'] for t in self.trade_log)
+        wr = (wins / total * 100) if total > 0 else 0
+        dd = (self.peak_balance - self.current_balance) / self.peak_balance * 100 if self.peak_balance > 0 else 0
+        halted, halt_reason = self.circuit_breaker.is_halted()
+        return {
+            'total_trades': total,
+            'wins': wins,
+            'losses': losses,
+            'win_rate': wr,
+            'total_pnl': total_pnl,
+            'max_drawdown': dd,
+            'balance': self.current_balance,
+            'peak': self.peak_balance,
+            'portfolio_heat': sum(self.symbol_exposure.values()),
+            'circuit_breaker_halted': halted,
+            'circuit_breaker_reason': halt_reason,
+        }
+

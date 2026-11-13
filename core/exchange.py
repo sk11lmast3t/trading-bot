@@ -11,6 +11,7 @@ Execution Quality Enhancements (P1):
 import ccxt
 import pandas as pd
 import logging
+import math
 import time
 import random
 from enum import Enum
@@ -147,7 +148,19 @@ class ExchangeConnector:
         df.set_index('timestamp', inplace=True)
         return df
 
-    def fetch_orderbook(self, symbol: str, limit: int = 10) -> Dict:
+    def fetch_orderbook(self, symbol: str, limit: int = 20) -> Dict:
+        """Fetch a public order book using a venue-supported depth.
+
+        KuCoin Futures only accepts 20 or 100 levels. Validate before calling so
+        an unsupported value cannot raise on every cycle; callers treat None as
+        "order book unavailable".
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit not in (20, 100):
+            logger.warning(
+                "Skipping public order-book use for %s: unsupported limit %r (use 20 or 100)",
+                symbol, limit,
+            )
+            return None
         return self.exchange.fetch_order_book(symbol, limit)
 
     def fetch_balance(self) -> Dict:
@@ -220,7 +233,10 @@ class ExchangeConnector:
         # Slippage check for market orders
         if check_slippage and self.exec_cfg.slippage_model_enabled and order_type == 'market':
             try:
-                orderbook = self.fetch_orderbook(symbol, limit=self.exec_cfg.slippage_depth_levels)
+                requested_depth = getattr(
+                    getattr(self.config, "strategy", None), "orderbook_depth", 20)
+                depth = requested_depth if requested_depth in (20, 100) else 20
+                orderbook = self.fetch_orderbook(symbol, limit=depth)
                 ticker = self.exchange.fetch_ticker(symbol)
                 mid_price = (ticker.get('bid', 0) + ticker.get('ask', 0)) / 2 or ticker.get('last', 0)
                 if mid_price > 0:
@@ -334,7 +350,7 @@ class ExchangeConnector:
                                         post_only: bool = True, params: dict = None):
         """Place a post-only limit order at the best bid (buy) or best ask (sell)."""
         try:
-            orderbook = self.fetch_orderbook(symbol, limit=1)
+            orderbook = self.fetch_orderbook(symbol, limit=20)
         except Exception as e:
             logger.warning(f'[{symbol}] Failed to fetch orderbook for best-bid/ask: {e}')
             return None
@@ -414,6 +430,9 @@ class PaperExchange:
         self.reject_chance = self.exec_cfg.paper_reject_chance
         self._public_exchanges = []
         self._current_public = None
+        self._requested_leverage = {}
+        self._orderbook_last_warning = {}
+        self._orderbook_cache = {}
         self._init_public_exchanges()
 
     @property
@@ -444,15 +463,33 @@ class PaperExchange:
             logger.error("failed to initialize candle exchange %s: %s", name, e)
             raise
         self._public_exchanges = [self._current_public]
+        self._market_metadata = {}
+        self._market_metadata_error = None
+        load_markets = getattr(self._current_public, 'load_markets', None)
+        if callable(load_markets):
+            try:
+                markets = load_markets()
+                if isinstance(markets, dict) and markets:
+                    self._market_metadata = markets
+                else:
+                    self._market_metadata_error = "exchange returned no market metadata"
+                    logger.warning("public market limits are unavailable for %s", name)
+            except Exception as e:
+                self._market_metadata_error = str(e)
+                logger.warning("could not load public market limits for %s: %s",
+                               name, e)
         logger.info("Pinned candle source to %s", getattr(self._current_public, 'id', name))
 
-    def fetch_ohlcv(self, symbol: str, timeframe: str = '1m', limit: int = 200):
+    def fetch_ohlcv(self, symbol: str, timeframe: str = '1m', limit: int = 200, since=None):
         ex = self._current_public
         if ex is None:
             logger.error("no pinned candle exchange for %s %s; skipping", symbol, timeframe)
             return None
         try:
-            ohlcv = ex.fetch_ohlcv(symbol, timeframe, limit=limit)
+            if since is None:
+                ohlcv = ex.fetch_ohlcv(symbol, timeframe, limit=limit)
+            else:
+                ohlcv = ex.fetch_ohlcv(symbol, timeframe, since=int(since), limit=limit)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
@@ -461,6 +498,39 @@ class PaperExchange:
             logger.error("pinned candle exchange %s failed for %s %s: %s; skipping bar",
                          getattr(ex, 'id', self.config.exchange.name), symbol, timeframe, e)
             return None
+
+    def fetch_orderbook(self, symbol: str, limit: int = 20):
+        """Fetch public market context only; this method cannot submit an order."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit not in (20, 100):
+            self._warn_orderbook_once(symbol, f"unsupported configured limit {limit!r}; use 20 or 100")
+            return None
+        cache_key = (str(symbol), limit)
+        cached = getattr(self, "_orderbook_cache", {}).get(cache_key)
+        if cached and time.monotonic() - cached[0] <= 5.0:
+            return cached[1]
+        ex = self._current_public
+        if ex is None or not callable(getattr(ex, 'fetch_order_book', None)):
+            self._warn_orderbook_once(symbol, "public order-book endpoint unavailable")
+            getattr(self, "_orderbook_cache", {})[cache_key] = (time.monotonic(), None)
+            return None
+        try:
+            book = ex.fetch_order_book(symbol, limit=limit)
+            self._orderbook_cache[cache_key] = (time.monotonic(), book)
+            return book
+        except Exception as e:
+            self._warn_orderbook_once(symbol, f"public order-book request failed: {e}")
+            self._orderbook_cache[cache_key] = (time.monotonic(), None)
+            return None
+
+    def _warn_orderbook_once(self, symbol, message):
+        warnings = getattr(self, "_orderbook_last_warning", None)
+        if warnings is None:
+            warnings = self._orderbook_last_warning = {}
+        key = (str(symbol), str(message))
+        now = time.monotonic()
+        if now - warnings.get(key, 0.0) >= 300.0:
+            logger.warning("Skipping public order-book use for %s: %s", symbol, message)
+            warnings[key] = now
 
 
     def _simulate_latency(self):
@@ -488,10 +558,129 @@ class PaperExchange:
         return self.positions.get(symbol)
 
     def set_leverage(self, symbol: str, leverage: int):
-        pass
+        adaptive = getattr(self.config, 'adaptive_leverage', None)
+        maximum = min(float(adaptive.max_leverage), 3.0) if adaptive and adaptive.enabled else 1.0
+        value = float(leverage)
+        if not math.isfinite(value) or value < 1.0 or value > maximum:
+            raise ValueError("Paper leverage is outside the configured safe range")
+        self._requested_leverage[symbol] = value
+
+    def update_mark_price(self, symbol: str, price: float):
+        position = self.positions.get(symbol)
+        value = float(price)
+        if position and math.isfinite(value) and value > 0:
+            position['markPrice'] = value
+
+    def liquidation_price(self, symbol: str):
+        position = self.positions.get(symbol)
+        if not position:
+            return None
+        leverage = float(position.get('leverage') or 1.0)
+        if leverage <= 1.0:
+            return None
+        maintenance = float(self.config.adaptive_leverage.maintenance_margin_rate)
+        entry = float(position.get('entryPrice') or 0.0)
+        if entry <= 0 or maintenance >= 1.0 / leverage:
+            return None
+        if position.get('side') == 'long':
+            return entry * (1.0 - 1.0 / leverage + maintenance)
+        return entry * (1.0 + 1.0 / leverage - maintenance)
 
     def create_market_order(self, symbol: str, side: str, amount: float, params: dict = None) -> Dict:
         self._simulate_latency()
+        params = params if isinstance(params, dict) else {}
+        price = params.get('price')
+        reason = None
+        if getattr(self, '_market_metadata_error', None):
+            reason = "Public market limits are unavailable; paper order rejected safely"
+        try:
+            amount, price = float(amount), float(price)
+        except (TypeError, ValueError):
+            reason = "Execution amount and price must be finite positive numbers"
+        if reason is None and (not math.isfinite(amount) or amount <= 0 or
+                               not math.isfinite(price) or price <= 0):
+            reason = "Execution amount and price must be finite positive numbers"
+        if reason is None and str(side).lower() not in ('buy', 'sell', 'long', 'short'):
+            reason = f"Unsupported paper order side: {side}"
+        adaptive = getattr(self.config, 'adaptive_leverage', None)
+        adaptive_enabled = bool(adaptive and adaptive.enabled)
+        try:
+            leverage = float(params.get(
+                'leverage', getattr(self, '_requested_leverage', {}).get(symbol, 1.0)))
+        except (TypeError, ValueError):
+            leverage = float('nan')
+        if reason is None:
+            max_pct = float(getattr(self.config.risk, 'max_position_size_pct', 1.0))
+            max_pct_allowed = (min(float(adaptive.max_gross_exposure_pct), 1.50)
+                               if adaptive_enabled else 1.0)
+            if not math.isfinite(max_pct) or not 0 < max_pct <= max_pct_allowed:
+                reason = "Paper position notional cap is outside the configured exposure limit"
+            elif not adaptive_enabled and float(self.config.scalping.leverage) != 1.0:
+                reason = "Adaptive leverage is disabled; paper mode requires exactly 1x leverage"
+            elif not math.isfinite(leverage) or leverage < 1.0:
+                reason = "Paper leverage must be finite and at least 1x"
+            elif not adaptive_enabled and leverage != 1.0:
+                reason = "Adaptive leverage is disabled; paper orders require 1x"
+            elif adaptive_enabled and leverage != 1.0 and not (
+                    float(adaptive.min_leverage) <= leverage <= min(float(adaptive.max_leverage), 3.0)):
+                reason = "Paper leverage is outside the configured adaptive range"
+            max_notional = self.balance * max_pct
+            if adaptive_enabled:
+                current_gross = current_margin = unrealized = 0.0
+                for position in self.positions.values():
+                    entry = float(position.get('entryPrice') or 0.0)
+                    mark = float(position.get('markPrice') or entry)
+                    contracts = float(position.get('contracts') or 0.0)
+                    current_gross += mark * contracts
+                    current_margin += float(position.get('margin') or
+                                             (mark * contracts / max(float(position.get('leverage') or 1.0), 1.0)))
+                    unrealized += ((mark - entry) * contracts *
+                                   (1.0 if position.get('side') == 'long' else -1.0))
+                equity = self.balance + unrealized
+                max_notional = min(max_notional,
+                                   max(0.0, equity * min(float(adaptive.max_gross_exposure_pct), 1.50)
+                                       - current_gross))
+                required_margin = amount * price / leverage
+                margin_cap = equity * min(float(adaptive.max_margin_allocation_pct), 0.50)
+                available_margin = max(0.0, min(equity - current_margin,
+                                                margin_cap - current_margin))
+                if required_margin > available_margin + 1e-9:
+                    reason = (f"Required margin {required_margin:.8f} exceeds "
+                              f"available margin {available_margin:.8f}")
+            else:
+                required_margin = amount * price
+                available_margin = self.balance
+                if required_margin > available_margin + 1e-9:
+                    reason = (f"Required margin {required_margin:.8f} exceeds "
+                              f"available balance {available_margin:.8f}")
+        if reason is None:
+            if amount * price > max_notional + 1e-9:
+                reason = (f"Paper order notional {amount * price:.8f} exceeds "
+                          f"configured maximum {max_notional:.8f}")
+        if reason is None:
+            metadata = getattr(self, '_market_metadata', {})
+            if metadata and symbol not in metadata:
+                reason = f"Paper order rejected: no market metadata for {symbol}"
+            market = metadata.get(symbol, {}) if isinstance(metadata, dict) else {}
+            limits = market.get('limits', {}) if isinstance(market, dict) else {}
+            min_cost = ((limits.get('cost') or {}).get('min'))
+            min_amount = ((limits.get('amount') or {}).get('min'))
+            if reason is None and min_cost is not None and amount * price < float(min_cost):
+                reason = (f"Paper order notional {amount * price:.8f} is below "
+                          f"market minimum {float(min_cost):.8f}")
+            elif reason is None and min_amount is not None and amount < float(min_amount):
+                reason = (f"Paper order amount {amount:.12g} is below "
+                          f"market minimum {float(min_amount):.12g}")
+        if reason is not None:
+            self.order_id += 1
+            order = {
+                'id': f"paper_{self.order_id}", 'symbol': symbol, 'side': side,
+                'amount': amount if isinstance(amount, (int, float)) else 0.0,
+                'price': 0.0, 'status': 'rejected',
+                'timestamp': datetime.now().isoformat(), 'reject_reason': reason,
+            }
+            self.trade_history.append(order)
+            return order
         reject_reason = self._simulate_outcome()
         if reject_reason:
             self.order_id += 1
@@ -514,7 +703,55 @@ class PaperExchange:
             fill_ratio = random.uniform(0.5, 0.95)
 
         filled_amount = amount * fill_ratio
-        price = self._simulate_slippage(params.get('price', 0.0) if params else 0.0, side)
+        price = self._simulate_slippage(price, side)
+        if not math.isfinite(price) or price <= 0:
+            self.order_id += 1
+            order = {
+                'id': f"paper_{self.order_id}", 'symbol': symbol, 'side': side,
+                'amount': amount, 'filled': 0.0, 'price': 0.0, 'status': 'rejected',
+                'timestamp': datetime.now().isoformat(),
+                'reject_reason': "Simulated execution price is not finite and positive",
+            }
+            self.trade_history.append(order)
+            return order
+        if filled_amount * price > max_notional + 1e-9:
+            self.order_id += 1
+            order = {
+                'id': f"paper_{self.order_id}", 'symbol': symbol, 'side': side,
+                'amount': amount, 'filled': 0.0, 'price': 0.0, 'status': 'rejected',
+                'timestamp': datetime.now().isoformat(),
+                'reject_reason': (f"Slippage-adjusted paper notional {filled_amount * price:.8f} "
+                                  f"exceeds configured maximum {max_notional:.8f}"),
+            }
+            self.trade_history.append(order)
+            return order
+        filled_margin = filled_amount * price / leverage
+        if filled_margin > available_margin + 1e-9:
+            self.order_id += 1
+            order = {
+                'id': f"paper_{self.order_id}", 'symbol': symbol, 'side': side,
+                'amount': amount, 'filled': 0.0, 'price': 0.0, 'status': 'rejected',
+                'timestamp': datetime.now().isoformat(),
+                'reject_reason': "Slippage-adjusted fill exceeds available paper margin",
+            }
+            self.trade_history.append(order)
+            return order
+        metadata = getattr(self, '_market_metadata', {})
+        market = metadata.get(symbol, {}) if isinstance(metadata, dict) else {}
+        limits = market.get('limits', {}) if isinstance(market, dict) else {}
+        min_cost = (limits.get('cost') or {}).get('min')
+        min_amount = (limits.get('amount') or {}).get('min')
+        if ((min_cost is not None and filled_amount * price < float(min_cost)) or
+                (min_amount is not None and filled_amount < float(min_amount))):
+            self.order_id += 1
+            order = {
+                'id': f"paper_{self.order_id}", 'symbol': symbol, 'side': side,
+                'amount': amount, 'filled': 0.0, 'price': 0.0, 'status': 'rejected',
+                'timestamp': datetime.now().isoformat(),
+                'reject_reason': "Simulated fill is below the exchange market minimum",
+            }
+            self.trade_history.append(order)
+            return order
 
         self.order_id += 1
         order = {
@@ -535,6 +772,9 @@ class PaperExchange:
                 'side': 'long',
                 'contracts': filled_amount,
                 'entryPrice': price,
+                'markPrice': price,
+                'leverage': leverage,
+                'margin': filled_margin,
                 'timestamp': datetime.now().isoformat(),
             }
         else:
@@ -543,6 +783,9 @@ class PaperExchange:
                 'side': 'short',
                 'contracts': filled_amount,
                 'entryPrice': price,
+                'markPrice': price,
+                'leverage': leverage,
+                'margin': filled_margin,
                 'timestamp': datetime.now().isoformat(),
             }
         self.trade_history.append(order)
@@ -617,11 +860,7 @@ class PaperExchange:
         """Best bid for buys, best ask for sells from the public orderbook."""
         if self._current_public is None:
             return None
-        try:
-            orderbook = self._current_public.fetch_order_book(symbol, limit=1)
-        except Exception as e:
-            logger.warning('orderbook fetch failed for %s: %s' % (symbol, e))
-            return None
+        orderbook = self.fetch_orderbook(symbol, 20)
         if not orderbook:
             return None
         if side in ('buy', 'long'):
@@ -722,6 +961,16 @@ class PaperExchange:
         to_cancel = [k for k,v in self.orders.items() if v.get('symbol') == symbol]
         self.orders = {k: v for k, v in self.orders.items() if v.get('symbol') != symbol}
         return len(to_cancel)
+
+    def cancel_entry_orders(self):
+        """Cancel all open simulated entries while retaining reduce-only orders."""
+        cancelled = 0
+        for order_id, order in list(self.orders.items()):
+            if order.get('status') == 'open' and not order.get('reduceOnly'):
+                order['status'] = 'cancelled'
+                self.orders.pop(order_id, None)
+                cancelled += 1
+        return cancelled
 
     def get_order(self, order_id: str) -> Optional[Dict]:
         return self.orders.get(order_id)
