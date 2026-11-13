@@ -570,6 +570,18 @@ def test_plausible_sqlite_stop_is_kept(tmp_path):
         None, None) == pytest.approx(105.0)
 
 
+def test_snapshot_sl_disagreement_is_logged(tmp_path, caplog):
+    bot = _make_bot(tmp_path)
+
+    restored = bot._restore_original_stop(
+        {"symbol": SYMBOL, "entry_price": ENTRY, "side": "long", "sl": 95.0},
+        {"sl": 90.0}, None)
+
+    assert restored == pytest.approx(95.0)
+    assert "snapshot.sl" in caplog.text
+    assert "differs from authoritative sqlite.sl" in caplog.text
+
+
 # --------------------------------------------------------------------------
 # L1: exchange synchronization keeps the full metadata schema
 # --------------------------------------------------------------------------

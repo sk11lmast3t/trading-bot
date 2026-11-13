@@ -1801,14 +1801,15 @@ class UnifiedCryptoBot:
                     "the position will be treated as unpriced risk", symbol)
             return None
         if isinstance(snapshot_position, dict):
-            for label, value in candidates[1:3]:
-                other = _positive_float(value)
+            for label, value in candidates[1:4]:
+                other = (plausible_protective_stop(value, entry, side, max_distance)
+                         if entry is not None and side is not None
+                         else _positive_float(value))
                 if other is not None and abs(other - original) > max(1e-12, original * 1e-9):
                     logger.warning(
                         "[%s] Snapshot %s=%.8f differs from authoritative %s "
                         "stop=%.8f; keeping %s", symbol, label, other, source,
                         original, source)
-                    break
         logger.info("[%s] Restored original protective stop %.8f from %s",
                     symbol, original, source)
         return original
