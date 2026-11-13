@@ -8,10 +8,21 @@ Enhancements:
 - Trailing stop & breakeven activation
 """
 import logging
+import math
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def valid_stop_price(value) -> Optional[float]:
+    """Return a finite positive stop price, or None when unusable."""
+    try:
+        stop = float(value)
+    except (TypeError, ValueError):
+        return None
+    return stop if math.isfinite(stop) and stop > 0 else None
+
 
 def normalize_side(side: str) -> str:
     s = str(side).strip().lower()
@@ -162,11 +173,15 @@ class RiskManager:
             'leverage': float(leverage),
             'quantity': float(quantity),
             'strategy': strategy,
+            # The original protective stop is kept separate from the active
+            # trailing stop so recovery never loses the exchange-level stop.
             'stop_price': stop_price,
+            'original_stop': stop_price,
             'side': side,
             'entry_time': self.clock(),
             'entry_price': None,
             'mark_price': None,
+            'last_mark_price': None,
             'high_watermark': None,
             'low_watermark': None,
             'trailing_stop': None,
@@ -294,15 +309,39 @@ class RiskManager:
         return (float(entry) * (entry_fee + entry_slip + funding) +
                 float(stop) * (exit_fee + exit_slip))
 
+    def effective_stop_price(self, position: dict) -> Optional[float]:
+        """Return the protective stop that would actually cap the loss.
+
+        The original stop and the active trailing stop are both honoured: a
+        long keeps the higher (more protective) level, a short the lower one.
+        A missing or invalid level is never treated as zero risk; if neither
+        level is usable this returns None so callers can block instead.
+        """
+        try:
+            side = normalize_side(position.get("side", "long"))
+        except (TypeError, ValueError):
+            return None
+        original = valid_stop_price(position.get("original_stop"))
+        if original is None:
+            original = valid_stop_price(position.get("stop_price"))
+        if original is None:
+            original = valid_stop_price(position.get("sl"))
+        trailing = valid_stop_price(position.get("trailing_stop"))
+        if original is None:
+            return trailing
+        if trailing is None:
+            return original
+        return max(original, trailing) if side == "long" else min(original, trailing)
+
     def stop_risk_for_position(self, position: dict) -> Optional[float]:
         try:
             entry = float(position.get("entry_price") or position.get("entryPrice") or 0.0)
-            stop = float(position.get("stop_price") or position.get("sl") or 0.0)
             quantity = float(position.get("quantity") or position.get("contracts") or position.get("size") or 0.0)
             side = normalize_side(position.get("side", "long"))
         except (TypeError, ValueError):
             return None
-        if min(entry, stop, quantity) <= 0:
+        stop = self.effective_stop_price(position)
+        if stop is None or not math.isfinite(entry) or entry <= 0 or quantity <= 0:
             return None
         distance = max(0.0, entry - stop) if side == "long" else max(0.0, stop - entry)
         return distance * quantity + quantity * self.stop_costs_per_unit(entry, stop)

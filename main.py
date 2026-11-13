@@ -110,6 +110,23 @@ def _number_or_none(value):
         return None
 
 
+def _positive_float(value):
+    """Return a finite positive float, or None for missing/invalid input."""
+    number = _number_or_none(value)
+    return number if number is not None and math.isfinite(number) and number > 0 else None
+
+
+def _bool_value(value):
+    """Interpret snapshot booleans without treating the string 'False' as True."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
 def _order_fill_price(order, fallback):
     if isinstance(order, dict):
         value = order.get("average") or order.get("average_price") or order.get("price")
@@ -1416,6 +1433,213 @@ class UnifiedCryptoBot:
         except Exception as e:
             logger.error(f"persist_state failed: {e}")
 
+    def _restore_original_stop(self, row, snapshot_position, targets):
+        """Pick the authoritative original protective stop and keep it separate."""
+        symbol = row.get('symbol')
+        candidates = [("sqlite.sl", row.get('sl'))]
+        if isinstance(snapshot_position, dict):
+            candidates.extend([
+                ("snapshot.original_stop", snapshot_position.get('original_stop')),
+                ("snapshot.stop_price", snapshot_position.get('stop_price')),
+                ("snapshot.sl", snapshot_position.get('sl')),
+            ])
+        if isinstance(targets, dict):
+            candidates.append(("position_targets.sl", targets.get('sl')))
+        original, source = None, None
+        for label, value in candidates:
+            stop = _positive_float(value)
+            if stop is not None:
+                original, source = stop, label
+                break
+        if original is None:
+            if any(value is not None and value != "" for _, value in candidates):
+                logger.warning(
+                    "[%s] Protective stop values exist but none is valid: %s; "
+                    "the position will be treated as unpriced risk", symbol, candidates)
+            else:
+                logger.warning(
+                    "[%s] No protective stop in SQLite or the JSON snapshot", symbol)
+            return None
+        if isinstance(snapshot_position, dict):
+            for label, value in candidates[1:3]:
+                other = _positive_float(value)
+                if other is not None and abs(other - original) > max(1e-12, original * 1e-9):
+                    logger.warning(
+                        "[%s] Snapshot %s=%.8f differs from authoritative SQLite "
+                        "stop=%.8f; keeping SQLite", symbol, label, other, original)
+                    break
+        logger.info("[%s] Restored original protective stop %.8f from %s",
+                    symbol, original, source)
+        return original
+
+    def _breakeven_stop(self, entry, side):
+        entry = _positive_float(entry)
+        if entry is None:
+            return None
+        offset = _number_or_none(
+            getattr(getattr(self.risk_manager, "rc", None), "round_trip_cost_pct", 0.0))
+        offset = max(0.0, float(offset or 0.0))
+        return entry * (1 + offset) if side == "long" else entry * (1 - offset)
+
+    def _merge_restored_dynamic_state(self, symbol, pos, snapshot_position):
+        """Restore trailing/breakeven/watermark state, trusting SQLite identity."""
+        entry = _positive_float(pos.get('entry_price')) or 0.0
+        raw_side = str(pos.get('side') or 'long').strip().lower()
+        side = 'long' if raw_side in ('buy', 'long') else 'short'
+        quantity = _positive_float(pos.get('quantity')) or 0.0
+        if not isinstance(snapshot_position, dict):
+            logger.warning(
+                "[%s] No matching JSON snapshot; keeping the SQLite original stop "
+                "and starting trailing/breakeven state fresh", symbol)
+            pos['high_watermark'] = entry
+            pos['low_watermark'] = entry
+            pos['trailing_stop'] = None
+            pos['breakeven_armed'] = False
+            pos['mark_price'] = None
+            pos['last_mark_price'] = None
+            return
+
+        snap_side = str(snapshot_position.get('side') or '').strip().lower()
+        snap_side = ('long' if snap_side in ('buy', 'long') else
+                     'short' if snap_side in ('sell', 'short') else '')
+        if snap_side and snap_side != side:
+            logger.warning("[%s] Snapshot side=%s disagrees with SQLite side=%s; keeping SQLite",
+                           symbol, snap_side, side)
+        snap_qty = _positive_float(snapshot_position.get('quantity'))
+        if snap_qty is not None and quantity > 0 and abs(snap_qty - quantity) > max(1e-12, quantity * 1e-9):
+            logger.warning(
+                "[%s] Snapshot quantity=%.12f disagrees with SQLite quantity=%.12f; keeping SQLite",
+                symbol, snap_qty, quantity)
+        snap_entry = _positive_float(snapshot_position.get('entry_price'))
+        if snap_entry is not None and entry > 0 and abs(snap_entry - entry) > max(1e-12, entry * 1e-9):
+            logger.warning(
+                "[%s] Snapshot entry=%.8f disagrees with SQLite entry=%.8f; keeping SQLite",
+                symbol, snap_entry, entry)
+
+        armed = _bool_value(snapshot_position.get('breakeven_armed'))
+        raw_trailing = snapshot_position.get('trailing_stop')
+        trailing = _positive_float(raw_trailing)
+        if trailing is None and raw_trailing not in (None, '', 0, 0.0):
+            logger.warning("[%s] Snapshot trailing_stop=%r is malformed; ignoring it",
+                           symbol, raw_trailing)
+        if armed and trailing is None:
+            trailing = self._breakeven_stop(entry, side)
+            if trailing is not None:
+                logger.warning(
+                    "[%s] Breakeven was armed but the trailing stop was missing or "
+                    "corrupt; reconstructed protective stop at %.8f", symbol, trailing)
+            else:
+                logger.warning(
+                    "[%s] Breakeven was armed but entry is invalid; the protective "
+                    "stop could not be reconstructed", symbol)
+        pos['trailing_stop'] = trailing
+        pos['breakeven_armed'] = bool(armed)
+
+        raw_high = snapshot_position.get('high_watermark')
+        raw_low = snapshot_position.get('low_watermark')
+        high = _positive_float(raw_high)
+        low = _positive_float(raw_low)
+        if high is None or low is None or high < low:
+            if raw_high is not None or raw_low is not None:
+                logger.warning(
+                    "[%s] Watermark snapshot malformed (high=%r low=%r); resetting to entry",
+                    symbol, raw_high, raw_low)
+            high = low = entry
+        if entry > 0:
+            high = max(high, entry)
+            low = min(low, entry)
+        pos['high_watermark'] = high
+        pos['low_watermark'] = low
+
+        raw_mark = snapshot_position.get('mark_price')
+        mark = _positive_float(raw_mark)
+        if raw_mark is not None and mark is None:
+            logger.warning("[%s] Snapshot mark_price=%r is malformed; ignoring the stale value",
+                           symbol, raw_mark)
+        pos['last_mark_price'] = mark
+        # Keep the historical mark for reference only. A fresh public price is
+        # fetched below and replaces it before risk or equity uses the value.
+        pos['mark_price'] = mark
+        logger.info(
+            "[%s] Restored dynamic risk state: trailing=%s breakeven=%s high=%.8f "
+            "low=%.8f last_mark=%s", symbol, trailing, armed, high, low, mark)
+
+    def _sync_exchange_position(self, symbol, pos):
+        """Make the paper simulator agree with the reconstructed risk position."""
+        if self.config.mode != "paper" or not isinstance(self.exchange, PaperExchange):
+            return
+        positions = getattr(self.exchange, 'positions', None)
+        if positions is None:
+            return
+        existing = positions.get(symbol)
+        if not isinstance(existing, dict):
+            existing = {}
+        side = 'long' if str(pos.get('side') or 'long').lower() in ('long', 'buy') else 'short'
+        original = (_positive_float(pos.get('original_stop'))
+                    or _positive_float(pos.get('stop_price'))
+                    or _positive_float(pos.get('sl')))
+        entry = _positive_float(pos.get('entry_price')) or 0.0
+        quantity = _positive_float(pos.get('quantity')) or 0.0
+        leverage = _positive_float(pos.get('leverage')) or 1.0
+        margin = _positive_float(pos.get('margin'))
+        if margin is None:
+            margin = entry * quantity / leverage if entry and quantity else 0.0
+        existing.update({
+            'symbol': symbol,
+            'side': side,
+            'contracts': quantity,
+            'entryPrice': entry,
+            'leverage': leverage,
+            'margin': margin,
+            'tp': pos.get('tp'),
+            'sl': original,
+            'original_stop': original,
+            'trailing_stop': pos.get('trailing_stop'),
+            'breakeven_armed': bool(pos.get('breakeven_armed')),
+            'high_watermark': pos.get('high_watermark'),
+            'low_watermark': pos.get('low_watermark'),
+        })
+        mark = _positive_float(pos.get('mark_price'))
+        if mark is not None:
+            existing['markPrice'] = mark
+            existing['mark_price'] = mark
+        existing.setdefault('timestamp', pos.get('entry_time'))
+        positions[symbol] = existing
+        logger.info(
+            "[%s] Reconciled paper exchange with risk state (side=%s qty=%.12f "
+            "entry=%.8f original_stop=%s trailing=%s)", symbol, side, quantity,
+            entry, original, pos.get('trailing_stop'))
+
+    def _refresh_restored_marks(self):
+        """Replace restored snapshot marks with fresh public prices, never stale."""
+        if self.config.mode != "paper":
+            return
+        for symbol, pos in list(self.risk_manager.open_positions.items()):
+            try:
+                targets = getattr(self, 'position_targets', {}).get(symbol, {})
+                timeframe = targets.get('timeframe') or self.config.scalping.timeframe
+                df = self.exchange.fetch_ohlcv(symbol, timeframe, limit=2)
+                if df is None or len(df) == 0:
+                    raise ValueError("no public candles returned")
+                price = _positive_float(df.iloc[-1]['close'])
+                if price is None:
+                    raise ValueError("public candle close is not a valid price")
+                self.risk_manager.update_position_price(symbol, price)
+                update_mark = getattr(self.exchange, 'update_mark_price', None)
+                if callable(update_mark):
+                    update_mark(symbol, price)
+                pos['mark_price'] = price
+                self._sync_exchange_position(symbol, pos)
+                logger.info("[%s] Refreshed restored mark from public candles at %.8f",
+                            symbol, price)
+            except Exception as e:
+                # Do not let a stale snapshot price stand in for a fresh mark.
+                pos['mark_price'] = None
+                self._sync_exchange_position(symbol, pos)
+                logger.warning(
+                    "[%s] Could not refresh the restored mark (%s); equity uses the "
+                    "entry price instead of the stale snapshot mark", symbol, e)
+
     def load_state(self):
         import core.state as cstate
         try:
@@ -1423,6 +1647,38 @@ class UnifiedCryptoBot:
         except Exception as e:
             logger.error(f"load_state failed: {e}")
             self.loaded_positions = []
+        path = self._state_path()
+        snapshot = None
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    snapshot = json.load(f)
+                if not isinstance(snapshot, dict):
+                    logger.warning(
+                        "State snapshot at %s is not a JSON object; ignoring dynamic state", path)
+                    snapshot = None
+            except Exception as e:
+                logger.warning(
+                    "State snapshot at %s is unreadable (%s); keeping SQLite original "
+                    "stops and skipping dynamic trailing state", path, e)
+                snapshot = None
+        else:
+            logger.warning(
+                "No state snapshot at %s; keeping SQLite original stops and starting "
+                "dynamic trailing state fresh", path)
+        snapshot_positions = {}
+        if snapshot is not None:
+            raw_positions = snapshot.get('open_positions')
+            if isinstance(raw_positions, dict):
+                snapshot_positions = raw_positions
+            elif raw_positions is not None:
+                logger.warning(
+                    "State snapshot open_positions is malformed (%s); ignoring it",
+                    type(raw_positions).__name__)
+        snapshot_targets = snapshot.get('position_targets', {}) if snapshot is not None else {}
+        if not isinstance(snapshot_targets, dict):
+            logger.warning("State snapshot position_targets is malformed; ignoring it")
+            snapshot_targets = {}
         try:
             ex_positions = {}
             try:
@@ -1488,21 +1744,26 @@ class UnifiedCryptoBot:
                 pos.setdefault('leverage', 1.0)
                 pos.setdefault('margin', float(pos.get('notional') or 0.0) /
                                max(float(pos.get('leverage') or 1.0), 1.0))
-                pos.setdefault('mark_price', pos.get('entry_price'))
+                # SQLite owns identity/side/quantity/entry/TP/original SL,
+                # strategy, leverage and margin. The JSON snapshot only
+                # restores the dynamic risk-management fields.
+                pos['original_stop'] = self._restore_original_stop(
+                    pp, snapshot_positions.get(sym), snapshot_targets.get(sym))
+                pos['stop_price'] = pos['original_stop']
+                pos.setdefault('mark_price', None)
                 rm.symbol_exposure[sym] = float(pos.get('notional') or 0.0)
-                pos.setdefault('high_watermark', pos.get('entry_price'))
-                pos.setdefault('low_watermark', pos.get('entry_price'))
+                self._merge_restored_dynamic_state(sym, pos, snapshot_positions.get(sym))
                 rm.open_positions[sym] = pos
+                self._sync_exchange_position(sym, pos)
             rm._refresh_equity_drawdown()
-            path = self._state_path()
-            if os.path.exists(path):
+            if snapshot is not None:
                 try:
-                    with open(path) as f:
-                        data = json.load(f)
-                    self.position_targets = data.get(
-                        'position_targets', getattr(self, 'position_targets', {}))
-                    self.position_entry_cycle = data.get(
-                        'position_entry_cycle', getattr(self, 'position_entry_cycle', {}))
+                    data = snapshot
+                    self.position_targets = snapshot_targets
+                    entry_cycle = data.get('position_entry_cycle')
+                    self.position_entry_cycle = (
+                        entry_cycle if isinstance(entry_cycle, dict)
+                        else getattr(self, 'position_entry_cycle', {}))
                     if self.config.mode == "paper":
                         self.cycle_count = int(data.get(
                             'cycle_count', getattr(self, 'cycle_count', 0)))
@@ -1578,6 +1839,7 @@ class UnifiedCryptoBot:
                             'peak_balance', self.risk_manager.circuit_breaker.peak_balance))
                 except Exception:
                     pass
+            self._refresh_restored_marks()
             rm._refresh_equity_drawdown()
             if os.environ.get('RECONCILE_CONFIRM') == '1':
                 self.entries_blocked = False
