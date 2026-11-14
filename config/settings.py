@@ -123,6 +123,10 @@ class RiskConfig:
     trailing_stop_pct: float = 0.002               # Trail at 0.20% distance from peak
     breakeven_activation_pct: float = 0.002        # Move stop to breakeven at +0.20% profit
     round_trip_cost_pct: float = 0.0025            # Fee-adjusted breakeven offset (0.25%)
+    # Restart-recovery sanity bands. They reject corrupt watermarks/stops while
+    # still allowing legitimate large runs and trailing levels.
+    recovery_price_band_pct: float = 0.25
+    max_stop_distance_pct: float = 0.25
 
 
 @dataclass

@@ -74,7 +74,9 @@ class ReplayExchange:
                                       "id": str(self._seq)}
             return {"id": str(self._seq), "filled": float(amount), "price": price}
 
-    def close_position(self, symbol, exit_price):
+    def close_position(self, symbol, exit_price, apply_slippage=True):
+        # Replay prices already include the modelled fill; the flag exists for
+        # parity with PaperExchange.close_position.
         return self.positions.pop(symbol, None)
 
 

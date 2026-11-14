@@ -158,6 +158,13 @@ def record_trade(pnl, symbol, exit_reason, exit_time=None, *, strategy="", notio
 
 
 def record_event(event_type, payload, ts=None):
+    """Insert one lifecycle event.
+
+    NOTE: as of this audit the bot does not call this function during normal
+    operation, so the ``events`` table stays empty unless a caller or the
+    ``stats`` report queries it. It is kept as an explicit, tested API for
+    future telemetry rather than being claimed as populated.
+    """
     if ts is None:
         ts = datetime.utcnow().isoformat()
     conn = _conn()
@@ -171,13 +178,37 @@ def record_event(event_type, payload, ts=None):
 def load_open_positions():
     conn = _conn()
     try:
-        rows = conn.execute("SELECT * FROM positions WHERE status='open'").fetchall()
-        return [dict(r) for r in rows]
+        rows = conn.execute(
+            "SELECT * FROM positions WHERE status='open' ORDER BY id ASC"
+        ).fetchall()
+        # A symbol can accumulate duplicate open rows if a process died between
+        # the insert and the close update. The latest row is authoritative, and
+        # ordering by id makes the choice deterministic across runs.
+        ordered = []
+        index = {}
+        for row in rows:
+            entry = dict(row)
+            symbol = entry.get("symbol")
+            if not symbol:
+                ordered.append(entry)
+                continue
+            if symbol in index:
+                ordered[index[symbol]] = entry
+            else:
+                index[symbol] = len(ordered)
+                ordered.append(entry)
+        return ordered
     finally:
         conn.close()
 
 
 def save_risk_state(key, value):
+    """Upsert a key/value risk marker.
+
+    NOTE: currently unused by the bot lifecycle; risk telemetry is persisted
+    in the JSON state snapshot. This API is retained for isolated callers and
+    is not evidence that the ``risk_state`` table is populated in a session.
+    """
     conn = _conn()
     try:
         conn.execute("INSERT INTO risk_state (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value if isinstance(value, str) else json.dumps(value)))
@@ -187,6 +218,11 @@ def save_risk_state(key, value):
 
 
 def load_risk_state():
+    """Read all ``risk_state`` key/value pairs.
+
+    NOTE: the bot does not currently read this table during recovery; the JSON
+    snapshot is authoritative for dynamic position state.
+    """
     conn = _conn()
     try:
         rows = conn.execute("SELECT key, value FROM risk_state").fetchall()
