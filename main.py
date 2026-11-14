@@ -58,6 +58,10 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# System-wide leverage ceiling. The CLI and core.adaptive_leverage both reject
+# anything above this, so restart recovery uses the same single constant.
+MAX_SAFE_LEVERAGE = 3.0
 os.makedirs('logs', exist_ok=True)
 audit_logger = logging.getLogger('audit')
 audit_logger.setLevel(logging.INFO)
@@ -1751,6 +1755,27 @@ class UnifiedCryptoBot:
             distance = DEFAULT_MAX_STOP_DISTANCE_PCT
         return band, distance
 
+    def _restored_leverage(self, symbol, raw):
+        """Return the leverage to restore for a persisted position.
+
+        Paper positions above the safe cap are clamped (the simulator must
+        never carry more risk than the cap allows). A live position is a real
+        exchange position: its actual leverage is kept and the excess is only
+        logged, because rewriting it would misstate the margin really in use.
+        """
+        leverage = _positive_float(raw) or 1.0
+        if leverage > MAX_SAFE_LEVERAGE:
+            if self.config.mode == "live":
+                logger.warning(
+                    "[%s] Live position leverage %.4f exceeds the %.1fx safe cap; "
+                    "keeping the real value", symbol, leverage, MAX_SAFE_LEVERAGE)
+            else:
+                logger.warning(
+                    "[%s] Clamping restored paper leverage %.4f to the %.1fx safe cap",
+                    symbol, leverage, MAX_SAFE_LEVERAGE)
+                leverage = MAX_SAFE_LEVERAGE
+        return leverage
+
     def _restore_original_stop(self, row, snapshot_position, targets):
         """Pick the authoritative original protective stop and keep it separate.
 
@@ -1964,11 +1989,7 @@ class UnifiedCryptoBot:
                     or _positive_float(pos.get('sl')))
         entry = _positive_float(pos.get('entry_price')) or 0.0
         quantity = _positive_float(pos.get('quantity')) or 0.0
-        leverage = _positive_float(pos.get('leverage')) or 1.0
-        if leverage > 3.0:
-            logger.warning("[%s] Clamping restored paper leverage %.4f to the 3x safe cap",
-                           symbol, leverage)
-            leverage = 3.0
+        leverage = self._restored_leverage(symbol, pos.get('leverage'))
         notional = _positive_float(pos.get('notional'))
         if notional is None:
             notional = entry * quantity
@@ -2390,11 +2411,22 @@ class UnifiedCryptoBot:
                 malformed_rows)
             return
 
+        # Integrity problems that a RECONCILE_CONFIRM acknowledgement must not
+        # clear: only a plain DB/exchange position mismatch may be confirmed.
+        hard_blocks = []
         try:
             ex_positions = {}
             try:
                 ex_positions = self.exchange.get_positions() or {}
-            except Exception:
+            except Exception as exc:
+                # A failed query is not "no positions": the exchange may hold
+                # positions this process cannot see, so live entries stay blocked.
+                if self.config.mode == "live":
+                    logger.error(
+                        "Restart reconcile: get_positions failed (%s); cannot verify "
+                        "exchange positions, blocking new entries", exc)
+                    hard_blocks.append("exchange position query failed")
+                    self.entries_blocked = True
                 for pp, _amount, _entry in valid_rows:
                     sym = pp.get('symbol')
                     if sym:
@@ -2421,12 +2453,7 @@ class UnifiedCryptoBot:
                                 "[%s] Persisted side=%r is invalid; the paper exchange "
                                 "cannot be reconciled safely", symbol, pp.get('side'))
                             continue
-                        leverage = _positive_float(pp.get('leverage')) or 1.0
-                        if leverage > 3.0:
-                            logger.warning(
-                                "[%s] Clamping persisted paper leverage %.4f to the 3x safe cap",
-                                symbol, leverage)
-                            leverage = 3.0
+                        leverage = self._restored_leverage(symbol, pp.get('leverage'))
                         notional = amount * entry
                         margin = _positive_float(pp.get('margin'))
                         if (margin is None or margin > notional * (1.0 + 1e-9)
@@ -2453,6 +2480,7 @@ class UnifiedCryptoBot:
                     # not allow new entries while a real position is unreconciled.
                     self.entries_blocked = True
             if side_unknown:
+                hard_blocks.append("persisted side invalid")
                 self.entries_blocked = True
 
             rm = self.risk_manager
@@ -2464,6 +2492,7 @@ class UnifiedCryptoBot:
                     logger.error(
                         "[%s] Invalid persisted side=%r; restoring as unpriced risk and "
                         "blocking new entries", sym, pos.get('side'))
+                    hard_blocks.append(f"{sym}: invalid side")
                     self.entries_blocked = True
                 if pos.get('entry_time'):
                     try:
@@ -2473,12 +2502,7 @@ class UnifiedCryptoBot:
                                        sym, pos.get('entry_time'))
                         pos['entry_time'] = None
                 notional = amount * entry
-                leverage = _positive_float(pos.get('leverage')) or 1.0
-                if leverage > 3.0:
-                    logger.warning(
-                        "[%s] Clamping restored leverage %.4f to the 3x safe cap",
-                        sym, leverage)
-                    leverage = 3.0
+                leverage = self._restored_leverage(sym, pos.get('leverage'))
                 margin = _finite_float(pos.get('margin'))
                 if (margin is None or margin < 0
                         or (notional > 0 and margin > notional * (1.0 + 1e-9))
@@ -2504,6 +2528,7 @@ class UnifiedCryptoBot:
                     # zero risk. Block new entries until a human reconciles it.
                     logger.error("[%s] No usable protective stop after restore; "
                                  "blocking new entries", sym)
+                    hard_blocks.append(f"{sym}: no usable protective stop")
                     self.entries_blocked = True
                 pos['stop_price'] = pos['original_stop']
                 pos['sl'] = pos['original_stop']
@@ -2527,13 +2552,20 @@ class UnifiedCryptoBot:
                 self._restore_snapshot_account_state(snapshot)
             self._refresh_restored_marks()
             rm._refresh_equity_drawdown()
-            if (os.environ.get('RECONCILE_CONFIRM') == '1'
-                    and not getattr(self, 'mark_unavailable_symbols', set())):
-                self.entries_blocked = False
-                self.entries_blocked_by_marks = False
+            if os.environ.get('RECONCILE_CONFIRM') == '1':
+                if hard_blocks:
+                    logger.error(
+                        "RECONCILE_CONFIRM ignored; unresolved integrity problems "
+                        "keep new entries blocked: %s", "; ".join(hard_blocks))
+                elif not getattr(self, 'mark_unavailable_symbols', set()):
+                    self.entries_blocked = False
+                    self.entries_blocked_by_marks = False
             logger.info("State loaded")
         except Exception as e:
-            logger.error(f"reconcile failed: {e}")
+            # Fail closed: a crash mid-restore can leave positions only partly
+            # restored, so no new entries may open until a restart succeeds.
+            self.entries_blocked = True
+            logger.error(f"reconcile failed; new entries blocked: {e}", exc_info=True)
 
 
     def run(self):
