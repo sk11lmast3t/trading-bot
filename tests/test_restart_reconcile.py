@@ -18,7 +18,7 @@ class TestRestartReconcile(unittest.TestCase):
             self.assertFalse(bot.entries_blocked)
 
     def test_match_unblocks(self):
-        with patch('core.state.load_open_positions', return_value=[{'symbol':'BTC/USDT','side':'long','size':1,'entry_price':100}]), patch.dict('os.environ', {'RECONCILE_CONFIRM':'1'}):
+        with patch('core.state.load_open_positions', return_value=[{'symbol':'BTC/USDT','side':'long','size':1,'entry_price':100,'sl':99}]), patch.dict('os.environ', {'RECONCILE_CONFIRM':'1'}):
             bot = UnifiedCryptoBot(config=self.config)
             bot.exchange = MagicMock()
             bot.exchange.get_positions.return_value = {'BTC/USDT': {'entryPrice':'100','contracts':'1','side':'long'}}
