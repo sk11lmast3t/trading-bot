@@ -145,8 +145,11 @@ def build_prompt(name, ledger_path=None, stop_pct=0.02, min_target_pct=0.05,
 Return only source code for that one file. Do not include markdown fences.
 The candidate file may import only numpy, pandas, and core.indicators. The
 evaluation harness injects BaseStrategy, TradeSetup, and Signal. Define exactly
-one BaseStrategy subclass with analyze(df) -> TradeSetup and optional
-lookback_bars. Use one fixed rule set. Use no look-ahead and completed bars only.
+one class inheriting BaseStrategy. It may define only analyze(df) and the
+optional lookback_bars class attribute. It must NOT define __init__ or any
+other dunder name (the validator rejects dunder names). Strategy parameters
+must be class-level constants. Use one fixed rule set. Use no look-ahead and
+completed bars only.
 Do not access the filesystem, environment, network, or subprocesses.
 
 DESIGN CONSTRAINTS
@@ -159,7 +162,11 @@ DESIGN CONSTRAINTS
 
 Interface:
     class BaseStrategy:
-        def __init__(self, config): self.config = config
+        # __init__ is provided by the evaluation harness; do not define it.
+        ...
+    class Candidate(BaseStrategy):
+        lookback_bars = 100  # optional class attribute
+        PARAMETER = 10       # class-level constant
         def analyze(self, df): return TradeSetup(Signal.HOLD)
 TradeSetup(Signal.LONG|Signal.SHORT|Signal.HOLD, entry_price, stop_loss,
            take_profit, confidence, strategy_name)
