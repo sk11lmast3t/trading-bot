@@ -41,6 +41,18 @@ def test_prompt_ledger_removes_holdout_results(tmp_path):
     assert "secret_metric" not in json.dumps(result)
 
 
+def test_prompt_ledger_excludes_legacy_fill_model_rows(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    append_entry({"event": "candidate", "name": "old", "fill_model_version": "legacy",
+                  "search": {"net_bps_per_trade": 100}}, str(path))
+    append_entry({"event": "candidate", "name": "current", "search": {"net_bps_per_trade": 1}},
+                 str(path))
+
+    rows = prompt_entries(str(path))
+
+    assert [row["name"] for row in rows] == ["current"]
+
+
 def test_validation_gate_fails_without_ci_sample_and_stress_proof():
     result = validation_verdict({"base": {"net_bps_per_trade": -1}},
                                 {"base": {"trades": 12, "adjusted_ci": [-3, 1],

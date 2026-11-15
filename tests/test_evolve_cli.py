@@ -8,6 +8,8 @@ from core.fills import FILL_MODEL_VERSION
 def test_trial_counts_are_isolated_by_effective_settings():
     entries = [
         {"event": "candidate", "maker_fee": .0002, "taker_fee": .0005,
+         "slippage": .0003, "long_only": False},  # Unversioned legacy row.
+        {"event": "candidate", "maker_fee": .0002, "taker_fee": .0005,
          "slippage": .0003, "long_only": False,
          "fill_model_version": FILL_MODEL_VERSION},
         {"event": "candidate", "maker_fee": .0002, "taker_fee": .0005,
@@ -20,6 +22,18 @@ def test_trial_counts_are_isolated_by_effective_settings():
         "maker_fee": .0002, "taker_fee": .0005, "slippage": .0003,
         "long_only": False, "fill_model_version": FILL_MODEL_VERSION,
     }) == 1
+
+
+def test_legacy_candidate_cannot_enter_current_model_holdout_or_promotion(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "evolve").mkdir()
+    evolve_cli.append_entry({"event": "candidate", "name": "legacy_trial",
+                             "verdict": "passed", "fill_model_version": "legacy"})
+
+    with pytest.raises(RuntimeError, match="different fill model"):
+        evolve_cli.holdout("legacy_trial")
+    with pytest.raises(RuntimeError, match="different fill model"):
+        evolve_cli.promote("legacy_trial")
 
 
 def test_cycle_report_starts_with_effective_settings_and_default_limits():
