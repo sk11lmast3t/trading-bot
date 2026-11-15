@@ -45,10 +45,12 @@ def holdout_attempted(name, path=LEDGER_PATH):
 
 
 def prompt_entries(path=LEDGER_PATH, limit=10):
-    """Return recent ledger context with all holdout content removed."""
+    """Return current fill-model ledger context with holdout content removed."""
     safe = []
     for row in read_entries(path):
         if row.get("event") != "candidate":
+            continue
+        if row.get("fill_model_version", "legacy") != FILL_MODEL_VERSION:
             continue
         clean = {key: value for key, value in row.items()
                  if key not in {"holdout", "holdout_result", "holdout_metrics"}}

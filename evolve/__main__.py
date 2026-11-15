@@ -131,6 +131,8 @@ def holdout(name, data_dir="data", maker_fee=None, taker_fee=None,
     candidate = latest_candidate(name)
     if not candidate or candidate.get("verdict") != "passed":
         raise RuntimeError("Candidate must pass validation before its one holdout run")
+    if candidate.get("fill_model_version", "legacy") != FILL_MODEL_VERSION:
+        raise RuntimeError("Candidate validation used a different fill model; reevaluate it first")
     append_entry({"event": "holdout_attempt", "name": name, **settings,
                   "params": {"costs": fees, "long_only": settings["long_only"]}})
     try:
@@ -154,6 +156,8 @@ def promote(name):
     candidate = latest_candidate(name)
     if not candidate or candidate.get("verdict") != "passed":
         raise RuntimeError("Promotion refused: candidate has not passed validation")
+    if candidate.get("fill_model_version", "legacy") != FILL_MODEL_VERSION:
+        raise RuntimeError("Promotion refused: candidate validation used a different fill model")
     if not holdout_attempted(name):
         raise RuntimeError("Promotion refused: candidate has not had its single holdout run")
     outcomes = [r for r in read_entries() if r.get("name") == name and r.get("event") == "holdout_result"]
