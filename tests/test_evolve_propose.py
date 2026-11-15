@@ -24,6 +24,19 @@ def _valid_code():
 """
 
 
+def test_build_prompt_explains_dunder_restriction(tmp_path, monkeypatch):
+    monkeypatch.setattr(propose, "_search_months", lambda: ({"2025-01"}, {}))
+    monkeypatch.setattr(propose, "_journal_summary", lambda *_: "")
+    monkeypatch.setattr(propose, "_baseline_search_tables", lambda *_: "")
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("", encoding="utf-8")
+
+    prompt = propose.build_prompt("trial_test", ledger_path=str(ledger))
+
+    assert "must NOT define __init__ or any other dunder name" in " ".join(prompt.split())
+    assert "__init__ is provided by the evaluation harness; do not define it" in prompt
+
+
 def test_proposal_uses_fake_client_and_writes_one_candidate(tmp_path, monkeypatch):
     monkeypatch.setattr(evaluate, "CANDIDATE_DIR", str(tmp_path / "candidates"))
     monkeypatch.setattr(propose, "_search_months", lambda: ({"2025-01"}, {}))
