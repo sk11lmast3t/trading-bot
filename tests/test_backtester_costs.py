@@ -62,7 +62,8 @@ def test_entry_slippage_is_charged_on_market_entries():
     assert bt.trades
     for t in bt.trades:
         assert t.entry_slip == pytest.approx(t.entry_price * t.size * 0.001)
-        assert t.exit_slip == pytest.approx(t.exit_price * t.size * 0.001)
+        assert t.exit_slip == pytest.approx(
+            abs(t.exit_price - t.exit_reference_price) * t.size)
 
 
 def test_zero_costs_means_net_equals_gross():

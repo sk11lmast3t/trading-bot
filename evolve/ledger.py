@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
+from core.fills import FILL_MODEL_VERSION
 
 
 LEDGER_PATH = os.path.join("evolve", "ledger.jsonl")
@@ -22,7 +23,8 @@ def read_entries(path=LEDGER_PATH):
 
 def append_entry(entry, path=LEDGER_PATH):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    record = {"recorded_at": datetime.now(timezone.utc).isoformat(), **entry}
+    record = {"recorded_at": datetime.now(timezone.utc).isoformat(),
+              "fill_model_version": FILL_MODEL_VERSION, **entry}
     encoded = json.dumps(record, sort_keys=True, allow_nan=False)
     with open(path, "a", encoding="utf-8") as stream:
         stream.write(encoded + "\n")

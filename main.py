@@ -39,6 +39,7 @@ from core.risk_manager import (
     plausible_protective_stop,
     validate_trailing_stop,
 )
+from core.fills import exit_fee_rate, stop_fill, stop_reference_fill, tp_fill
 from core import state
 from core.adaptive_leverage import build_paper_trade_plan, portfolio_snapshot
 from core.strategy_engine import (
@@ -1177,8 +1178,8 @@ class UnifiedCryptoBot:
             meta = getattr(self, "paper_trade_meta", {}).pop(symbol, {})
             if not isinstance(meta, dict):
                 meta = {}
-            taker_fee = max(0.0, _finite_float(self.config.backtest.taker_fee) or 0.0)
-            exit_fee = reference_price * contracts * taker_fee
+            close_fee_rate = exit_fee_rate(self.config.backtest, reason)
+            exit_fee = reference_price * contracts * close_fee_rate
             if exit_slippage_rate is None:
                 exit_slippage_rate = self.config.backtest.slippage
             exit_slippage_rate = max(0.0, _finite_float(exit_slippage_rate) or 0.0)
@@ -1445,26 +1446,32 @@ class UnifiedCryptoBot:
                                    "(entry=%.8f)", symbol, high, low, entry)
                     continue
                 hit_sl = low <= sl_price if side == 'long' else high >= sl_price
-                hit_tp = high >= tp_price if side == 'long' else low <= tp_price
+                if self.config.mode == "live":
+                    # Preserve the existing live exit decision and let the
+                    # exchange determine the actual market/limit fill.
+                    live_tp_hit = high >= tp_price if side == 'long' else low <= tp_price
+                    tp_execution_fill = tp_price if live_tp_hit else None
+                else:
+                    tp_execution_fill = tp_fill(side, tp_price, high, low)
+                hit_tp = tp_execution_fill is not None
                 if hit_sl or hit_tp:
                     is_sl = hit_sl  # adverse-first when both levels lie inside the bar
                     level = sl_price if is_sl else tp_price
-                    # Stop gaps fill at the first available bar price. A target
-                    # gap is conservatively filled at its limit, never improved.
-                    base_fill = level
-                    if is_sl and side == 'long' and bar_open < sl_price:
-                        base_fill = bar_open
-                    elif is_sl and side != 'long' and bar_open > sl_price:
-                        base_fill = bar_open
-                    fill = base_fill
+                    # The paper bot and backtester share the same stop gap and
+                    # adverse slippage model. Live orders keep exchange fills.
                     exit_slippage_rate = 0.0
-                    if self.config.mode != "live" and is_sl:
-                        # Stops are market orders and pay adverse slippage. A
-                        # take-profit is a resting limit: it fills at its price
-                        # and is never improved by a favourable gap.
+                    if is_sl and self.config.mode != "live":
                         slip = max(0.0, _finite_float(self.config.backtest.slippage) or 0.0)
                         exit_slippage_rate = slip
-                        fill = base_fill * (1 - slip if side == 'long' else 1 + slip)
+                        base_fill = stop_reference_fill(side, sl_price, bar_open)
+                        fill = stop_fill(side, sl_price, bar_open, slip)
+                    elif is_sl:
+                        base_fill = (min(level, bar_open) if side == 'long'
+                                     else max(level, bar_open))
+                        fill = base_fill
+                    else:
+                        base_fill = tp_execution_fill
+                        fill = tp_execution_fill
                     self._prepare_poll_close(symbol, pos, df, level)
                     self._close_position(
                         symbol, pos, fill,
@@ -1500,7 +1507,20 @@ class UnifiedCryptoBot:
                     trail_hit, trail_reason = False, ""
                 if trail_hit:
                     self._prepare_poll_close(symbol, pos, df, price)
-                    self._close_position(symbol, pos, price, f"TRAILING STOP: {trail_reason}")
+                    if self.config.mode == "paper":
+                        active_rm_pos = self.risk_manager.open_positions.get(symbol, {})
+                        trail_level = (_positive_float(active_rm_pos.get('trailing_stop'))
+                                       if isinstance(active_rm_pos, dict) else None)
+                        if trail_level is None:
+                            trail_level = price
+                        slip = max(0.0, _finite_float(self.config.backtest.slippage) or 0.0)
+                        reference_fill = stop_reference_fill(side, trail_level, price)
+                        fill = stop_fill(side, trail_level, price, slip)
+                        self._close_position(
+                            symbol, pos, fill, f"TRAILING STOP: {trail_reason}",
+                            reference_price=reference_fill, exit_slippage_rate=slip)
+                    else:
+                        self._close_position(symbol, pos, price, f"TRAILING STOP: {trail_reason}")
                     return
             except Exception as e:
                 logger.error(f"Trailing check error for {symbol}: {e}")

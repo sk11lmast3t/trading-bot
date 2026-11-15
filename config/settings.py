@@ -18,6 +18,7 @@ class ExchangeConfig:
     testnet: bool = True
     demo: bool = os.getenv("DEMO", "false").lower() == "true"
     rate_limit: int = 1200
+    api_passphrase: str = field(default_factory=lambda: os.getenv("API_PASSPHRASE", ""), repr=False)
 
 
 @dataclass
@@ -195,6 +196,8 @@ class BacktestConfig:
     # THROUGH the limit by at least this fraction (0.0001 = 1 bp). A modelling
     # assumption, not a measured fill rate: measure the real one in paper/live.
     maker_penetration: float = 0.0001
+    # Resting take-profit orders pay the selected role; protective stops are taker.
+    tp_fee_role: str = "taker"
 
 
 @dataclass

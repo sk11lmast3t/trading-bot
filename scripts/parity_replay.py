@@ -275,8 +275,8 @@ def compare(bot_trades, bt_trades, frame, bt_obj=None):
         at = pd.Timestamp(t.exit_time)
         bar = frame.loc[at] if at in frame.index else None
         intrabar_hit = bool(bar is not None and (
-            (t.side == "long" and ((bt_reason == "SL" and bar.low <= t.sl) or (bt_reason == "TP" and bar.high >= t.tp))) or
-            (t.side == "short" and ((bt_reason == "SL" and bar.high >= t.sl) or (bt_reason == "TP" and bar.low <= t.tp)))))
+            (t.side == "long" and ((bt_reason == "SL" and bar.low <= t.sl) or (bt_reason == "TP" and bar.high > t.tp))) or
+            (t.side == "short" and ((bt_reason == "SL" and bar.high >= t.sl) or (bt_reason == "TP" and bar.low < t.tp)))))
         if not reason_ok:
             if intrabar_hit and bot_reason != bt_reason:
                 causes.append("bot close vs backtester high/low")
@@ -305,17 +305,7 @@ def compare(bot_trades, bt_trades, frame, bt_obj=None):
                        t.exit_slip, t.exit_price * t.size),
         )
         if any(abs(diff) > 1e-10 for diff in rate_diffs):
-            # A take-profit is a resting limit in the paper bot (no exit
-            # slippage) but a market fill in the backtester (pays slippage).
-            # Label that deliberate model difference instead of calling it a
-            # formula bug. Any other cost-rate difference stays generic.
-            tp_limit_only = (
-                bot_reason == bt_reason == "TP"
-                and all(abs(diff) <= 1e-10 for diff in rate_diffs[:3])
-                and abs(rate_diffs[3]) > 1e-10
-            )
-            causes.append("TP limit vs market slippage model" if tp_limit_only
-                          else "slippage/fee formula")
+            causes.append("slippage/fee formula")
         if abs(pnl_bps) > 1e-9 and not causes:
             causes.append("other pnl mismatch")
         causes = list(dict.fromkeys(causes))
