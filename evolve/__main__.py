@@ -9,6 +9,7 @@ import re
 import sys
 
 from evolve.costs import learn_costs
+from core.fills import FILL_MODEL_VERSION
 from evolve.evaluate import (constraint_failures, evaluate_candidate, load_costs,
                              validate_candidate_source)
 from evolve.gates import validation_verdict
@@ -27,7 +28,8 @@ def _safe_name(name):
 def _settings(maker_fee=None, taker_fee=None, slippage=None, long_only=False):
     costs = load_costs(maker_fee, taker_fee, slippage)
     return {"maker_fee": costs["maker_fee"], "taker_fee": costs["taker_fee"],
-            "slippage": costs["slippage"], "long_only": bool(long_only)}
+            "slippage": costs["slippage"], "long_only": bool(long_only),
+            "fill_model_version": FILL_MODEL_VERSION}
 
 
 def _row_settings(row):
@@ -43,6 +45,7 @@ def _row_settings(row):
         "taker_fee": value("taker_fee", 0.0005),
         "slippage": value("slippage", 0.0003),
         "long_only": bool(row.get("long_only", params.get("long_only", False))),
+        "fill_model_version": row.get("fill_model_version", "legacy"),
     }
 
 

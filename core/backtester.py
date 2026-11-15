@@ -12,6 +12,7 @@ from typing import List, Dict
 from core.indicators import Indicators
 from core.strategies import get_strategy, Signal
 from core.risk_manager import RiskManager
+from core.fills import exit_fee_rate, stop_fill, stop_reference_fill, tp_fill
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ class BacktestTrade:
         self.tp = tp
         self.strategy = strat
         self.exit_price = 0
+        self.exit_reference_price = None
         self.exit_time = None
         self.pnl = 0                 # NET pnl after every cost
         self.exit_reason = ""
@@ -104,8 +106,9 @@ class Backtester:
                       assumption, not a measured fill rate.
       maker_fallback  as maker, but an unfilled order is replaced by a market
                       entry at the next bar's open (taker fee + slippage).
-    Exits are always market orders (taker fee + slippage), as in main.py.
-    Exit order: SL first, then TP (pessimistic when both are touched in one
+    Protective stop exits use the shared gap-aware market-fill model. Take
+    profits use strict-through limit fills and the configured TP fee role.
+    Exit order: SL first, then TP (pessimistic when both are triggered in one
     bar), then time exit (config.risk.max_hold_time_minutes) at the bar close.
     NOT modelled (the live bot has them): trailing stop and breakeven.
     """
@@ -151,15 +154,23 @@ class Backtester:
             for sym in list(self.open_trades.keys()):
                 t = self.open_trades[sym]
                 if t.side == "long":
-                    sl_hit, tp_hit = low <= t.sl, high >= t.tp
+                    sl_hit = low <= t.sl
                 else:
-                    sl_hit, tp_hit = high >= t.sl, low <= t.tp
+                    sl_hit = high >= t.sl
+                target_fill = tp_fill(t.side, t.tp, high, low)
                 if sl_hit:
-                    self._close(sym, t.sl, ts, "SL")
-                elif tp_hit:
-                    self._close(sym, t.tp, ts, "TP")
+                    reference_fill = stop_reference_fill(t.side, t.sl, float(cur["open"]))
+                    fill = stop_fill(t.side, t.sl, float(cur["open"]),
+                                     self.config.backtest.slippage)
+                    self._close(sym, fill, ts, "SL", reference_price=reference_fill,
+                                exit_slippage_rate=self.config.backtest.slippage)
+                elif target_fill is not None:
+                    self._close(sym, target_fill, ts, "TP", reference_price=target_fill,
+                                exit_slippage_rate=0.0)
                 elif max_hold_bars is not None and i - t.entry_bar >= max_hold_bars:
-                    self._close(sym, price, ts, "TIME")
+                    fill = stop_fill(t.side, price, price, self.config.backtest.slippage)
+                    self._close(sym, fill, ts, "TIME", reference_price=price,
+                                exit_slippage_rate=self.config.backtest.slippage)
             # New signals (no `continue` here: the equity curve gets one point per bar)
             if symbol not in self.open_trades and (trade_from is None or ts >= trade_from):
                 sim_time = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
@@ -177,7 +188,10 @@ class Backtester:
         # Close remaining
         fp = float(df.iloc[-1]["close"])
         for sym in list(self.open_trades.keys()):
-            self._close(sym, fp, df.index[-1], "END")
+            side = self.open_trades[sym].side
+            fill = stop_fill(side, fp, fp, self.config.backtest.slippage)
+            self._close(sym, fill, df.index[-1], "END", reference_price=fp,
+                        exit_slippage_rate=self.config.backtest.slippage)
         return self._metrics()
 
     def _try_enter(self, df, i, symbol, setup, mode, cur):
@@ -228,18 +242,24 @@ class Backtester:
         self.open_trades[symbol] = t
         self.stats["entries_" + t.entry_how] += 1
 
-    def _close(self, symbol, exit_price, exit_time, reason):
+    def _close(self, symbol, exit_price, exit_time, reason, *, reference_price=None,
+               exit_slippage_rate=None):
         bt = self.config.backtest
         t = self.open_trades.pop(symbol)
+        if reference_price is None:
+            reference_price = exit_price
+        if exit_slippage_rate is None:
+            exit_slippage_rate = bt.slippage
         t.exit_price = exit_price
+        t.exit_reference_price = reference_price
         t.exit_time = exit_time
         t.exit_reason = reason
         if t.side == "long":
-            t.gross_pnl = (exit_price - t.entry_price) * t.size
+            t.gross_pnl = (reference_price - t.entry_price) * t.size
         else:
-            t.gross_pnl = (t.entry_price - exit_price) * t.size
-        t.exit_fee = exit_price * t.size * bt.taker_fee
-        t.exit_slip = exit_price * t.size * bt.slippage
+            t.gross_pnl = (t.entry_price - reference_price) * t.size
+        t.exit_fee = reference_price * t.size * exit_fee_rate(bt, reason)
+        t.exit_slip = abs(exit_price - reference_price) * t.size
         hold_min = max((exit_time - t.entry_time).total_seconds() / 60.0, 0.0)
         # funding_rate is per 8h; positive means longs pay shorts
         t.funding = (t.notional * getattr(bt, "funding_rate", 0.0) * hold_min / 480.0

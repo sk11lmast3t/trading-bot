@@ -2,20 +2,23 @@ import pytest
 
 import evolve.__main__ as evolve_cli
 from evolve.report import render_cycle
+from core.fills import FILL_MODEL_VERSION
 
 
 def test_trial_counts_are_isolated_by_effective_settings():
     entries = [
         {"event": "candidate", "maker_fee": .0002, "taker_fee": .0005,
-         "slippage": .0003, "long_only": False},
+         "slippage": .0003, "long_only": False,
+         "fill_model_version": FILL_MODEL_VERSION},
         {"event": "candidate", "maker_fee": .0002, "taker_fee": .0005,
-         "slippage": .0003, "long_only": True},
+         "slippage": .0003, "long_only": True,
+         "fill_model_version": FILL_MODEL_VERSION},
         {"event": "holdout_result", "maker_fee": .0002, "taker_fee": .0005,
          "slippage": .0003, "long_only": False},
     ]
     assert evolve_cli._trial_count(entries, {
         "maker_fee": .0002, "taker_fee": .0005, "slippage": .0003,
-        "long_only": False,
+        "long_only": False, "fill_model_version": FILL_MODEL_VERSION,
     }) == 1
 
 

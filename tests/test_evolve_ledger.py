@@ -2,6 +2,8 @@ import json
 
 from evolve.gates import validation_verdict
 from evolve.ledger import append_entry, holdout_attempted, latest_candidate, prompt_entries, read_entries
+from evolve.__main__ import _row_settings, _settings
+from core.fills import FILL_MODEL_VERSION
 
 
 def _metrics():
@@ -55,3 +57,14 @@ def test_validation_gate_pass_requires_all_thresholds():
 
     assert result["verdict"] == "passed"
     assert result["reason_failed"] == []
+
+
+def test_evolve_trial_settings_separate_legacy_fill_model():
+    current = _settings(0.0002, 0.0005, 0.0003, False)
+    old = {"maker_fee": 0.0002, "taker_fee": 0.0005, "slippage": 0.0003,
+           "long_only": False}
+    new = {**old, "fill_model_version": FILL_MODEL_VERSION}
+
+    assert current["fill_model_version"] == FILL_MODEL_VERSION
+    assert _row_settings(old) != current
+    assert _row_settings(new) == current

@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
 import pandas as pd
+import pytest
 
 import main
 from config.settings import BotConfig
@@ -122,9 +123,12 @@ def test_replay_runner_returns_the_known_bot_and_backtester_trades(monkeypatch):
     assert details[0]["entry_price_diff_bps"] == 0.0
     assert details[0]["exit_time_diff_bars"] == 0.0
     assert details[0]["exit_price_diff_bps"] == 0.0
-    # The bot's limit TP pays no exit slippage; the conservative backtester does.
-    assert details[0]["exit_slippage_diff"] < 0
-    assert any("TP limit vs market slippage model" in m["cause"] for m in mismatches)
+    # A limit TP has zero exit slippage in both execution paths.
+    assert bot_trades[0]["exit_slippage"] == 0.0
+    assert bt_trades[0].exit_slip == 0.0
+    assert details[0]["exit_slippage_diff"] == 0.0
+    assert details[0]["net_pnl_diff_bps"] == pytest.approx(0.0)
+    assert mismatches == []
 
 
 def test_compare_keeps_nearest_pair_outside_five_minutes_unmatched():
