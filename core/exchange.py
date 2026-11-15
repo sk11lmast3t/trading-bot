@@ -135,6 +135,8 @@ class ExchangeConnector:
             'enableRateLimit': True,
             'options': {'defaultType': 'future'},
         }
+        if ec.api_passphrase:
+            params['password'] = ec.api_passphrase
         if ec.testnet:
             params['sandbox'] = True
         self.exchange = exchange_class(params)
