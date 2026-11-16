@@ -18,7 +18,7 @@ class FakeLLM:
 
 
 def _valid_code():
-    return """class Trial(BaseStrategy):
+    return """class Candidate(BaseStrategy):
     def analyze(self, df):
         return TradeSetup(Signal.HOLD)
 """
@@ -34,6 +34,8 @@ def test_build_prompt_documents_candidate_runtime_restrictions(tmp_path, monkeyp
     prompt = propose.build_prompt("trial_test", ledger_path=str(ledger))
 
     normalized = " ".join(prompt.split())
+    assert "class header MUST be exactly `class Candidate(BaseStrategy):`" in normalized
+    assert "A class with no base or with any other base is rejected by the validator." in normalized
     assert "must NOT define __init__ or any other dunder name" in normalized
     assert "__init__ is provided by the evaluation harness; do not define it" in prompt
     assert "BaseStrategy, TradeSetup, and Signal are already defined in the module" in normalized
@@ -53,6 +55,7 @@ def test_build_prompt_documents_candidate_runtime_restrictions(tmp_path, monkeyp
 
 def test_proposal_uses_fake_client_and_writes_one_candidate(tmp_path, monkeypatch):
     monkeypatch.setattr(evaluate, "CANDIDATE_DIR", str(tmp_path / "candidates"))
+    monkeypatch.setattr(propose, "ROOT", str(tmp_path))
     monkeypatch.setattr(propose, "_search_months", lambda: ({"2025-01"}, {}))
     monkeypatch.setattr(propose, "_journal_summary", lambda *_: "search journal summary")
     monkeypatch.setattr(propose, "_baseline_search_tables", lambda *_: "| 2025-01 | search only |")
@@ -65,6 +68,7 @@ def test_proposal_uses_fake_client_and_writes_one_candidate(tmp_path, monkeypatc
     )
 
     assert os.path.isfile(path)
+    assert not (tmp_path / "evolve" / "rejected" / "trial_test.txt").exists()
     assert os.listdir(evaluate.CANDIDATE_DIR) == ["trial_test.py"]
     assert spent == 120
     assert len(client.calls) == 1
@@ -77,6 +81,25 @@ def test_proposal_uses_fake_client_and_writes_one_candidate(tmp_path, monkeypatc
     assert "1x" in prompt
     assert "completed bars only" in prompt
     assert "Holds up to several days are allowed" in prompt
+
+
+def test_rejected_proposal_saves_raw_response_and_reraises_candidate_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(evaluate, "CANDIDATE_DIR", str(tmp_path / "candidates"))
+    monkeypatch.setattr(propose, "ROOT", str(tmp_path))
+    monkeypatch.setattr(propose, "_search_months", lambda: ({"2025-01"}, {}))
+    monkeypatch.setattr(propose, "_journal_summary", lambda *_: "")
+    monkeypatch.setattr(propose, "_baseline_search_tables", lambda *_: "")
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("", encoding="utf-8")
+    raw_response = "```python\nimport core.types\n```\n"
+    client = FakeLLM(raw_response)
+
+    with pytest.raises(evaluate.CandidateError, match="Candidate import is not allowed: core.types"):
+        propose.propose_candidate("rejected_trial", llm_client=client, token_budget=20000,
+                                  ledger_path=str(ledger))
+
+    rejected = tmp_path / "evolve" / "rejected" / "rejected_trial.txt"
+    assert rejected.read_text(encoding="utf-8") == raw_response
 
 
 def test_api_key_is_read_only_from_llm_env_file(tmp_path):
