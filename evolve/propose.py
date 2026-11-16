@@ -143,8 +143,25 @@ def build_prompt(name, ledger_path=None, stop_pct=0.02, min_target_pct=0.05,
     prompt = f"""Propose exactly one new Python candidate named {name}.
 
 Return only source code for that one file. Do not include markdown fences.
-The candidate file may import only numpy, pandas, and core.indicators. The
-evaluation harness injects BaseStrategy, TradeSetup, and Signal. Define exactly
+The candidate file may import only numpy, pandas, and core.indicators. Example
+allowed import lines:
+    import numpy
+    import numpy as np
+    from numpy import array
+    import pandas
+    import pandas as pd
+    from pandas import DataFrame
+    import core.indicators
+    import core.indicators as indicators
+    from core.indicators import Indicators
+No other modules may be imported.
+BaseStrategy, TradeSetup, and Signal are already defined in the module
+namespace by the evaluation harness; do NOT import them.
+Only these builtins are available to candidate code: abs, all, any, bool, dict,
+enumerate, Exception, float, int, isinstance, len, list, max, min, object,
+range, set, str, sum, super, tuple, ValueError, zip. Other builtins (for
+example round, sorted, print) are not available.
+Define exactly
 one class inheriting BaseStrategy. It may define only analyze(df) and the
 optional lookback_bars class attribute. It must NOT define __init__ or any
 other dunder name (the validator rejects dunder names). Strategy parameters

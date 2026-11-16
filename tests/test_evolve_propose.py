@@ -24,7 +24,7 @@ def _valid_code():
 """
 
 
-def test_build_prompt_explains_dunder_restriction(tmp_path, monkeypatch):
+def test_build_prompt_documents_candidate_runtime_restrictions(tmp_path, monkeypatch):
     monkeypatch.setattr(propose, "_search_months", lambda: ({"2025-01"}, {}))
     monkeypatch.setattr(propose, "_journal_summary", lambda *_: "")
     monkeypatch.setattr(propose, "_baseline_search_tables", lambda *_: "")
@@ -33,8 +33,22 @@ def test_build_prompt_explains_dunder_restriction(tmp_path, monkeypatch):
 
     prompt = propose.build_prompt("trial_test", ledger_path=str(ledger))
 
-    assert "must NOT define __init__ or any other dunder name" in " ".join(prompt.split())
+    normalized = " ".join(prompt.split())
+    assert "must NOT define __init__ or any other dunder name" in normalized
     assert "__init__ is provided by the evaluation harness; do not define it" in prompt
+    assert "BaseStrategy, TradeSetup, and Signal are already defined in the module" in normalized
+    assert "do NOT import them" in prompt
+    for module in ("numpy", "pandas", "core.indicators"):
+        assert module in prompt
+    assert "import numpy as np" in prompt
+    assert "import pandas as pd" in prompt
+    assert "from core.indicators import Indicators" in prompt
+    assert (
+        "abs, all, any, bool, dict, enumerate, Exception, float, int, isinstance,"
+        " len, list, max, min, object, range, set, str, sum, super, tuple,"
+        " ValueError, zip"
+    ) in normalized
+    assert "round, sorted, print" in prompt
 
 
 def test_proposal_uses_fake_client_and_writes_one_candidate(tmp_path, monkeypatch):
