@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import inspect
 import json
 import os
 import re
@@ -131,6 +132,19 @@ def _journal_summary(months, splits):
             pass
 
 
+def _indicator_signatures():
+    from core.indicators import Indicators
+
+    names = (
+        "ema", "sma", "rsi", "atr", "macd", "bollinger_bands", "momentum",
+        "volume_sma", "vwap", "stochastic_rsi", "disparity",
+    )
+    return "\n".join(
+        f"    Indicators.{name}{inspect.signature(getattr(Indicators, name))}"
+        for name in names
+    )
+
+
 def build_prompt(name, ledger_path=None, stop_pct=0.02, min_target_pct=0.05,
                  max_leverage=1.0):
     months, splits = _search_months()
@@ -159,6 +173,18 @@ allowed import lines:
 No other modules may be imported.
 BaseStrategy, TradeSetup, and Signal are already defined in the module
 namespace by the evaluation harness; do NOT import them.
+`analyze(df)` receives a copy of the most recent lookback window of completed
+bars as a pandas DataFrame. Its index is the timestamp DatetimeIndex named
+`timestamp`; it is sorted in ascending time order. Its columns are open, high,
+low, close, volume, ema_fast, ema_medium, ema_slow, rsi, stoch_k, stoch_d, atr,
+macd, macd_signal, macd_hist, bb_upper, bb_middle, bb_lower, vol_sma, momentum,
+disparity_25, and vwap.
+All Indicators methods take pandas Series inputs and return pandas Series (or
+tuples of pandas Series where their signatures show multiple outputs). Never
+use .values or NumPy arrays with Indicators. Read the latest values with
+.iloc[-1] or .iloc[-2]; never use [-1] on a pandas Series.
+Available Indicators static methods and signatures:
+{_indicator_signatures()}
 Only these builtins are available to candidate code: abs, all, any, bool, dict,
 enumerate, Exception, float, int, isinstance, len, list, max, min, object,
 range, set, str, sum, super, tuple, ValueError, zip. Other builtins (for
@@ -183,10 +209,23 @@ Interface:
     class BaseStrategy:
         # __init__ is provided by the evaluation harness; do not define it.
         ...
-    class Candidate(BaseStrategy):
-        lookback_bars = 100  # optional class attribute
-        PARAMETER = 10       # class-level constant
-        def analyze(self, df): return TradeSetup(Signal.HOLD)
+Runnable RSI + SMA example:
+```python
+from core.indicators import Indicators
+
+class Candidate(BaseStrategy):
+    def analyze(self, df):
+        close = df["close"]
+        rsi = Indicators.rsi(close, 14)
+        sma = Indicators.sma(close, 14)
+        latest_close = close.iloc[-1]
+        latest_rsi = rsi.iloc[-1]
+        latest_sma = sma.iloc[-1]
+        if latest_rsi < 30 and latest_close > latest_sma:
+            return TradeSetup(Signal.LONG, latest_close, latest_close * 0.98,
+                              latest_close * 1.05, 1.0, "rsi_sma")
+        return TradeSetup(Signal.HOLD)
+```
 TradeSetup(Signal.LONG|Signal.SHORT|Signal.HOLD, entry_price, stop_loss,
            take_profit, confidence, strategy_name)
 

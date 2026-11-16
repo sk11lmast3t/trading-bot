@@ -1,10 +1,14 @@
 import os
 
+import numpy as np
+import pandas as pd
 import pytest
 
 import evolve.evaluate as evaluate
 import evolve.propose as propose
 import evolve.__main__ as evolve_cli
+from config.settings import BotConfig
+from core.indicators import Indicators
 
 
 class FakeLLM:
@@ -51,6 +55,51 @@ def test_build_prompt_documents_candidate_runtime_restrictions(tmp_path, monkeyp
         " ValueError, zip"
     ) in normalized
     assert "round, sorted, print" in prompt
+    assert "All Indicators methods take pandas Series inputs" in normalized
+    assert "Never use .values or NumPy arrays with Indicators" in normalized
+    assert ".iloc[-1] or .iloc[-2]" in normalized
+    assert "never use [-1] on a pandas Series" in normalized
+    for method in (
+        "ema", "sma", "rsi", "atr", "macd", "bollinger_bands", "momentum",
+        "volume_sma", "vwap", "stochastic_rsi", "disparity",
+    ):
+        assert f"Indicators.{method}(" in prompt
+
+
+def test_prompt_rsi_sma_example_validates_and_runs_with_loader(tmp_path, monkeypatch):
+    monkeypatch.setattr(propose, "_search_months", lambda: ({"2025-01"}, {}))
+    monkeypatch.setattr(propose, "_journal_summary", lambda *_: "")
+    monkeypatch.setattr(propose, "_baseline_search_tables", lambda *_: "")
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("", encoding="utf-8")
+
+    prompt = propose.build_prompt("trial_example", ledger_path=str(ledger))
+    marker = "Runnable RSI + SMA example:\n```python\n"
+    assert marker in prompt
+    example = prompt.split(marker, 1)[1].split("\n```", 1)[0]
+    assert evaluate.validate_candidate_source(example) == "Candidate"
+
+    candidate_dir = tmp_path / "candidates"
+    candidate_dir.mkdir()
+    (candidate_dir / "trial_example.py").write_text(example + "\n", encoding="utf-8")
+    monkeypatch.setattr(evaluate, "CANDIDATE_DIR", str(candidate_dir))
+    strategy, loaded_source = evaluate.load_candidate("trial_example", BotConfig())
+
+    index = pd.date_range("2026-01-01", periods=40, freq="5min", name="timestamp")
+    close = pd.Series(np.linspace(100.0, 104.0, len(index)), index=index)
+    raw = pd.DataFrame({
+        "open": close - 0.1,
+        "high": close + 0.5,
+        "low": close - 0.5,
+        "close": close,
+        "volume": pd.Series(np.full(len(index), 100.0), index=index),
+    }, index=index)
+    frame = Indicators.calculate_all(raw, BotConfig())
+
+    setup = strategy.analyze(frame.iloc[-30:].copy())
+
+    assert loaded_source.rstrip("\n") == example
+    assert setup is not None
 
 
 def test_proposal_uses_fake_client_and_writes_one_candidate(tmp_path, monkeypatch):
