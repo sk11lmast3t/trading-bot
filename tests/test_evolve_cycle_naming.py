@@ -1,0 +1,105 @@
+import pytest
+
+import evolve.__main__ as evolve_cli
+import evolve.evaluate as evaluate
+import evolve.ledger as ledger
+import evolve.propose as propose
+
+
+VALID_CANDIDATE = """class Candidate(BaseStrategy):
+    def analyze(self, df):
+        return TradeSetup(Signal.HOLD)
+"""
+
+
+class StubLLM:
+    def __init__(self, interrupt=False):
+        self.interrupt = interrupt
+
+    def complete(self, *, prompt, max_tokens):
+        if self.interrupt:
+            raise KeyboardInterrupt
+        return VALID_CANDIDATE, {"total_tokens": 10}
+
+
+@pytest.fixture
+def isolated_cycle(tmp_path, monkeypatch):
+    candidate_dir = tmp_path / "strategies" / "candidates"
+    candidate_dir.mkdir(parents=True)
+    ledger_path = tmp_path / "ledger.jsonl"
+    ledger_path.write_text("", encoding="utf-8")
+    reports = []
+
+    monkeypatch.setattr(evaluate, "CANDIDATE_DIR", str(candidate_dir))
+    monkeypatch.setattr(evolve_cli, "read_entries",
+                        lambda: ledger.read_entries(str(ledger_path)))
+    monkeypatch.setattr(evolve_cli, "append_entry",
+                        lambda row: ledger.append_entry(row, str(ledger_path)))
+    monkeypatch.setattr(evolve_cli, "learn_costs", lambda: None)
+    monkeypatch.setattr(evolve_cli, "load_costs", lambda *args: {
+        "maker_fee": 0.0002, "taker_fee": 0.0005, "slippage": 0.0003,
+    })
+    monkeypatch.setattr(evolve_cli, "evaluate_candidate", lambda *args, **kwargs: {})
+    monkeypatch.setattr(evolve_cli, "validation_verdict", lambda *args: {
+        "verdict": "failed", "reason_failed": [],
+    })
+    monkeypatch.setattr(evolve_cli, "constraint_failures", lambda *args: [])
+    monkeypatch.setattr(evolve_cli, "write_cycle", lambda rows, **kwargs: (
+        reports.append(rows) or str(tmp_path / "cycle-report.md")))
+
+    monkeypatch.setattr(propose, "_search_months", lambda: ({"2025-01"}, {}))
+    monkeypatch.setattr(propose, "_journal_summary", lambda *_: "")
+    monkeypatch.setattr(propose, "_baseline_search_tables", lambda *_: "")
+
+    def use_stub_client(client):
+        def propose_with_stub(name, **kwargs):
+            kwargs["llm_client"] = client
+            kwargs["ledger_path"] = str(ledger_path)
+            return propose.propose_candidate(name, **kwargs)
+        monkeypatch.setattr(evolve_cli, "propose_candidate", propose_with_stub)
+
+    return candidate_dir, ledger_path, reports, use_stub_client
+
+
+def test_cycle_skips_preexisting_candidate_file(isolated_cycle, capsys):
+    candidate_dir, ledger_path, reports, use_stub_client = isolated_cycle
+    ledger.append_entry({"event": "candidate", "name": "older"}, str(ledger_path))
+    (candidate_dir / "evolve_0002.py").write_text("occupied", encoding="utf-8")
+    use_stub_client(StubLLM())
+
+    records = evolve_cli.cycle(max_candidates=1, token_budget=1000)
+
+    assert [row["name"] for row in records] == ["evolve_0003"]
+    assert (candidate_dir / "evolve_0003.py").is_file()
+    assert "Skipping candidate name evolve_0002" in capsys.readouterr().out
+    assert len(reports) == 1
+
+
+def test_multi_candidate_cycle_keeps_names_unique_around_existing_file(isolated_cycle):
+    candidate_dir, _ledger_path, _reports, use_stub_client = isolated_cycle
+    (candidate_dir / "evolve_0001.py").write_text("occupied", encoding="utf-8")
+    use_stub_client(StubLLM())
+
+    records = evolve_cli.cycle(max_candidates=3, token_budget=3000)
+
+    names = [row["name"] for row in records]
+    assert names == ["evolve_0002", "evolve_0003", "evolve_0004"]
+    assert len(names) == len(set(names))
+    assert all((candidate_dir / f"{name}.py").is_file() for name in names)
+
+
+def test_cycle_interrupt_records_failure_and_reraises_without_report(isolated_cycle):
+    _candidate_dir, ledger_path, reports, use_stub_client = isolated_cycle
+    use_stub_client(StubLLM(interrupt=True))
+
+    with pytest.raises(KeyboardInterrupt):
+        evolve_cli.cycle(max_candidates=1, token_budget=1000)
+
+    rows = ledger.read_entries(str(ledger_path))
+    assert len(rows) == 1
+    assert rows[0]["name"] == "evolve_0001"
+    assert rows[0]["verdict"] == "failed"
+    assert rows[0]["reason_failed"] == [
+        "cycle error: KeyboardInterrupt: run interrupted"
+    ]
+    assert reports == []

@@ -69,8 +69,21 @@ def cycle(max_candidates=DEFAULT_MAX_CANDIDATES, token_budget=DEFAULT_TOKEN_BUDG
     records = []
     spent = 0
     entries = read_entries()
+    candidate_count = sum(1 for entry in entries
+                          if entry.get("event", "candidate") == "candidate")
+    from evolve import evaluate as evolve_evaluate
+    candidate_dir = evolve_evaluate.CANDIDATE_DIR
+    reserved_names = set()
     for offset in range(max_candidates):
-        name = f"evolve_{len([e for e in entries if e.get('event', 'candidate') == 'candidate']) + offset + 1:04d}"
+        number = candidate_count + offset + 1
+        while True:
+            name = f"evolve_{number:04d}"
+            if name not in reserved_names and not os.path.exists(
+                    os.path.join(candidate_dir, name + ".py")):
+                reserved_names.add(name)
+                break
+            print(f"Skipping candidate name {name}: already used or file exists")
+            number += 1
         row = {"event": "candidate", "name": name, "parent": "baseline",
                "code_hash": None,
                **settings,
@@ -107,6 +120,11 @@ def cycle(max_candidates=DEFAULT_MAX_CANDIDATES, token_budget=DEFAULT_TOKEN_BUDG
                 gate["verdict"] = "failed"
             row.update(gate)
             row["what"] = "one fixed candidate rule set evaluated on SEARCH, then VALIDATION"
+        except KeyboardInterrupt:
+            row.update(verdict="failed",
+                       reason_failed=["cycle error: KeyboardInterrupt: run interrupted"])
+            append_entry(row)
+            raise
         except Exception as exc:
             row.update(verdict="failed", reason_failed=[f"cycle error: {type(exc).__name__}: {exc}"])
         append_entry(row)
