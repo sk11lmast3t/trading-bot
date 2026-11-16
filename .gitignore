@@ -54,3 +54,4 @@ reports/*_trades.csv.gz
 .pytest_tmp*/
 
 evolve/.llm_env
+evolve/rejected/

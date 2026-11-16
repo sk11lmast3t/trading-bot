@@ -143,6 +143,8 @@ def build_prompt(name, ledger_path=None, stop_pct=0.02, min_target_pct=0.05,
     prompt = f"""Propose exactly one new Python candidate named {name}.
 
 Return only source code for that one file. Do not include markdown fences.
+The class header MUST be exactly `class Candidate(BaseStrategy):`. A class
+with no base or with any other base is rejected by the validator.
 The candidate file may import only numpy, pandas, and core.indicators. Example
 allowed import lines:
     import numpy
@@ -251,7 +253,19 @@ def propose_candidate(name, llm_client=None, token_budget=12000, already_spent=0
         raise RuntimeError("LLM response exceeded the hard cycle token budget")
     source = _extract_code(response)
     from evolve.evaluate import CANDIDATE_DIR, validate_candidate_source
-    validate_candidate_source(source)
+    try:
+        validate_candidate_source(source)
+    except Exception:
+        rejected_dir = os.path.join(ROOT, "evolve", "rejected")
+        rejected_path = os.path.join(rejected_dir, f"{name}.txt")
+        try:
+            os.makedirs(rejected_dir, exist_ok=True)
+            with open(rejected_path, "w", encoding="utf-8") as stream:
+                stream.write(response)
+        except OSError:
+            # Preserve the validator exception even if diagnostic storage fails.
+            pass
+        raise
     os.makedirs(CANDIDATE_DIR, exist_ok=True)
     path = os.path.join(CANDIDATE_DIR, name + ".py")
     with open(path, "x", encoding="utf-8") as stream:
