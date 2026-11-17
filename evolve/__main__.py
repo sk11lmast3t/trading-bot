@@ -58,9 +58,11 @@ def _trial_count(entries, settings):
 def cycle(max_candidates=DEFAULT_MAX_CANDIDATES, token_budget=DEFAULT_TOKEN_BUDGET,
           llm_client=None, data_dir="data", maker_fee=None, taker_fee=None,
           slippage=None, long_only=False, stop_pct=0.02,
-          min_target_pct=0.05, max_leverage=1.0):
+          min_target_pct=0.05, max_leverage=1.0, eval_timeout=1800):
     if max_candidates < 1 or max_candidates > 3:
         raise ValueError("A cycle may create between 1 and 3 candidates")
+    if isinstance(eval_timeout, bool) or not isinstance(eval_timeout, int) or eval_timeout <= 0:
+        raise ValueError("eval_timeout must be a positive integer")
     learn_costs()
     settings = _settings(maker_fee, taker_fee, slippage, long_only)
     costs = {key: settings[key] for key in ("maker_fee", "taker_fee", "slippage")}
@@ -104,10 +106,12 @@ def cycle(max_candidates=DEFAULT_MAX_CANDIDATES, token_budget=DEFAULT_TOKEN_BUDG
             trials = _trial_count(entries, settings) + 1
             row["search"] = evaluate_candidate(name, "search", data_dir=data_dir, fees=costs,
                                                trials=trials, stress_factor=1.5,
-                                               long_only=settings["long_only"])
+                                               long_only=settings["long_only"],
+                                               timeout=eval_timeout)
             row["validation"] = evaluate_candidate(name, "validation", data_dir=data_dir, fees=costs,
                                                    trials=trials, stress_factor=1.5,
-                                                   long_only=settings["long_only"])
+                                                   long_only=settings["long_only"],
+                                                   timeout=eval_timeout)
             gate = validation_verdict(row["search"], row["validation"], trials)
             geometry_failures = []
             for partition in ("search", "validation"):
@@ -210,6 +214,8 @@ def main(argv=None):
     cyc.add_argument("--stop-pct", type=float, default=0.02)
     cyc.add_argument("--min-target-pct", type=float, default=0.05)
     cyc.add_argument("--max-leverage", type=float, default=1.0)
+    cyc.add_argument("--eval-timeout", type=int, default=1800,
+                     help="Maximum seconds allowed for each search/validation evaluation")
     hold = sub.add_parser("holdout")
     hold.add_argument("name")
     hold.add_argument("--data", default="data")
@@ -225,7 +231,7 @@ def main(argv=None):
               maker_fee=args.maker_fee, taker_fee=args.taker_fee,
               slippage=args.slippage, long_only=args.long_only,
               stop_pct=args.stop_pct, min_target_pct=args.min_target_pct,
-              max_leverage=args.max_leverage)
+              max_leverage=args.max_leverage, eval_timeout=args.eval_timeout)
     elif args.command == "holdout":
         holdout(args.name, args.data, maker_fee=args.maker_fee,
                 taker_fee=args.taker_fee, slippage=args.slippage,
