@@ -29,17 +29,22 @@ def isolated_cycle(tmp_path, monkeypatch):
     ledger_path = tmp_path / "ledger.jsonl"
     ledger_path.write_text("", encoding="utf-8")
     reports = []
+    evaluation_calls = []
+    learn_cost_calls = []
 
     monkeypatch.setattr(evaluate, "CANDIDATE_DIR", str(candidate_dir))
     monkeypatch.setattr(evolve_cli, "read_entries",
                         lambda: ledger.read_entries(str(ledger_path)))
     monkeypatch.setattr(evolve_cli, "append_entry",
                         lambda row: ledger.append_entry(row, str(ledger_path)))
-    monkeypatch.setattr(evolve_cli, "learn_costs", lambda: None)
+    monkeypatch.setattr(evolve_cli, "learn_costs", lambda: learn_cost_calls.append(True))
     monkeypatch.setattr(evolve_cli, "load_costs", lambda *args: {
         "maker_fee": 0.0002, "taker_fee": 0.0005, "slippage": 0.0003,
     })
-    monkeypatch.setattr(evolve_cli, "evaluate_candidate", lambda *args, **kwargs: {})
+    def fake_evaluate_candidate(name, partition, **kwargs):
+        evaluation_calls.append({"name": name, "partition": partition, **kwargs})
+        return {}
+    monkeypatch.setattr(evolve_cli, "evaluate_candidate", fake_evaluate_candidate)
     monkeypatch.setattr(evolve_cli, "validation_verdict", lambda *args: {
         "verdict": "failed", "reason_failed": [],
     })
@@ -58,11 +63,11 @@ def isolated_cycle(tmp_path, monkeypatch):
             return propose.propose_candidate(name, **kwargs)
         monkeypatch.setattr(evolve_cli, "propose_candidate", propose_with_stub)
 
-    return candidate_dir, ledger_path, reports, use_stub_client
+    return candidate_dir, ledger_path, reports, use_stub_client, evaluation_calls, learn_cost_calls
 
 
 def test_cycle_skips_preexisting_candidate_file(isolated_cycle, capsys):
-    candidate_dir, ledger_path, reports, use_stub_client = isolated_cycle
+    candidate_dir, ledger_path, reports, use_stub_client, _, _ = isolated_cycle
     ledger.append_entry({"event": "candidate", "name": "older"}, str(ledger_path))
     (candidate_dir / "evolve_0002.py").write_text("occupied", encoding="utf-8")
     use_stub_client(StubLLM())
@@ -76,7 +81,7 @@ def test_cycle_skips_preexisting_candidate_file(isolated_cycle, capsys):
 
 
 def test_multi_candidate_cycle_keeps_names_unique_around_existing_file(isolated_cycle):
-    candidate_dir, _ledger_path, _reports, use_stub_client = isolated_cycle
+    candidate_dir, _ledger_path, _reports, use_stub_client, _, _ = isolated_cycle
     (candidate_dir / "evolve_0001.py").write_text("occupied", encoding="utf-8")
     use_stub_client(StubLLM())
 
@@ -89,7 +94,7 @@ def test_multi_candidate_cycle_keeps_names_unique_around_existing_file(isolated_
 
 
 def test_cycle_interrupt_records_failure_and_reraises_without_report(isolated_cycle):
-    _candidate_dir, ledger_path, reports, use_stub_client = isolated_cycle
+    _candidate_dir, ledger_path, reports, use_stub_client, _, _ = isolated_cycle
     use_stub_client(StubLLM(interrupt=True))
 
     with pytest.raises(KeyboardInterrupt):
@@ -103,3 +108,40 @@ def test_cycle_interrupt_records_failure_and_reraises_without_report(isolated_cy
         "cycle error: KeyboardInterrupt: run interrupted"
     ]
     assert reports == []
+
+
+def test_cycle_default_eval_timeout_is_passed_to_search_and_validation(isolated_cycle):
+    _candidate_dir, _ledger_path, _reports, use_stub_client, evaluation_calls, _ = isolated_cycle
+    use_stub_client(StubLLM())
+
+    evolve_cli.cycle(max_candidates=1, token_budget=1000)
+
+    assert [call["partition"] for call in evaluation_calls] == ["search", "validation"]
+    assert [call["timeout"] for call in evaluation_calls] == [1800, 1800]
+
+
+def test_configured_eval_timeout_is_passed_to_both_evaluations_and_cli(isolated_cycle,
+                                                                       monkeypatch):
+    _candidate_dir, _ledger_path, _reports, use_stub_client, evaluation_calls, _ = isolated_cycle
+    use_stub_client(StubLLM())
+
+    evolve_cli.cycle(max_candidates=1, token_budget=1000, eval_timeout=14400)
+
+    assert [call["timeout"] for call in evaluation_calls] == [14400, 14400]
+
+    forwarded = []
+    monkeypatch.setattr(evolve_cli, "cycle", lambda *args, **kwargs: forwarded.append(kwargs))
+    evolve_cli.main(["cycle"])
+    evolve_cli.main(["cycle", "--eval-timeout", "14400"])
+    assert [call["eval_timeout"] for call in forwarded] == [1800, 14400]
+
+
+@pytest.mark.parametrize("eval_timeout", [0, -5])
+def test_invalid_eval_timeout_fails_before_work_or_ledger_write(isolated_cycle, eval_timeout):
+    _candidate_dir, ledger_path, _reports, _use_stub_client, _evaluation_calls, learn_calls = isolated_cycle
+
+    with pytest.raises(ValueError, match="eval_timeout must be a positive integer"):
+        evolve_cli.cycle(max_candidates=1, eval_timeout=eval_timeout)
+
+    assert learn_calls == []
+    assert ledger.read_entries(str(ledger_path)) == []
