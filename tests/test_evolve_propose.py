@@ -169,3 +169,34 @@ def test_second_holdout_is_refused_and_promotion_requires_pass_and_holdout(tmp_p
         evolve_cli.holdout("trial")
     evolve_cli.promote("trial")
     assert "trial" in (tmp_path / "config" / "paper_candidates.json").read_text()
+
+
+def _write_baseline(path, tag):
+    rows = ["### Net bps per trade by month - all_taker",
+            "| Month | `" + tag + "` |", "|---|---|", "| 2025-01 | -1.0 |", ""]
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+
+def test_baseline_table_uses_only_the_named_report(tmp_path, monkeypatch):
+    monkeypatch.setattr(propose, "ROOT", str(tmp_path))
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    _write_baseline(reports / "baseline_kucoin_real.md", "named_report")
+    _write_baseline(reports / "baseline_zzz_later.md", "later_report")
+
+    text = propose._baseline_search_tables({"2025-01"})
+
+    assert "Source: baseline_kucoin_real.md" in text
+    assert "named_report" in text
+    assert "later_report" not in text
+
+
+def test_baseline_table_has_no_fallback_to_another_report(tmp_path, monkeypatch):
+    monkeypatch.setattr(propose, "ROOT", str(tmp_path))
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    _write_baseline(reports / "baseline_zzz_later.md", "later_report")
+
+    text = propose._baseline_search_tables({"2025-01"})
+
+    assert text == "No checked-in baseline monthly table was available."

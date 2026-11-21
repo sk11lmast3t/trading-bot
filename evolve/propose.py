@@ -55,34 +55,37 @@ def _search_months(data_dir=None):
     return (set.intersection(*month_sets) if month_sets else set()), splits
 
 
-def _baseline_search_tables(months):
-    reports = sorted(
-        os.path.join(ROOT, "reports", name) for name in os.listdir(os.path.join(ROOT, "reports"))
-        if name.startswith("baseline_") and name.endswith(".md")
-    ) if os.path.isdir(os.path.join(ROOT, "reports")) else []
-    if not reports:
+BASELINE_REPORT = "baseline_kucoin_real.md"
+
+
+def _baseline_search_tables(months, report_name=None):
+    # Read exactly one named report. Falling back to another report could hand
+    # the LLM a baseline from a different dataset or cost level than the evaluator uses.
+    name = report_name or BASELINE_REPORT
+    path = os.path.join(ROOT, "reports", name)
+    if not os.path.isfile(path):
         return "No checked-in baseline monthly table was available."
-    for path in reversed(reports):
-        with open(path, encoding="utf-8") as stream:
-            lines = stream.readlines()
-        out = [f"Source: {os.path.basename(path)} (SEARCH months only)"]
-        keep = False
-        found = False
-        for line in lines:
-            if line.startswith("### Net bps per trade by month - all_taker"):
-                keep = True
-                found = True
-                out.append(line.rstrip())
-                continue
-            if keep:
-                if line.startswith("### ") or (line.strip() == "" and len(out) > 1):
-                    break
-                if line.startswith("|"):
-                    cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
-                    if len(cells) and cells[0] in months or (len(cells) and cells[0] == "Month") or (len(cells) and set(cells[0]) <= {"-", ":"}):
-                        out.append(line.rstrip())
-        if found:
-            return "\n".join(out)
+    with open(path, encoding="utf-8") as stream:
+        lines = stream.readlines()
+    out = [f"Source: {os.path.basename(path)} (SEARCH months only)"]
+    keep = False
+    found = False
+    for line in lines:
+        if line.startswith("### Net bps per trade by month - all_taker"):
+            keep = True
+            found = True
+            out.append(line.rstrip())
+            continue
+        if keep:
+            if line.startswith("### ") or (line.strip() == "" and len(out) > 1):
+                break
+            if line.startswith("|"):
+                cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
+                if ((len(cells) and cells[0] in months) or (len(cells) and cells[0] == "Month")
+                        or (len(cells) and set(cells[0]) <= {"-", ":"})):
+                    out.append(line.rstrip())
+    if found:
+        return "\n".join(out)
     return "No all-taker baseline monthly table was available."
 
 
