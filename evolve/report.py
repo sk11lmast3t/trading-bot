@@ -21,7 +21,8 @@ def render_cycle(records, settings=None, max_candidates=DEFAULT_MAX_CANDIDATES,
          f"slippage={settings['slippage']}, long_only={settings['long_only']}, "
          f"stop_pct={settings.get('stop_pct', 0.02)}, "
          f"min_target_pct={settings.get('min_target_pct', 0.05)}, "
-         f"max_leverage={settings.get('max_leverage', 1.0)}"),
+         f"max_leverage={settings.get('max_leverage', 1.0)}, "
+         f"hold_minutes={settings.get('hold_minutes', 30.0)}"),
         (f"Cycle limits: --max-candidates={max_candidates} "
          f"(default {DEFAULT_MAX_CANDIDATES}); --token-budget={token_budget} "
          f"(default {DEFAULT_TOKEN_BUDGET})"),

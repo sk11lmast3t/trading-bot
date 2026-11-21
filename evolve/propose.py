@@ -136,7 +136,7 @@ def _journal_summary(months, splits):
 
 
 def build_prompt(name, ledger_path=None, stop_pct=0.02, min_target_pct=0.05,
-                 max_leverage=1.0, data_dir=None):
+                 max_leverage=1.0, data_dir=None, hold_minutes=30.0):
     months, splits = _search_months(data_dir)
     ledger = prompt_entries(ledger_path or os.path.join(ROOT, "evolve", "ledger.jsonl"), 10)
     # Explicitly serialize only the search/validation fields. Holdout results
@@ -181,7 +181,8 @@ DESIGN CONSTRAINTS
 - Do not use leverage above {max_leverage:g}x.
 - Use completed bars only.
 - Use one fixed rule set.
-- Holds up to several days are allowed.
+- Every trade is force-closed {hold_minutes:g} minutes after entry. Design for that
+  holding period; a target far from entry may rarely be reached in time.
 
 Interface:
     class BaseStrategy:
@@ -236,10 +237,10 @@ def _extract_code(text):
 
 def propose_candidate(name, llm_client=None, token_budget=12000, already_spent=0,
                       ledger_path=None, config_path=LLM_ENV_PATH, stop_pct=0.02,
-                      min_target_pct=0.05, max_leverage=1.0, data_dir=None):
+                      min_target_pct=0.05, max_leverage=1.0, data_dir=None, hold_minutes=30.0):
     prompt = build_prompt(name, ledger_path=ledger_path, stop_pct=stop_pct,
                           min_target_pct=min_target_pct, max_leverage=max_leverage,
-                          data_dir=data_dir)
+                          data_dir=data_dir, hold_minutes=hold_minutes)
     remaining = int(token_budget) - int(already_spent) - estimate_tokens(prompt)
     if remaining < 256:
         raise RuntimeError("hard cycle token budget leaves fewer than 256 response tokens")
