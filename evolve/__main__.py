@@ -98,7 +98,7 @@ def cycle(max_candidates=DEFAULT_MAX_CANDIDATES, token_budget=DEFAULT_TOKEN_BUDG
             path, used, _ = propose_candidate(name, llm_client=llm_client,
                                                token_budget=token_budget, already_spent=spent,
                                                stop_pct=stop_pct, min_target_pct=min_target_pct,
-                                               max_leverage=max_leverage)
+                                               max_leverage=max_leverage, data_dir=data_dir)
             spent += used
             with open(path, encoding="utf-8") as stream:
                 source = stream.read()

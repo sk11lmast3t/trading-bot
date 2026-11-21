@@ -45,8 +45,9 @@ def llm_config(path=LLM_ENV_PATH, environ=None):
     return {"base_url": base_url.rstrip("/"), "model": model, "api_key": key}
 
 
-def _search_months():
-    splits = discover_splits(os.path.join(ROOT, "data"))
+def _search_months(data_dir=None):
+    # Resolve the supplied path the same way evaluate_candidate resolves --data.
+    splits = discover_splits(data_dir if data_dir is not None else os.path.join(ROOT, "data"))
     month_sets = [{start.strftime("%Y-%m") for start, _ in split.search}
                   for split in splits.values()]
     # A shared baseline table aggregates symbols. Include only months that are
@@ -132,8 +133,8 @@ def _journal_summary(months, splits):
 
 
 def build_prompt(name, ledger_path=None, stop_pct=0.02, min_target_pct=0.05,
-                 max_leverage=1.0):
-    months, splits = _search_months()
+                 max_leverage=1.0, data_dir=None):
+    months, splits = _search_months(data_dir)
     ledger = prompt_entries(ledger_path or os.path.join(ROOT, "evolve", "ledger.jsonl"), 10)
     # Explicitly serialize only the search/validation fields. Holdout results
     # are omitted even if future ledger event formats add them.
@@ -232,9 +233,10 @@ def _extract_code(text):
 
 def propose_candidate(name, llm_client=None, token_budget=12000, already_spent=0,
                       ledger_path=None, config_path=LLM_ENV_PATH, stop_pct=0.02,
-                      min_target_pct=0.05, max_leverage=1.0):
+                      min_target_pct=0.05, max_leverage=1.0, data_dir=None):
     prompt = build_prompt(name, ledger_path=ledger_path, stop_pct=stop_pct,
-                          min_target_pct=min_target_pct, max_leverage=max_leverage)
+                          min_target_pct=min_target_pct, max_leverage=max_leverage,
+                          data_dir=data_dir)
     remaining = int(token_budget) - int(already_spent) - estimate_tokens(prompt)
     if remaining < 256:
         raise RuntimeError("hard cycle token budget leaves fewer than 256 response tokens")

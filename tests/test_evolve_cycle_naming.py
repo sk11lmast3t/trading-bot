@@ -52,7 +52,7 @@ def isolated_cycle(tmp_path, monkeypatch):
     monkeypatch.setattr(evolve_cli, "write_cycle", lambda rows, **kwargs: (
         reports.append(rows) or str(tmp_path / "cycle-report.md")))
 
-    monkeypatch.setattr(propose, "_search_months", lambda: ({"2025-01"}, {}))
+    monkeypatch.setattr(propose, "_search_months", lambda data_dir=None: ({"2025-01"}, {}))
     monkeypatch.setattr(propose, "_journal_summary", lambda *_: "")
     monkeypatch.setattr(propose, "_baseline_search_tables", lambda *_: "")
 
@@ -108,6 +108,22 @@ def test_cycle_interrupt_records_failure_and_reraises_without_report(isolated_cy
         "cycle error: KeyboardInterrupt: run interrupted"
     ]
     assert reports == []
+
+
+def test_cycle_passes_data_dir_to_the_proposer(isolated_cycle, monkeypatch):
+    _, _, _, use_stub_client, _, _ = isolated_cycle
+    use_stub_client(StubLLM())
+    seen = []
+    real_propose_candidate = evolve_cli.propose_candidate
+
+    def spy(name, **kwargs):
+        seen.append(kwargs.get("data_dir"))
+        return real_propose_candidate(name, **kwargs)
+
+    monkeypatch.setattr(evolve_cli, "propose_candidate", spy)
+    evolve_cli.cycle(max_candidates=1, token_budget=1000, data_dir="some_data_dir")
+
+    assert seen == ["some_data_dir"]
 
 
 def test_cycle_default_eval_timeout_is_passed_to_search_and_validation(isolated_cycle):

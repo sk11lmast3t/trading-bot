@@ -25,7 +25,7 @@ def _valid_code():
 
 
 def test_build_prompt_documents_candidate_runtime_restrictions(tmp_path, monkeypatch):
-    monkeypatch.setattr(propose, "_search_months", lambda: ({"2025-01"}, {}))
+    monkeypatch.setattr(propose, "_search_months", lambda data_dir=None: ({"2025-01"}, {}))
     monkeypatch.setattr(propose, "_journal_summary", lambda *_: "")
     monkeypatch.setattr(propose, "_baseline_search_tables", lambda *_: "")
     ledger = tmp_path / "ledger.jsonl"
@@ -56,7 +56,7 @@ def test_build_prompt_documents_candidate_runtime_restrictions(tmp_path, monkeyp
 def test_proposal_uses_fake_client_and_writes_one_candidate(tmp_path, monkeypatch):
     monkeypatch.setattr(evaluate, "CANDIDATE_DIR", str(tmp_path / "candidates"))
     monkeypatch.setattr(propose, "ROOT", str(tmp_path))
-    monkeypatch.setattr(propose, "_search_months", lambda: ({"2025-01"}, {}))
+    monkeypatch.setattr(propose, "_search_months", lambda data_dir=None: ({"2025-01"}, {}))
     monkeypatch.setattr(propose, "_journal_summary", lambda *_: "search journal summary")
     monkeypatch.setattr(propose, "_baseline_search_tables", lambda *_: "| 2025-01 | search only |")
     ledger = tmp_path / "ledger.jsonl"
@@ -86,7 +86,7 @@ def test_proposal_uses_fake_client_and_writes_one_candidate(tmp_path, monkeypatc
 def test_rejected_proposal_saves_raw_response_and_reraises_candidate_error(tmp_path, monkeypatch):
     monkeypatch.setattr(evaluate, "CANDIDATE_DIR", str(tmp_path / "candidates"))
     monkeypatch.setattr(propose, "ROOT", str(tmp_path))
-    monkeypatch.setattr(propose, "_search_months", lambda: ({"2025-01"}, {}))
+    monkeypatch.setattr(propose, "_search_months", lambda data_dir=None: ({"2025-01"}, {}))
     monkeypatch.setattr(propose, "_journal_summary", lambda *_: "")
     monkeypatch.setattr(propose, "_baseline_search_tables", lambda *_: "")
     ledger = tmp_path / "ledger.jsonl"
@@ -114,6 +114,30 @@ def test_api_key_is_read_only_from_llm_env_file(tmp_path):
     result = propose.llm_config(str(env_file), {"LLM_BASE_URL": "http://localhost/v1",
                                                  "LLM_MODEL": "fake"})
     assert result["api_key"] == "file-secret"
+
+
+def test_build_prompt_reads_the_data_dir_it_is_given(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(propose, "discover_splits", lambda path: seen.append(path) or {})
+    monkeypatch.setattr(propose, "_journal_summary", lambda *_: "")
+    monkeypatch.setattr(propose, "_baseline_search_tables", lambda *_: "")
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("", encoding="utf-8")
+
+    propose.build_prompt("trial_test", ledger_path=str(ledger), data_dir="some_data_dir")
+
+    assert seen == ["some_data_dir"]
+
+
+def test_propose_candidate_forwards_data_dir_to_build_prompt(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(propose, "build_prompt", lambda name, **kwargs: seen.update(kwargs) or "tiny")
+
+    with pytest.raises(RuntimeError, match="hard cycle token budget"):
+        propose.propose_candidate("trial_test", llm_client=object(), token_budget=100,
+                                  data_dir="some_data_dir")
+
+    assert seen.get("data_dir") == "some_data_dir"
 
 
 def test_proposal_refuses_budget_overrun_before_writing(tmp_path, monkeypatch):
