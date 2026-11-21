@@ -76,3 +76,64 @@ def test_holdout_is_single_attempt_and_promotion_needs_validation_and_holdout(tm
     assert any(row.get("event") == "holdout_refused" for row in evolve_cli.read_entries())
     evolve_cli.promote("trial")
     assert "trial" in (tmp_path / "config" / "paper_candidates.json").read_text()
+
+
+
+def _seed_holdout(monkeypatch, tmp_path, params=None):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "evolve").mkdir()
+    row = {"event": "candidate", "name": "trial", "verdict": "passed"}
+    if params is not None:
+        row["params"] = params
+    evolve_cli.append_entry(row)
+    calls = []
+
+    def fake_eval(*args, **kwargs):
+        calls.append(kwargs)
+        return {"pass": True}
+
+    monkeypatch.setattr(evolve_cli, "evaluate_candidate", fake_eval)
+    monkeypatch.setattr(evolve_cli, "load_costs", lambda *args: {
+        "maker_fee": 0.0002, "taker_fee": 0.0005, "slippage": 0.0003,
+    })
+    return calls
+
+
+def test_holdout_refuses_a_different_hold_than_validation(tmp_path, monkeypatch):
+    calls = _seed_holdout(monkeypatch, tmp_path, {"hold_minutes": 45.0})
+    with pytest.raises(RuntimeError, match="differs"):
+        evolve_cli.holdout("trial", hold_minutes=30)
+    assert calls == []
+    assert not any(row.get("event") == "holdout_attempt"
+                   for row in evolve_cli.read_entries())
+
+
+def test_holdout_uses_the_hold_recorded_on_the_candidate(tmp_path, monkeypatch):
+    calls = _seed_holdout(monkeypatch, tmp_path, {"hold_minutes": 45.0})
+    evolve_cli.holdout("trial")
+    assert len(calls) == 1
+    assert calls[0]["hold_minutes"] == 45.0
+    attempts = [row for row in evolve_cli.read_entries()
+                if row.get("event") == "holdout_attempt"]
+    assert len(attempts) == 1
+    assert attempts[0]["params"]["hold_minutes"] == 45.0
+    results = [row for row in evolve_cli.read_entries()
+               if row.get("event") == "holdout_result"]
+    assert results[0]["params"]["hold_minutes"] == 45.0
+
+
+def test_holdout_treats_a_row_without_hold_as_30_minutes(tmp_path, monkeypatch):
+    calls = _seed_holdout(monkeypatch, tmp_path)
+    evolve_cli.holdout("trial")
+    assert calls[0]["hold_minutes"] == 30.0
+
+
+
+def test_report_shows_real_run_settings_including_hold():
+    report = render_cycle([], {"maker_fee": .001, "taker_fee": .001, "slippage": .0003,
+                               "long_only": True, "stop_pct": 0.03,
+                               "min_target_pct": 0.04, "max_leverage": 1.0,
+                               "hold_minutes": 45.0})
+    assert "stop_pct=0.03" in report
+    assert "min_target_pct=0.04" in report
+    assert "hold_minutes=45.0" in report

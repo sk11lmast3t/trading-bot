@@ -80,7 +80,8 @@ def test_proposal_uses_fake_client_and_writes_one_candidate(tmp_path, monkeypatc
     assert "5.0000%" in prompt
     assert "1x" in prompt
     assert "completed bars only" in prompt
-    assert "Holds up to several days are allowed" in prompt
+    assert "force-closed 30 minutes after entry" in prompt
+    assert "Holds up to several days" not in prompt
 
 
 def test_rejected_proposal_saves_raw_response_and_reraises_candidate_error(tmp_path, monkeypatch):
@@ -200,3 +201,27 @@ def test_baseline_table_has_no_fallback_to_another_report(tmp_path, monkeypatch)
     text = propose._baseline_search_tables({"2025-01"})
 
     assert text == "No checked-in baseline monthly table was available."
+
+
+def test_build_prompt_states_the_hold_time_and_not_multi_day_holds(tmp_path, monkeypatch):
+    monkeypatch.setattr(propose, "_search_months", lambda data_dir=None: ({"2025-01"}, {}))
+    monkeypatch.setattr(propose, "_journal_summary", lambda *_: "")
+    monkeypatch.setattr(propose, "_baseline_search_tables", lambda *_: "")
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("", encoding="utf-8")
+
+    prompt = propose.build_prompt("trial_test", ledger_path=str(ledger), hold_minutes=45)
+
+    assert "45 minutes after entry" in prompt
+    assert "Holds up to several days" not in prompt
+
+
+def test_propose_candidate_forwards_hold_minutes_to_build_prompt(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(propose, "build_prompt", lambda name, **kwargs: seen.update(kwargs) or "tiny")
+
+    with pytest.raises(RuntimeError, match="hard cycle token budget"):
+        propose.propose_candidate("trial_test", llm_client=object(), token_budget=100,
+                                  hold_minutes=45)
+
+    assert seen.get("hold_minutes") == 45

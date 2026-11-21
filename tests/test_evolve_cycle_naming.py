@@ -161,3 +161,59 @@ def test_invalid_eval_timeout_fails_before_work_or_ledger_write(isolated_cycle, 
 
     assert learn_calls == []
     assert ledger.read_entries(str(ledger_path)) == []
+
+
+def test_hold_minutes_is_passed_to_both_evaluations_and_recorded(isolated_cycle):
+    _candidate_dir, _ledger_path, _reports, use_stub_client, evaluation_calls, _ = isolated_cycle
+    use_stub_client(StubLLM())
+
+    records = evolve_cli.cycle(max_candidates=1, token_budget=1000, hold_minutes=120)
+
+    assert [call["hold_minutes"] for call in evaluation_calls] == [120.0, 120.0]
+    assert records[0]["params"]["hold_minutes"] == 120.0
+
+
+def test_default_hold_minutes_is_30(isolated_cycle):
+    _candidate_dir, _ledger_path, _reports, use_stub_client, evaluation_calls, _ = isolated_cycle
+    use_stub_client(StubLLM())
+
+    records = evolve_cli.cycle(max_candidates=1, token_budget=1000)
+
+    assert [call["hold_minutes"] for call in evaluation_calls] == [30.0, 30.0]
+    assert records[0]["params"]["hold_minutes"] == 30.0
+
+
+@pytest.mark.parametrize("hold_minutes", [0, -5, float("nan"), float("inf"), True])
+def test_invalid_hold_minutes_fails_before_any_work(isolated_cycle, hold_minutes):
+    _candidate_dir, _ledger_path, _reports, _use_stub_client, evaluation_calls, learn_calls = isolated_cycle
+
+    with pytest.raises(ValueError, match="hold_minutes must be a positive finite number"):
+        evolve_cli.cycle(max_candidates=1, hold_minutes=hold_minutes)
+
+    assert learn_calls == []
+    assert evaluation_calls == []
+
+
+def test_hold_minutes_does_not_change_the_trial_settings():
+    base = {"event": "candidate", "maker_fee": 0.001, "taker_fee": 0.001, "slippage": 0.0003,
+            "long_only": True, "fill_model_version": "v"}
+    one = {**base, "params": {"hold_minutes": 60.0}}
+    two = {**base, "params": {"hold_minutes": 120.0}}
+
+    assert evolve_cli._row_settings(one) == evolve_cli._row_settings(two)
+
+
+def test_cycle_passes_hold_minutes_to_the_proposer(isolated_cycle, monkeypatch):
+    _, _, _, use_stub_client, _, _ = isolated_cycle
+    use_stub_client(StubLLM())
+    seen = []
+    real_propose_candidate = evolve_cli.propose_candidate
+
+    def spy(name, **kwargs):
+        seen.append(kwargs.get("hold_minutes"))
+        return real_propose_candidate(name, **kwargs)
+
+    monkeypatch.setattr(evolve_cli, "propose_candidate", spy)
+    evolve_cli.cycle(max_candidates=1, token_budget=1000, hold_minutes=90)
+
+    assert seen == [90.0]

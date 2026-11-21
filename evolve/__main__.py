@@ -58,16 +58,22 @@ def _trial_count(entries, settings):
 def cycle(max_candidates=DEFAULT_MAX_CANDIDATES, token_budget=DEFAULT_TOKEN_BUDGET,
           llm_client=None, data_dir="data", maker_fee=None, taker_fee=None,
           slippage=None, long_only=False, stop_pct=0.02,
-          min_target_pct=0.05, max_leverage=1.0, eval_timeout=1800):
+          min_target_pct=0.05, max_leverage=1.0, eval_timeout=1800,
+          hold_minutes=30.0):
     if max_candidates < 1 or max_candidates > 3:
         raise ValueError("A cycle may create between 1 and 3 candidates")
     if isinstance(eval_timeout, bool) or not isinstance(eval_timeout, int) or eval_timeout <= 0:
         raise ValueError("eval_timeout must be a positive integer")
+    if (isinstance(hold_minutes, bool) or not isinstance(hold_minutes, (int, float))
+            or not 0 < hold_minutes < float("inf")):
+        raise ValueError("hold_minutes must be a positive finite number")
+    hold_minutes = float(hold_minutes)
     learn_costs()
     settings = _settings(maker_fee, taker_fee, slippage, long_only)
     costs = {key: settings[key] for key in ("maker_fee", "taker_fee", "slippage")}
     print("Cycle settings: " + ", ".join(f"{key}={value}" for key, value in settings.items())
-          + f", max_candidates={max_candidates}, token_budget={token_budget}")
+          + f", max_candidates={max_candidates}, token_budget={token_budget}"
+          + f", hold_minutes={hold_minutes}")
     records = []
     spent = 0
     entries = read_entries()
@@ -91,14 +97,15 @@ def cycle(max_candidates=DEFAULT_MAX_CANDIDATES, token_budget=DEFAULT_TOKEN_BUDG
                **settings,
                "params": {"costs": costs, "long_only": settings["long_only"],
                           "stop_pct": stop_pct, "min_target_pct": min_target_pct,
-                          "max_leverage": max_leverage,
+                          "max_leverage": max_leverage, "hold_minutes": hold_minutes,
                           "partitions": ["search", "validation"]},
                "search": {}, "validation": {}}
         try:
             path, used, _ = propose_candidate(name, llm_client=llm_client,
                                                token_budget=token_budget, already_spent=spent,
                                                stop_pct=stop_pct, min_target_pct=min_target_pct,
-                                               max_leverage=max_leverage, data_dir=data_dir)
+                                               max_leverage=max_leverage, data_dir=data_dir,
+                                               hold_minutes=hold_minutes)
             spent += used
             with open(path, encoding="utf-8") as stream:
                 source = stream.read()
@@ -107,11 +114,11 @@ def cycle(max_candidates=DEFAULT_MAX_CANDIDATES, token_budget=DEFAULT_TOKEN_BUDG
             row["search"] = evaluate_candidate(name, "search", data_dir=data_dir, fees=costs,
                                                trials=trials, stress_factor=1.5,
                                                long_only=settings["long_only"],
-                                               timeout=eval_timeout)
+                                               timeout=eval_timeout, hold_minutes=hold_minutes)
             row["validation"] = evaluate_candidate(name, "validation", data_dir=data_dir, fees=costs,
                                                    trials=trials, stress_factor=1.5,
                                                    long_only=settings["long_only"],
-                                                   timeout=eval_timeout)
+                                                   timeout=eval_timeout, hold_minutes=hold_minutes)
             gate = validation_verdict(row["search"], row["validation"], trials)
             geometry_failures = []
             for partition in ("search", "validation"):
@@ -134,14 +141,14 @@ def cycle(max_candidates=DEFAULT_MAX_CANDIDATES, token_budget=DEFAULT_TOKEN_BUDG
         append_entry(row)
         entries.append(row)
         records.append(row)
-    report_path = write_cycle(records, settings=settings, max_candidates=max_candidates,
+    report_path = write_cycle(records, settings={**settings, "stop_pct": stop_pct, "min_target_pct": min_target_pct, "max_leverage": max_leverage, "hold_minutes": hold_minutes}, max_candidates=max_candidates,
                               token_budget=token_budget)
     print(f"Wrote {report_path}")
     return records
 
 
 def holdout(name, data_dir="data", maker_fee=None, taker_fee=None,
-            slippage=None, long_only=False):
+            slippage=None, long_only=False, hold_minutes=None):
     name = _safe_name(name)
     settings = _settings(maker_fee, taker_fee, slippage, long_only)
     fees = {key: settings[key] for key in ("maker_fee", "taker_fee", "slippage")}
@@ -155,14 +162,20 @@ def holdout(name, data_dir="data", maker_fee=None, taker_fee=None,
         raise RuntimeError("Candidate must pass validation before its one holdout run")
     if candidate.get("fill_model_version", "legacy") != FILL_MODEL_VERSION:
         raise RuntimeError("Candidate validation used a different fill model; reevaluate it first")
+    recorded_hold = float((candidate.get("params") or {}).get("hold_minutes", 30.0))
+    if hold_minutes is not None and float(hold_minutes) != recorded_hold:
+        raise RuntimeError(f"Holdout hold_minutes {hold_minutes} differs from the {recorded_hold} used in validation")
+    hold_minutes = recorded_hold
     append_entry({"event": "holdout_attempt", "name": name, **settings,
-                  "params": {"costs": fees, "long_only": settings["long_only"]}})
+                  "params": {"costs": fees, "long_only": settings["long_only"],
+                             "hold_minutes": hold_minutes}})
     try:
         result = evaluate_candidate(name, "holdout", data_dir=data_dir,
                                     fees=fees, trials=max(1, _trial_count(read_entries(), settings)),
-                                    long_only=settings["long_only"])
+                                    long_only=settings["long_only"], hold_minutes=hold_minutes)
         append_entry({"event": "holdout_result", "name": name, **settings,
-                      "params": {"costs": fees, "long_only": settings["long_only"]},
+                      "params": {"costs": fees, "long_only": settings["long_only"],
+                                 "hold_minutes": hold_minutes},
                       "result": result})
         print(json.dumps(result, indent=2))
         return result
@@ -216,6 +229,8 @@ def main(argv=None):
     cyc.add_argument("--max-leverage", type=float, default=1.0)
     cyc.add_argument("--eval-timeout", type=int, default=1800,
                      help="Maximum seconds allowed for each search/validation evaluation")
+    cyc.add_argument("--hold-minutes", type=float, default=30.0,
+                     help="Maximum minutes a trade may be held before a time exit")
     hold = sub.add_parser("holdout")
     hold.add_argument("name")
     hold.add_argument("--data", default="data")
@@ -231,7 +246,8 @@ def main(argv=None):
               maker_fee=args.maker_fee, taker_fee=args.taker_fee,
               slippage=args.slippage, long_only=args.long_only,
               stop_pct=args.stop_pct, min_target_pct=args.min_target_pct,
-              max_leverage=args.max_leverage, eval_timeout=args.eval_timeout)
+              max_leverage=args.max_leverage, eval_timeout=args.eval_timeout,
+              hold_minutes=args.hold_minutes)
     elif args.command == "holdout":
         holdout(args.name, args.data, maker_fee=args.maker_fee,
                 taker_fee=args.taker_fee, slippage=args.slippage,
