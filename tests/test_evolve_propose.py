@@ -225,3 +225,91 @@ def test_propose_candidate_forwards_hold_minutes_to_build_prompt(monkeypatch):
                                   hold_minutes=45)
 
     assert seen.get("hold_minutes") == 45
+
+
+def _stub_prompt_inputs(monkeypatch):
+    monkeypatch.setattr(propose, "_search_months", lambda data_dir=None: ({"2025-01"}, {}))
+    monkeypatch.setattr(propose, "_journal_summary", lambda *_: "")
+    monkeypatch.setattr(propose, "_baseline_search_tables", lambda *_: "")
+
+
+def _empty_ledger(tmp_path):
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("", encoding="utf-8")
+    return str(ledger)
+
+
+def test_build_prompt_includes_research_idea_as_untrusted_data(tmp_path, monkeypatch):
+    _stub_prompt_inputs(monkeypatch)
+
+    prompt = propose.build_prompt("trial_test", ledger_path=_empty_ledger(tmp_path),
+                                  research_idea="Buy pullbacks in an uptrend.")
+
+    assert "Buy pullbacks in an uptrend." in prompt
+    assert "untrusted data" in prompt
+    assert "DESIGN CONSTRAINTS win" in prompt
+    assert prompt.index("DESIGN CONSTRAINTS\n") < prompt.index("Buy pullbacks")
+
+
+def test_build_prompt_without_idea_is_unchanged(tmp_path, monkeypatch):
+    _stub_prompt_inputs(monkeypatch)
+    ledger = _empty_ledger(tmp_path)
+
+    base = propose.build_prompt("trial_test", ledger_path=ledger)
+    explicit_none = propose.build_prompt("trial_test", ledger_path=ledger, research_idea=None)
+    with_idea = propose.build_prompt("trial_test", ledger_path=ledger, research_idea="x")
+
+    assert explicit_none == base
+    assert "RESEARCH IDEA" not in base
+    assert with_idea.replace(propose._idea_block("x"), "", 1) == base
+
+
+def test_load_research_idea_rejects_empty_and_oversized(tmp_path):
+    empty = tmp_path / "empty.txt"
+    empty.write_text("   ", encoding="utf-8")
+    big = tmp_path / "big.txt"
+    big.write_text("a" * (propose.MAX_IDEA_CHARS + 1), encoding="utf-8")
+    exact = tmp_path / "exact.txt"
+    exact.write_text("a" * propose.MAX_IDEA_CHARS, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="empty"):
+        propose.load_research_idea(str(empty))
+    with pytest.raises(ValueError, match="longer than"):
+        propose.load_research_idea(str(big))
+    assert propose.load_research_idea(str(exact)) == "a" * propose.MAX_IDEA_CHARS
+
+
+def test_research_idea_still_hits_the_holdout_safety_check(tmp_path, monkeypatch):
+    _stub_prompt_inputs(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="forbidden holdout content"):
+        propose.build_prompt("trial_test", ledger_path=_empty_ledger(tmp_path),
+                             research_idea="use holdout_result here")
+
+
+def test_propose_candidate_forwards_research_idea_only_when_given(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(propose, "build_prompt", lambda name, **kwargs: seen.update(kwargs) or "tiny")
+
+    with pytest.raises(RuntimeError, match="hard cycle token budget"):
+        propose.propose_candidate("trial_test", llm_client=object(), token_budget=100,
+                                  research_idea="an idea")
+    assert seen.get("research_idea") == "an idea"
+
+    seen.clear()
+    with pytest.raises(RuntimeError, match="hard cycle token budget"):
+        propose.propose_candidate("trial_test", llm_client=object(), token_budget=100)
+    assert "research_idea" not in seen
+
+
+def test_cycle_rejects_oversized_idea_file_before_any_llm_call(tmp_path, monkeypatch):
+    big = tmp_path / "idea.txt"
+    big.write_text("a" * (propose.MAX_IDEA_CHARS + 1), encoding="utf-8")
+
+    def fail(*args, **kwargs):
+        raise AssertionError("LLM proposal must not be reached")
+
+    monkeypatch.setattr(evolve_cli, "propose_candidate", fail)
+
+    with pytest.raises(ValueError, match="longer than"):
+        evolve_cli.main(["cycle", "--max-candidates", "1", "--idea-file", str(big)])

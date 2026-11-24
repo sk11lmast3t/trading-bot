@@ -14,7 +14,7 @@ from evolve.evaluate import (constraint_failures, evaluate_candidate, load_costs
                              validate_candidate_source)
 from evolve.gates import validation_verdict
 from evolve.ledger import append_entry, holdout_attempted, latest_candidate, read_entries
-from evolve.propose import propose_candidate
+from evolve.propose import load_research_idea, propose_candidate
 from evolve.report import (DEFAULT_MAX_CANDIDATES, DEFAULT_TOKEN_BUDGET,
                            write_cycle)
 
@@ -59,7 +59,7 @@ def cycle(max_candidates=DEFAULT_MAX_CANDIDATES, token_budget=DEFAULT_TOKEN_BUDG
           llm_client=None, data_dir="data", maker_fee=None, taker_fee=None,
           slippage=None, long_only=False, stop_pct=0.02,
           min_target_pct=0.05, max_leverage=1.0, eval_timeout=1800,
-          hold_minutes=30.0):
+          hold_minutes=30.0, idea_file=None):
     if max_candidates < 1 or max_candidates > 3:
         raise ValueError("A cycle may create between 1 and 3 candidates")
     if isinstance(eval_timeout, bool) or not isinstance(eval_timeout, int) or eval_timeout <= 0:
@@ -68,6 +68,13 @@ def cycle(max_candidates=DEFAULT_MAX_CANDIDATES, token_budget=DEFAULT_TOKEN_BUDG
             or not 0 < hold_minutes < float("inf")):
         raise ValueError("hold_minutes must be a positive finite number")
     hold_minutes = float(hold_minutes)
+    idea_kwargs = {}
+    idea_params = {}
+    if idea_file is not None:
+        idea_text = load_research_idea(idea_file)
+        idea_kwargs = {"research_idea": idea_text}
+        idea_params = {"idea_sha256": hashlib.sha256(idea_text.encode("utf-8")).hexdigest(),
+                       "idea_chars": len(idea_text)}
     learn_costs()
     settings = _settings(maker_fee, taker_fee, slippage, long_only)
     costs = {key: settings[key] for key in ("maker_fee", "taker_fee", "slippage")}
@@ -98,14 +105,14 @@ def cycle(max_candidates=DEFAULT_MAX_CANDIDATES, token_budget=DEFAULT_TOKEN_BUDG
                "params": {"costs": costs, "long_only": settings["long_only"],
                           "stop_pct": stop_pct, "min_target_pct": min_target_pct,
                           "max_leverage": max_leverage, "hold_minutes": hold_minutes,
-                          "partitions": ["search", "validation"]},
+                          "partitions": ["search", "validation"], **idea_params},
                "search": {}, "validation": {}}
         try:
             path, used, _ = propose_candidate(name, llm_client=llm_client,
                                                token_budget=token_budget, already_spent=spent,
                                                stop_pct=stop_pct, min_target_pct=min_target_pct,
                                                max_leverage=max_leverage, data_dir=data_dir,
-                                               hold_minutes=hold_minutes)
+                                               hold_minutes=hold_minutes, **idea_kwargs)
             spent += used
             with open(path, encoding="utf-8") as stream:
                 source = stream.read()
@@ -231,6 +238,8 @@ def main(argv=None):
                      help="Maximum seconds allowed for each search/validation evaluation")
     cyc.add_argument("--hold-minutes", type=float, default=30.0,
                      help="Maximum minutes a trade may be held before a time exit")
+    cyc.add_argument("--idea-file", default=None,
+                     help="Optional plain-text research idea (max 6000 characters), shown to the LLM as untrusted data")
     hold = sub.add_parser("holdout")
     hold.add_argument("name")
     hold.add_argument("--data", default="data")
@@ -247,7 +256,7 @@ def main(argv=None):
               slippage=args.slippage, long_only=args.long_only,
               stop_pct=args.stop_pct, min_target_pct=args.min_target_pct,
               max_leverage=args.max_leverage, eval_timeout=args.eval_timeout,
-              hold_minutes=args.hold_minutes)
+              hold_minutes=args.hold_minutes, idea_file=args.idea_file)
     elif args.command == "holdout":
         holdout(args.name, args.data, maker_fee=args.maker_fee,
                 taker_fee=args.taker_fee, slippage=args.slippage,
