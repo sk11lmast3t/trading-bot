@@ -113,9 +113,36 @@ def estimate_reward_cost(setup, config):
     minimum = float(getattr(config.execution, "minimum_expected_net_reward_pct", 0.0002))
     net = gross - round_trip - buffer
     allowed = net >= minimum
+    reason = "" if allowed else "expected net reward is below the configured minimum"
+    rr_fields = {}
+    min_rr = _finite_or_zero(getattr(config, "min_rr_after_costs", 0.0))
+    if allowed and min_rr > 0:
+        # Optional risk/reward gate (default off). Uses the same round-trip cost
+        # (fees + slippage + funding) as above, added to the risk and removed
+        # from the reward: (gross - cost) / (stop distance + cost).
+        stop = float(setup.stop_loss or 0.0)
+        stop_ok = (math.isfinite(stop) and stop > 0 and
+                   ((signal == Signal.LONG and stop < entry) or
+                    (signal == Signal.SHORT and stop > entry)))
+        if not stop_ok:
+            allowed, reason = False, "risk/reward: stop-loss is missing or on the wrong side of entry"
+        else:
+            denominator = abs(entry - stop) / entry + round_trip
+            if not math.isfinite(denominator) or denominator <= 0:
+                allowed, reason = False, "risk/reward: risk after costs is not positive"
+            else:
+                rr = (gross - round_trip) / denominator
+                rr_fields = {"rr_after_costs": rr, "min_rr_after_costs": min_rr}
+                if rr < min_rr:
+                    allowed = False
+                    reason = (f"risk/reward after costs {rr:.2f} is below the "
+                              f"configured minimum {min_rr:.2f}")
+        if not allowed:
+            rr_fields["rr_rejected"] = True
     return {
+        **rr_fields,
         "allowed": allowed,
-        "reason": "" if allowed else "expected net reward is below the configured minimum",
+        "reason": reason,
         "gross_reward_pct": gross * 100.0,
         "entry_fee_pct": entry_fee * 100.0,
         "exit_fee_pct": exit_fee * 100.0,
@@ -127,6 +154,43 @@ def estimate_reward_cost(setup, config):
         "expected_net_reward_pct": net * 100.0,
         "minimum_expected_net_reward_pct": minimum * 100.0,
     }
+
+
+def _finite_or_zero(value):
+    try:
+        number = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if math.isfinite(number) else 0.0
+
+
+def volume_confirmation(frame, minimum_ratio, window=20):
+    """Optional volume gate (default off).
+
+    Compares the last *closed* bar's volume with the mean of the ``window``
+    closed bars before it. ``frame`` holds completed candles only. Short
+    history, missing/non-finite volume or a zero average fail closed.
+    """
+    try:
+        minimum = float(minimum_ratio or 0.0)
+    except (TypeError, ValueError):
+        return False, "volume filter: minimum ratio is not a number"
+    if minimum <= 0:
+        return True, ""
+    if not math.isfinite(minimum):
+        return False, "volume filter: minimum ratio is not finite"
+    if frame is None or "volume" not in frame or len(frame) < window + 1:
+        return False, f"volume filter: needs {window + 1} completed candles"
+    volumes = pd.to_numeric(frame["volume"].iloc[-(window + 1):], errors="coerce")
+    last, prior = float(volumes.iloc[-1]), volumes.iloc[:-1]
+    average = float(prior.mean())
+    if (not math.isfinite(last) or prior.isna().any() or
+            not math.isfinite(average) or average <= 0):
+        return False, "volume filter: volume data is missing or the average is zero"
+    ratio = last / average
+    if ratio < minimum:
+        return False, f"volume filter: last closed bar volume is {ratio:.2f}x its {window}-bar average, below {minimum:.2f}x"
+    return True, ""
 
 
 def timeframe_minutes(value):
@@ -300,13 +364,21 @@ class StrategyEngine:
                     if setup.signal in (Signal.LONG, Signal.SHORT):
                         setup.strategy_name = f"{name}@{timeframe}"
                         costs = estimate_reward_cost(setup, self.config)
-                        if costs["allowed"]:
+                        volume_ok, volume_reason = (
+                            volume_confirmation(frame, getattr(self.config, "min_volume_ratio", 0.0))
+                            if costs["allowed"] else (True, ""))
+                        if costs["allowed"] and volume_ok:
                             candidates.append((setup, timeframe, frame))
                         else:
-                            self.last_rejection_reason[symbol] = (
-                                f"cost-aware filter: net reward {costs['expected_net_reward_pct']:.4f}% "
-                                f"below minimum {costs['minimum_expected_net_reward_pct']:.4f}%"
-                            )
+                            if not costs["allowed"] and costs.get("rr_rejected"):
+                                self.last_rejection_reason[symbol] = costs["reason"]
+                            elif not costs["allowed"]:
+                                self.last_rejection_reason[symbol] = (
+                                    f"cost-aware filter: net reward {costs['expected_net_reward_pct']:.4f}% "
+                                    f"below minimum {costs['minimum_expected_net_reward_pct']:.4f}%"
+                                )
+                            else:
+                                self.last_rejection_reason[symbol] = volume_reason
                             self.last_skip_reasons[symbol][setup.strategy_name] = self.last_rejection_reason[symbol]
                     self.last_support[key] = "evaluated"
                 except Exception as exc:

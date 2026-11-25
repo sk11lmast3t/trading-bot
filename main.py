@@ -2732,6 +2732,18 @@ def build_config_from_args(argv=None, environ=None):
                         help="Additional reward buffer in percentage points (default: 0.02)")
     parser.add_argument("--min-expected-net-reward-pct", type=float, default=0.02,
                         help="Minimum net target reward in percentage points (default: 0.02)")
+    parser.add_argument("--min-rr-after-costs", type=float, default=0.0,
+                        help="Paper only: minimum (gross reward - round-trip cost) / (stop distance + cost); 0 = off (default)")
+    parser.add_argument("--min-volume-ratio", type=float, default=0.0,
+                        help="Paper only: last closed bar volume must be at least this multiple of the prior 20-bar average; 0 = off (default)")
+    parser.add_argument("--daily-trade-limit", type=int, default=None,
+                        help="Paper only: max closed trades per UTC day (default: config value)")
+    parser.add_argument("--cooldown-seconds", type=int, default=None,
+                        help="Paper only: global wait after the last closed trade before any new entry (default: config value)")
+    parser.add_argument("--max-daily-loss-pct", type=float, default=None,
+                        help="Paper only: block new entries after this daily loss in percentage points, until 00:00 UTC (default: config value)")
+    parser.add_argument("--max-drawdown-pct", type=float, default=None,
+                        help="Paper only: halt new entries at this drawdown from peak balance in percentage points; no reset until restart (default: config value)")
     parser.add_argument("--symbols", nargs="+", help="Fixed symbols separated by spaces or commas")
     parser.add_argument("--fresh", action="store_true", help="Start paper mode without restoring persisted positions")
     parser.add_argument("--paper-session-id",
@@ -2840,6 +2852,38 @@ def build_config_from_args(argv=None, environ=None):
         raise SystemExit("Cost buffer and minimum expected net reward must be finite and non-negative.")
     cfg.execution.cost_safety_buffer_pct = args.cost_safety_buffer_pct / 100.0
     cfg.execution.minimum_expected_net_reward_pct = args.min_expected_net_reward_pct / 100.0
+    gate_flags = {
+        "--min-rr-after-costs": args.min_rr_after_costs != 0.0,
+        "--min-volume-ratio": args.min_volume_ratio != 0.0,
+        "--daily-trade-limit": args.daily_trade_limit is not None,
+        "--cooldown-seconds": args.cooldown_seconds is not None,
+        "--max-daily-loss-pct": args.max_daily_loss_pct is not None,
+        "--max-drawdown-pct": args.max_drawdown_pct is not None,
+    }
+    used_gate_flags = [name for name, used in gate_flags.items() if used]
+    if used_gate_flags and requested_mode != "paper":
+        raise SystemExit(", ".join(used_gate_flags) + " are available only in paper mode.")
+    for name in ("min_rr_after_costs", "min_volume_ratio"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value < 0:
+            raise SystemExit(f"--{name.replace('_', '-')} must be finite and non-negative (0 = off).")
+    cfg.min_rr_after_costs = args.min_rr_after_costs
+    cfg.min_volume_ratio = args.min_volume_ratio
+    if args.daily_trade_limit is not None:
+        if args.daily_trade_limit < 1:
+            raise SystemExit("--daily-trade-limit must be at least 1.")
+        cfg.risk.daily_trade_limit = args.daily_trade_limit
+    if args.cooldown_seconds is not None:
+        if args.cooldown_seconds < 0:
+            raise SystemExit("--cooldown-seconds must be non-negative.")
+        cfg.scalping.cooldown_seconds = args.cooldown_seconds
+    for name, field in (("max_daily_loss_pct", "max_daily_loss_pct"),
+                        ("max_drawdown_pct", "max_drawdown_pct")):
+        value = getattr(args, name)
+        if value is not None:
+            if not math.isfinite(value) or value <= 0 or value > 100:
+                raise SystemExit(f"--{name.replace('_', '-')} must be greater than 0 and at most 100 (percentage points).")
+            setattr(cfg.risk, field, value / 100.0)
     cfg.strategy.orderbook_depth = args.orderbook_limit
     cfg.max_cycles = args.max_cycles
     for name in ("maker_fee", "taker_fee", "slippage"):
@@ -3027,6 +3071,12 @@ def effective_config_summary(cfg):
         "ORDERBOOK LIMIT": int(cfg.strategy.orderbook_depth),
         "COST SAFETY BUFFER PCT": float(cfg.execution.cost_safety_buffer_pct) * 100.0,
         "MIN EXPECTED NET REWARD PCT": float(cfg.execution.minimum_expected_net_reward_pct) * 100.0,
+        "MIN RR AFTER COSTS": float(getattr(cfg, "min_rr_after_costs", 0.0)),
+        "MIN VOLUME RATIO": float(getattr(cfg, "min_volume_ratio", 0.0)),
+        "DAILY TRADE LIMIT": int(cfg.risk.daily_trade_limit),
+        "COOLDOWN SECONDS": int(cfg.scalping.cooldown_seconds),
+        "MAX DAILY LOSS PCT": float(cfg.risk.max_daily_loss_pct) * 100.0,
+        "MAX DRAWDOWN PCT": float(cfg.risk.max_drawdown_pct) * 100.0,
         "TIMEFRAME WARNINGS": list(getattr(cfg, "timeframe_warnings", [])),
         "AUTO SCAN": bool(cfg.scalping.scan_all_coins),
         "MAX OPEN POSITIONS": int(cfg.risk.max_open_positions),
