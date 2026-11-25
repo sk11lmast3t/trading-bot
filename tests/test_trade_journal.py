@@ -182,7 +182,8 @@ def test_short_take_profit_net_pnl_is_positive_and_exit_slippage_is_zero(tmp_pat
     assert kwargs["slippage"] == pytest.approx(0.06)
 
 
-def test_stop_loss_net_pnl_includes_adverse_exit_slippage(tmp_path, monkeypatch):
+def test_stop_loss_net_pnl_includes_adverse_exit_slippage(tmp_path, monkeypatch, caplog):
+    caplog.set_level("INFO")
     bot = close_bot(tmp_path, monkeypatch)
     bot.paper_trade_meta["BTC/USDT"] = {"entry_fee": 0.05, "entry_slippage": 0.03}
     trigger = 95.0
@@ -197,6 +198,11 @@ def test_stop_loss_net_pnl_includes_adverse_exit_slippage(tmp_path, monkeypatch)
     expected = (-5.0 - 0.05 - 0.03 - 95.0 * 0.0005 - 95.0 * 0.001)
     assert net == pytest.approx(expected)
     assert net < -5.0
+    assert "entry fee: $0.0500" in caplog.text
+    assert "exit fee: $0.0475" in caplog.text
+    assert "entry slippage: $0.0300" in caplog.text
+    assert "exit slippage: $0.0950" in caplog.text
+    assert "net PnL: $-5.2225" in caplog.text
 
 
 def test_skipped_signal_is_logged_with_context_columns(tmp_path, monkeypatch):

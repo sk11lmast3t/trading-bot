@@ -428,17 +428,21 @@ class RiskManager:
         elif trailing is not None:
             pos['trailing_stop'] = trailing
 
-        # Breakeven: arm at breakeven_activation_pct, offset stop by round_trip_cost_pct
+        # Breakeven: use configured execution costs, with the legacy round-trip
+        # setting as a floor, and arm only after price has cleared that stop.
         if not pos.get('breakeven_armed', False) and self.rc.breakeven_activation_pct > 0:
-            if side == 'long' and price_v >= entry * (1 + self.rc.breakeven_activation_pct):
+            breakeven = self.breakeven_stop_price(entry, side)
+            if (side == 'long' and price_v > breakeven
+                    and price_v >= entry * (1 + self.rc.breakeven_activation_pct)):
                 pos['breakeven_armed'] = True
-                if pos.get('trailing_stop') is None:
-                    pos['trailing_stop'] = entry * (1 + self.rc.round_trip_cost_pct)
+                pos['trailing_stop'] = max(pos.get('trailing_stop') or breakeven,
+                                           breakeven)
                 logger.info(f"[{symbol}] Breakeven armed at {pos.get('trailing_stop'):.4f}")
-            elif side == 'short' and price_v <= entry * (1 - self.rc.breakeven_activation_pct):
+            elif (side == 'short' and price_v < breakeven
+                    and price_v <= entry * (1 - self.rc.breakeven_activation_pct)):
                 pos['breakeven_armed'] = True
-                if pos.get('trailing_stop') is None:
-                    pos['trailing_stop'] = entry * (1 - self.rc.round_trip_cost_pct)
+                pos['trailing_stop'] = min(pos.get('trailing_stop') or breakeven,
+                                           breakeven)
                 logger.info(f"[{symbol}] Breakeven armed at {pos.get('trailing_stop'):.4f}")
 
         # Trailing stop activation: arm when price moves trailing_stop_activation_pct in favor
@@ -465,6 +469,41 @@ class RiskManager:
                 if price_v >= pos['trailing_stop']:
                     return True, f"Trailing stop hit at {pos['trailing_stop']:.4f}"
         return False, ""
+
+    def breakeven_stop_price(self, entry: float, side: str) -> float:
+        """Price needed to cover configured round-trip costs plus a buffer."""
+        entry_v = valid_stop_price(entry)
+        if entry_v is None:
+            return 0.0
+        side_v = normalize_side(side)
+        costs = getattr(self.config, "backtest", None)
+        execution = getattr(self.config, "execution", None)
+        maker_entry = getattr(execution, "entry_mode", "market") == "maker"
+        entry_fee = finite_non_negative(
+            getattr(costs, "maker_fee" if maker_entry else "taker_fee", 0.0))
+        entry_slippage = (0.0 if maker_entry else finite_non_negative(
+            getattr(costs, "slippage", 0.0)))
+        exit_fee = finite_non_negative(getattr(costs, "taker_fee", 0.0))
+        exit_slippage = finite_non_negative(getattr(costs, "slippage", 0.0))
+        exit_cost_rate = exit_fee + exit_slippage
+        if exit_cost_rate >= 1.0:
+            return entry_v
+        hold_minutes = finite_non_negative(
+            getattr(self.rc, "max_hold_time_minutes", 0.0))
+        funding_rate = abs(finite_float(getattr(costs, "funding_rate", 0.0)) or 0.0)
+        funding_pct = funding_rate * hold_minutes / 480.0
+        buffer_pct = finite_non_negative(
+            getattr(execution, "cost_safety_buffer_pct", 0.0))
+        configured_floor = finite_non_negative(
+            getattr(self.rc, "round_trip_cost_pct", 0.0))
+        entry_cost_pct = entry_fee + entry_slippage + funding_pct
+        if side_v == "long":
+            cost_cover_price = (entry_v * (1.0 + entry_cost_pct + buffer_pct)
+                                / (1.0 - exit_cost_rate))
+            return max(cost_cover_price, entry_v * (1.0 + configured_floor))
+        cost_cover_price = (entry_v * (1.0 - entry_cost_pct - buffer_pct)
+                            / (1.0 + exit_cost_rate))
+        return min(cost_cover_price, entry_v * (1.0 - configured_floor))
 
 
     def release_position(self, symbol: str):
