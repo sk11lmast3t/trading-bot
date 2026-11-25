@@ -726,6 +726,13 @@ class UnifiedCryptoBot:
             notional_value = setup.entry_price * size
             max_position_pct = float(self.config.risk.max_position_size_pct)
             max_position_notional = self.risk_manager.current_balance * max_position_pct
+            planned_stop_risk = _number_or_none(decision.get("planned_stop_loss_risk"))
+            if planned_stop_risk is None:
+                cost_per_unit = _number_or_none(
+                    self.risk_manager.stop_costs_per_unit(
+                        setup.entry_price, setup.stop_loss)) or 0.0
+                planned_stop_risk = (abs(setup.entry_price - setup.stop_loss)
+                                     + cost_per_unit) * size
             if notional_value > max_position_notional + 1e-9:
                 logger.info("[%s] %s skipped: position notional %.8f exceeds configured maximum %.8f",
                             symbol, setup.signal.value, notional_value, max_position_notional)
@@ -750,6 +757,8 @@ class UnifiedCryptoBot:
                 f"[{symbol}] [EXECUTE {setup.signal.value}] Strategy: {setup.strategy_name} | "
                 f"Entry: ${setup.entry_price:.4f} | SL: ${setup.stop_loss:.4f} | "
                 f"TP: ${setup.take_profit:.4f} | Size: {size:.6f} | Notional: ${notional_value:.2f} | Conf: {setup.confidence:.2f}"
+                f" | Position cap: {max_position_pct:.1%} (${max_position_notional:.2f})"
+                f" | Est. stop risk: ${planned_stop_risk:.4f}"
                 f" | Leverage: {selected_leverage:.2f}x"
             )
 
@@ -1140,6 +1149,8 @@ class UnifiedCryptoBot:
         pnl = gross_pnl
         journal_exit_fill = float(price)
         live_exit_fee = None
+        entry_fee_cost = exit_fee_cost = None
+        entry_slippage_cost = exit_slippage_cost = funding_cost = None
         if self.config.mode == "live":
             opp_side = 'sell' if side == 'long' else 'buy'
             co = self.exchange.create_market_order(symbol, opp_side, contracts, reduce_only=True)
@@ -1165,6 +1176,19 @@ class UnifiedCryptoBot:
             if co is not None:
                 journal_exit_fill = _order_fill_price(co, price)
                 live_exit_fee = _order_fee(co)
+            entry_fee_cost = _number_or_none(
+                decision_context.get("entry_live_fee") if decision_context else None)
+            exit_fee_cost = _number_or_none(live_exit_fee)
+            entry_reference = _positive_float(
+                decision_context.get("intended_entry") if decision_context else None)
+            exit_reference = _positive_float(
+                decision_context.get("intended_exit") if decision_context else None)
+            entry_fill = _positive_float(
+                decision_context.get("entry_fill_price") if decision_context else None)
+            if entry_reference is not None and entry_fill is not None:
+                entry_slippage_cost = abs(entry_fill - entry_reference) * contracts
+            if exit_reference is not None:
+                exit_slippage_cost = abs(journal_exit_fill - exit_reference) * contracts
             try:
                 self.exchange.cancel_all_orders(symbol)
                 audit(symbol, 'cancel', contracts, price, None, 'cancel')
@@ -1200,14 +1224,22 @@ class UnifiedCryptoBot:
                             hold_for_funding / 480.0)
             pnl = (gross_pnl - entry_fee - entry_slippage - exit_fee
                    - exit_slippage - funding_cost)
+            entry_fee_cost, exit_fee_cost = entry_fee, exit_fee
+            entry_slippage_cost, exit_slippage_cost = entry_slippage, exit_slippage
             if _finite_float(pnl) is None:
                 logger.error("[%s] Refusing to record non-finite close PnL %r",
                              symbol, pnl)
                 self.entries_blocked = True
                 return
+        def cost_label(value):
+            return "n/a" if value is None else f"${value:.4f}"
         logger.info(
             f"[{symbol}] Closed {side.upper()} position: {reason} | "
-            f"gross PnL: ${gross_pnl:.4f} | net PnL: ${pnl:.4f}"
+            f"gross PnL: ${gross_pnl:.4f} | "
+            f"entry fee: {cost_label(entry_fee_cost)} | exit fee: {cost_label(exit_fee_cost)} | "
+            f"entry slippage: {cost_label(entry_slippage_cost)} | "
+            f"exit slippage: {cost_label(exit_slippage_cost)} | "
+            f"funding: {cost_label(funding_cost)} | net PnL: ${pnl:.4f}"
         )
         plan = meta.get("adaptive_plan") if self.config.mode != "live" else None
         adaptive_estimate = plan.get("estimate") if isinstance(plan, dict) else None
@@ -1863,10 +1895,7 @@ class UnifiedCryptoBot:
         entry = _positive_float(entry)
         if entry is None:
             return None
-        offset = _number_or_none(
-            getattr(getattr(self.risk_manager, "rc", None), "round_trip_cost_pct", 0.0))
-        offset = max(0.0, float(offset or 0.0))
-        breakeven = entry * (1 + offset) if side == "long" else entry * (1 - offset)
+        breakeven = self.risk_manager.breakeven_stop_price(entry, side)
         return _most_protective_stop(side, _positive_float(breakeven),
                                      _positive_float(original))
 

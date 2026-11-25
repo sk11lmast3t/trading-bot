@@ -99,3 +99,28 @@ def test_market_entry_uses_create_market_order(monkeypatch):
     bot.exchange.create_market_order.assert_called_once()
     bot.exchange.create_best_bid_ask_limit_order.assert_not_called()
     bot.risk_manager.register_position.assert_called_once()
+
+
+def test_paper_entry_log_includes_position_cap_and_estimated_stop_risk(monkeypatch, caplog):
+    caplog.set_level("INFO", logger="main")
+    bot = make_bot(entry_mode='market')
+    dates = pd.date_range('2023-01-01', periods=50, freq='1min')
+    df = pd.DataFrame({
+        'open': [100]*50, 'high': [101]*50, 'low': [99]*50,
+        'close': [100]*50, 'volume': [1000]*50,
+    }, index=dates)
+    bot.exchange.fetch_ohlcv.return_value = df
+    from core.indicators import Indicators
+    monkeypatch.setattr(Indicators, "calculate_all", MagicMock(return_value=df))
+    bot.exchange.create_market_order.return_value = {
+        'id': 'paper_1', 'symbol': 'BTC/USDT', 'side': 'buy',
+        'amount': 0.01, 'price': 100.0, 'status': 'closed',
+        'filled': 0.01, 'timestamp': 'now',
+    }
+
+    bot.process_symbol('BTC/USDT')
+
+    bot.exchange.create_market_order.assert_called_once()
+    bot.risk_manager.register_position.assert_called_once()
+    assert "Position cap:" in caplog.text
+    assert "Est. stop risk:" in caplog.text
